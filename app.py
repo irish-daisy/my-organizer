@@ -143,6 +143,46 @@ def index():
                                    username=session.get('username', 'Пользователь'),
                                    current_quarter=current_quarter)
 
+# --- СТРАНИЦА КВАРТАЛОВ (3 МЕСЯЦА) ---
+@app.route('/quarter/<quarter>')
+def quarter_page(quarter):
+    if 'user_id' not in session:
+        return redirect('/login')
+    
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    cur.execute('SELECT * FROM spheres WHERE user_id = %s AND quarter = %s ORDER BY created_at ASC', (user_id, quarter))
+    spheres = cur.fetchall()
+    
+    for sphere in spheres:
+        cur.execute('SELECT * FROM tasks WHERE user_id = %s AND sphere = %s AND quarter = %s AND status = %s ORDER BY date ASC', 
+                   (user_id, sphere['name'], quarter, 'active'))
+        sphere['tasks'] = cur.fetchall()
+    
+    conn.close()
+    
+    quarters = ['Q1', 'Q2', 'Q3', 'Q4']
+    current_q = get_current_quarter()
+    quarter_data = []
+    for q in quarters:
+        quarter_data.append({
+            'id': q,
+            'name': get_quarter_name(q),
+            'year': get_quarter_year(q),
+            'current': (q == current_q)
+        })
+    
+    return render_template_string(QUARTER_PAGE, 
+                                   quarter=quarter,
+                                   quarter_name=get_quarter_name(quarter),
+                                   quarter_year=get_quarter_year(quarter),
+                                   quarters=quarter_data,
+                                   spheres=spheres,
+                                   username=session.get('username', 'Пользователь'),
+                                   current_quarter=current_q)
+
 # --- СТРАНИЦА "ПОЗЖЕ" ---
 @app.route('/later')
 def later_page():
@@ -545,7 +585,7 @@ def logout():
     session.clear()
     return redirect('/login')
 
-# ====== ИСПРАВЛЕННЫЕ HTML ШАБЛОНЫ (синтаксис) ======
+# ====== HTML ШАБЛОНЫ ======
 
 MAIN_PAGE = '''
 <!DOCTYPE html>
@@ -1457,6 +1497,324 @@ MAIN_PAGE = '''
     
     loadTasks();
     loadBacklog();
+</script>
+</body>
+</html>
+'''
+
+QUARTER_PAGE = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ quarter_name }} {{ quarter_year }} — Мой органайзер</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f6f2fd;
+            padding: 16px;
+            min-height: 100vh;
+            color: #4a3f5e;
+        }
+        .container { max-width: 900px; margin: 0 auto; }
+        .header {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 16px 24px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        }
+        .header h1 { font-size: 22px; color: #4a3f5e; }
+        .header .user { color: #8b7bb5; font-size: 14px; }
+        .header .btn-back {
+            background: #ede5f5;
+            color: #4a3f5e;
+            border: none;
+            padding: 8px 18px;
+            border-radius: 8px;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        .header .btn-back:hover { background: #e0d5ec; }
+        
+        .quarter-nav {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .quarter-nav .q-link {
+            padding: 8px 16px;
+            border-radius: 8px;
+            text-decoration: none;
+            background: #fcfaff;
+            color: #4a3f5e;
+            border: 1.5px solid #ede5f5;
+            font-size: 14px;
+            transition: 0.2s;
+        }
+        .quarter-nav .q-link:hover { border-color: #8b7bb5; background: #f8f2fd; }
+        .quarter-nav .q-link.current {
+            background: #8b7bb5;
+            color: white;
+            border-color: #8b7bb5;
+        }
+        .quarter-nav .q-link.past { opacity: 0.6; }
+        
+        .add-sphere {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 16px 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .add-sphere input {
+            flex: 1;
+            padding: 10px 14px;
+            border: 1.5px solid #ede5f5;
+            border-radius: 8px;
+            font-size: 14px;
+            min-width: 150px;
+            background: white;
+            color: #4a3f5e;
+        }
+        .add-sphere input:focus { outline: none; border-color: #8b7bb5; }
+        .add-sphere button {
+            background: #8b7bb5;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 24px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .add-sphere button:hover { background: #7a69a4; }
+        
+        .sphere {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 18px 20px;
+            margin-bottom: 16px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+            border-left: 5px solid #d5c8e6;
+        }
+        .sphere-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .sphere-header h3 { font-size: 18px; color: #4a3f5e; }
+        
+        .task-item {
+            background: #faf5ff;
+            border-radius: 8px;
+            padding: 10px 14px;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
+        }
+        .task-item .task-info { display: flex; align-items: center; gap: 10px; }
+        .task-item .task-meta { font-size: 12px; color: #b5a7cc; }
+        .task-item .task-actions button {
+            background: none;
+            border: none;
+            color: #c5b8d8;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 0 4px;
+        }
+        .task-item .task-actions button:hover { color: #8b7bb5; }
+        
+        .add-task-form {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+            flex-wrap: wrap;
+        }
+        .add-task-form input {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1.5px solid #ede5f5;
+            border-radius: 8px;
+            font-size: 13px;
+            min-width: 120px;
+            background: white;
+            color: #4a3f5e;
+        }
+        .add-task-form input:focus { outline: none; border-color: #8b7bb5; }
+        .add-task-form button {
+            background: #8b7bb5;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 8px 16px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        .add-task-form button:hover { background: #7a69a4; }
+        
+        .empty-sphere { color: #c5b8d8; font-style: italic; padding: 10px 0; }
+        
+        @media (max-width: 600px) {
+            .header { flex-direction: column; text-align: center; }
+            .add-sphere { flex-direction: column; }
+            .add-sphere input { width: 100%; }
+            .quarter-nav { justify-content: center; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>🗓️ {{ quarter_name }} {{ quarter_year }}</h1>
+        <div>
+            <span class="user">👤 {{ username }}</span>
+            <a href="/" class="btn-back" style="margin-left:12px;">← Назад</a>
+            <a href="/logout" class="btn-back" style="margin-left:8px; background:#d5c8e6; color:#4a3f5e;">Выйти</a>
+        </div>
+    </div>
+    
+    <div class="quarter-nav">
+        {% for q in quarters %}
+        <a href="/quarter/{{ q.id }}" class="q-link 
+            {% if q.id == quarter %}current{% endif %}
+            {% if q.id != quarter and q.id < current_quarter %}past{% endif %}
+        ">
+            {{ q.name }} {{ q.year }}
+            {% if q.current %}⭐{% endif %}
+        </a>
+        {% endfor %}
+    </div>
+    
+    <div class="add-sphere">
+        <input type="text" id="sphereName" placeholder="Название сферы (например: Работа, Здоровье...)" autofocus>
+        <button id="addSphereBtn">➕ Добавить сферу</button>
+    </div>
+    
+    <div id="spheresContainer">
+        {% for sphere in spheres %}
+        <div class="sphere" data-sphere="{{ sphere.name }}">
+            <div class="sphere-header">
+                <h3>📂 {{ sphere.name }}</h3>
+            </div>
+            <div id="tasks-{{ loop.index }}">
+                {% for task in sphere.tasks %}
+                <div class="task-item" data-task-id="{{ task.id }}">
+                    <div class="task-info">
+                        <span>{{ task.title }}</span>
+                        {% if task.date %}
+                        <span class="task-meta">📅 {{ task.date }}</span>
+                        {% endif %}
+                    </div>
+                    <div class="task-actions">
+                        <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
+                        <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
+                    </div>
+                </div>
+                {% else %}
+                <div class="empty-sphere">Нет задач в этой сфере</div>
+                {% endfor %}
+            </div>
+            <div class="add-task-form">
+                <input type="text" class="taskInput" placeholder="Новая задача..." autofocus>
+                <input type="date" class="taskDate" />
+                <button class="addTaskBtn" data-sphere="{{ sphere.name }}">➕ Добавить задачу</button>
+            </div>
+        </div>
+        {% else %}
+        <div style="text-align:center; padding:40px; color:#c5b8d8; background:#fcfaff; border-radius:12px;">
+            <p style="font-size:18px;">📭 Нет сфер</p>
+            <p style="font-size:14px;">Добавьте первую сферу выше</p>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+
+<script>
+    const quarter = '{{ quarter }}';
+    
+    document.getElementById('addSphereBtn').addEventListener('click', function() {
+        const name = document.getElementById('sphereName').value.trim();
+        if (!name) { alert('Введите название сферы'); return; }
+        
+        fetch('/api/sphere', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, quarter })
+        })
+        .then(res => res.json())
+        .then(() => location.reload());
+    });
+    
+    document.getElementById('sphereName').addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') document.getElementById('addSphereBtn').click();
+    });
+    
+    document.querySelectorAll('.addTaskBtn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const sphere = this.dataset.sphere;
+            const container = this.closest('.sphere');
+            const input = container.querySelector('.taskInput');
+            const dateInput = container.querySelector('.taskDate');
+            const title = input.value.trim();
+            const date = dateInput.value;
+            
+            if (!title) { alert('Введите название задачи'); return; }
+            
+            fetch('/api/task/quarter', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title, sphere, quarter, date })
+            })
+            .then(res => res.json())
+            .then(() => location.reload());
+        });
+    });
+    
+    document.querySelectorAll('.taskInput').forEach(input => {
+        input.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                this.closest('.add-task-form').querySelector('.addTaskBtn').click();
+            }
+        });
+    });
+    
+    document.querySelectorAll('.done-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const taskId = this.dataset.taskId;
+            fetch(`/api/task/${taskId}/done`, { method: 'POST' })
+                .then(() => location.reload());
+        });
+    });
+    
+    document.querySelectorAll('.delete-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const taskId = this.dataset.taskId;
+            if (confirm('Удалить задачу?')) {
+                fetch(`/api/task/${taskId}`, { method: 'DELETE' })
+                    .then(() => location.reload());
+            }
+        });
+    });
 </script>
 </body>
 </html>
