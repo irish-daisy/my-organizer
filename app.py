@@ -68,6 +68,37 @@ init_db()
 def get_user_id():
     return session.get('user_id')
 
+def get_current_quarter():
+    """Возвращает текущий квартал в формате Q1, Q2, Q3, Q4"""
+    now = datetime.now()
+    month = now.month
+    if month in [1, 2, 3]:
+        return 'Q1'
+    elif month in [4, 5, 6]:
+        return 'Q2'
+    elif month in [7, 8, 9]:
+        return 'Q3'
+    else:
+        return 'Q4'
+
+def get_quarter_name(quarter):
+    names = {
+        'Q1': 'Январь – Март',
+        'Q2': 'Апрель – Июнь',
+        'Q3': 'Июль – Сентябрь',
+        'Q4': 'Октябрь – Декабрь'
+    }
+    return names.get(quarter, quarter)
+
+def get_quarter_year(quarter):
+    """Возвращает год для квартала"""
+    now = datetime.now()
+    year = now.year
+    # Если квартал Q4 и сейчас Q1, то год -1
+    if quarter == 'Q4' and now.month in [1, 2, 3]:
+        return year - 1
+    return year
+
 # --- ГЛАВНАЯ СТРАНИЦА ---
 @app.route('/')
 def index():
@@ -78,14 +109,19 @@ def index():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    cur.execute('SELECT * FROM tasks WHERE user_id = %s AND status = %s AND (quarter IS NULL OR quarter = %s) ORDER BY date ASC', (user_id, 'active', ''))
+    # Получаем задачи, которые НЕ привязаны к кварталам (или привязаны к пустому)
+    cur.execute('''
+        SELECT * FROM tasks 
+        WHERE user_id = %s AND status = %s AND (quarter IS NULL OR quarter = '') 
+        ORDER BY date ASC
+    ''', (user_id, 'active'))
     tasks = cur.fetchall()
     conn.close()
     
     categories = {
-        'focus': [],
-        'important': [],
-        'medium': [],
+        'work': [],
+        'home': [],
+        'personal': [],
         'later': []
     }
     
@@ -94,9 +130,9 @@ def index():
         categories[cat].append(dict(task))
     
     return render_template_string(MAIN_PAGE, 
-                                   focus_tasks=categories['focus'],
-                                   important_tasks=categories['important'],
-                                   medium_tasks=categories['medium'],
+                                   work_tasks=categories['work'],
+                                   home_tasks=categories['home'],
+                                   personal_tasks=categories['personal'],
                                    later_tasks=categories['later'],
                                    username=session.get('username', 'Пользователь'))
 
@@ -122,18 +158,77 @@ def quarter_page(quarter):
     
     conn.close()
     
-    quarter_names = {
-        'Q1': 'Январь – Март',
-        'Q2': 'Апрель – Июнь',
-        'Q3': 'Июль – Сентябрь',
-        'Q4': 'Октябрь – Декабрь'
-    }
+    # Получаем все кварталы для навигации
+    quarters = ['Q1', 'Q2', 'Q3', 'Q4']
+    current_year = datetime.now().year
+    current_q = get_current_quarter()
+    
+    quarter_data = []
+    for q in quarters:
+        q_year = get_quarter_year(q)
+        q_name = get_quarter_name(q)
+        is_current = (q == current_q)
+        quarter_data.append({
+            'id': q,
+            'name': q_name,
+            'year': q_year,
+            'current': is_current
+        })
     
     return render_template_string(QUARTER_PAGE, 
                                    quarter=quarter,
-                                   quarter_name=quarter_names.get(quarter, quarter),
+                                   quarter_name=get_quarter_name(quarter),
+                                   quarter_year=get_quarter_year(quarter),
+                                   quarters=quarter_data,
                                    spheres=spheres,
+                                   username=session.get('username', 'Пользователь'),
+                                   current_quarter=current_q)
+
+# --- СТРАНИЦА "ПОЗЖЕ" ---
+@app.route('/later')
+def later_page():
+    if 'user_id' not in session:
+        return redirect('/login')
+    
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    # Получаем все задачи со статусом "later" (позже)
+    cur.execute('''
+        SELECT * FROM tasks 
+        WHERE user_id = %s AND category = %s AND status = %s
+        ORDER BY created_at DESC
+    ''', (user_id, 'later', 'active'))
+    tasks = cur.fetchall()
+    conn.close()
+    
+    return render_template_string(LATER_PAGE, 
+                                   tasks=tasks,
                                    username=session.get('username', 'Пользователь'))
+
+# --- API: Добавить задачу в "Позже" ---
+@app.route('/api/task/later', methods=['POST'])
+def add_later_task():
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.json
+    title = data.get('title', '').strip()
+    
+    if not title:
+        return jsonify({'error': 'Title is required'}), 400
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT INTO tasks (user_id, title, category, date, repeat_type, repeat_day, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, 'later', '', 'none', None, 'active'))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': 'Task added to later'})
 
 # --- API: Добавить сферу в квартал ---
 @app.route('/api/sphere', methods=['POST'])
@@ -321,7 +416,11 @@ def get_tasks():
     
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute('SELECT * FROM tasks WHERE user_id = %s AND status = %s AND (quarter IS NULL OR quarter = %s) ORDER BY date ASC', (session['user_id'], 'active', ''))
+    cur.execute('''
+        SELECT * FROM tasks 
+        WHERE user_id = %s AND status = %s AND (quarter IS NULL OR quarter = '')
+        ORDER BY date ASC
+    ''', (session['user_id'], 'active'))
     tasks = cur.fetchall()
     conn.close()
     
@@ -416,6 +515,28 @@ MAIN_PAGE = '''
             min-height: 400px;
         }
         .left-column h2 { font-size: 15px; color: #6b7280; margin-bottom: 12px; }
+        .backlog-add {
+            display: flex;
+            gap: 6px;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+        }
+        .backlog-add input {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 13px;
+            min-width: 100px;
+        }
+        .backlog-add button {
+            background: #4361ee;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 8px 14px;
+            cursor: pointer;
+        }
         .backlog-item {
             background: white;
             border-radius: 8px;
@@ -435,27 +556,10 @@ MAIN_PAGE = '''
             font-size: 16px;
         }
         .backlog-item .move-btn:hover { color: #4361ee; }
-        .backlog-add {
-            display: flex;
-            gap: 6px;
-            margin-top: 10px;
-            flex-wrap: wrap;
-        }
-        .backlog-add input {
-            flex: 1;
-            padding: 8px 12px;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            font-size: 13px;
-            min-width: 100px;
-        }
-        .backlog-add button {
-            background: #4361ee;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            padding: 8px 14px;
-            cursor: pointer;
+        .backlog-hint {
+            font-size: 11px;
+            color: #bbb;
+            margin-top: 8px;
         }
         
         /* Центр */
@@ -536,9 +640,9 @@ MAIN_PAGE = '''
             padding: 0 4px;
         }
         .task-card .task-actions button:hover { color: #4361ee; }
-        .task-card.tag-focus { border-left-color: #4361ee; }
-        .task-card.tag-important { border-left-color: #e74c3c; }
-        .task-card.tag-medium { border-left-color: #f39c12; }
+        .task-card.tag-work { border-left-color: #4361ee; }
+        .task-card.tag-home { border-left-color: #2ecc71; }
+        .task-card.tag-personal { border-left-color: #e74c3c; }
         .task-card.tag-later { border-left-color: #9ca3af; }
         
         .empty-block { color: #bbb; font-size: 13px; text-align: center; padding: 16px; }
@@ -583,9 +687,9 @@ MAIN_PAGE = '''
             padding: 2px 10px;
             border-radius: 12px;
         }
-        .block-important .block-header { border-bottom-color: #e74c3c; }
-        .block-medium .block-header { border-bottom-color: #f39c12; }
-        .block-later .block-header { border-bottom-color: #9ca3af; }
+        .block-work .block-header { border-bottom-color: #4361ee; }
+        .block-home .block-header { border-bottom-color: #2ecc71; }
+        .block-personal .block-header { border-bottom-color: #e74c3c; }
         
         /* Правая колонка */
         .right-column { flex: 0 0 160px; display: flex; flex-direction: column; gap: 12px; }
@@ -610,6 +714,21 @@ MAIN_PAGE = '''
             display: inline-block;
         }
         .sidebar-card .big-btn:hover { background: #3a56d4; }
+        .sidebar-card .big-btn-secondary {
+            background: #6b7280;
+            color: white;
+            border: none;
+            border-radius: 10px;
+            padding: 12px;
+            font-size: 15px;
+            font-weight: 600;
+            width: 100%;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            margin-top: 8px;
+        }
+        .sidebar-card .big-btn-secondary:hover { background: #4b5563; }
         
         /* Модалка */
         .modal-overlay {
@@ -685,12 +804,12 @@ MAIN_PAGE = '''
     <!-- Левая колонка -->
     <div class="left-column">
         <h2>📥 Распределить</h2>
-        <div id="backlogList"></div>
         <div class="backlog-add">
             <input type="text" id="newTaskInput" placeholder="Новая задача...">
             <button id="addBacklogBtn">+</button>
         </div>
-        <p style="font-size:11px; color:#bbb; margin-top:8px;">⬅️ Нажмите → чтобы распределить</p>
+        <div id="backlogList"></div>
+        <div class="backlog-hint">⬅️ Нажмите → чтобы распределить</div>
     </div>
 
     <!-- Центр -->
@@ -711,35 +830,35 @@ MAIN_PAGE = '''
             </div>
             <div id="focusTasks"></div>
             <div class="empty-block" id="focusEmpty">
-                + Добавить задачу в фокус
+                Нет задач в фокусе
                 <button class="add-task-btn" data-category="focus">➕ Добавить задачу</button>
             </div>
         </div>
 
         <!-- Блоки столбиком -->
         <div class="block-row">
-            <div class="block block-important" id="importantBlock">
-                <div class="block-header">🔥 Важное <span class="count" id="importantCount">0</span></div>
-                <div id="importantTasks"></div>
-                <div class="empty-block" id="importantEmpty">
-                    + Добавить задачу
-                    <button class="add-task-btn" data-category="important">➕ Добавить задачу</button>
+            <div class="block block-work" id="workBlock">
+                <div class="block-header">💼 Работа <span class="count" id="workCount">0</span></div>
+                <div id="workTasks"></div>
+                <div class="empty-block" id="workEmpty">
+                    Нет задач
+                    <button class="add-task-btn" data-category="work">➕ Добавить задачу</button>
                 </div>
             </div>
-            <div class="block block-medium" id="mediumBlock">
-                <div class="block-header">⚖️ Среднее <span class="count" id="mediumCount">0</span></div>
-                <div id="mediumTasks"></div>
-                <div class="empty-block" id="mediumEmpty">
-                    + Добавить задачу
-                    <button class="add-task-btn" data-category="medium">➕ Добавить задачу</button>
+            <div class="block block-home" id="homeBlock">
+                <div class="block-header">🏠 Дом <span class="count" id="homeCount">0</span></div>
+                <div id="homeTasks"></div>
+                <div class="empty-block" id="homeEmpty">
+                    Нет задач
+                    <button class="add-task-btn" data-category="home">➕ Добавить задачу</button>
                 </div>
             </div>
-            <div class="block block-later" id="laterBlock">
-                <div class="block-header">🕰️ Позже <span class="count" id="laterCount">0</span></div>
-                <div id="laterTasks"></div>
-                <div class="empty-block" id="laterEmpty">
-                    + Добавить задачу
-                    <button class="add-task-btn" data-category="later">➕ Добавить задачу</button>
+            <div class="block block-personal" id="personalBlock">
+                <div class="block-header">❤️ Личное <span class="count" id="personalCount">0</span></div>
+                <div id="personalTasks"></div>
+                <div class="empty-block" id="personalEmpty">
+                    Нет задач
+                    <button class="add-task-btn" data-category="personal">➕ Добавить задачу</button>
                 </div>
             </div>
         </div>
@@ -748,7 +867,8 @@ MAIN_PAGE = '''
     <!-- Правая колонка -->
     <div class="right-column">
         <div class="sidebar-card">
-            <a href="/quarter/Q1" class="big-btn">🗓️ 3 месяца</a>
+            <a href="/quarter/{{ current_quarter }}" class="big-btn">🗓️ 3 месяца</a>
+            <a href="/later" class="big-btn-secondary">🕰️ Позже</a>
         </div>
     </div>
 </div>
@@ -806,8 +926,9 @@ MAIN_PAGE = '''
         <label for="editTaskCategory">Категория</label>
         <select id="editTaskCategory">
             <option value="focus">🎯 Фокус</option>
-            <option value="important">🔥 Важное</option>
-            <option value="medium">⚖️ Среднее</option>
+            <option value="work">💼 Работа</option>
+            <option value="home">🏠 Дом</option>
+            <option value="personal">❤️ Личное</option>
             <option value="later">🕰️ Позже</option>
         </select>
         <div class="checkbox-group">
@@ -848,7 +969,7 @@ MAIN_PAGE = '''
         fetch('/api/tasks')
             .then(res => res.json())
             .then(tasks => {
-                const categories = { focus: [], important: [], medium: [], later: [] };
+                const categories = { focus: [], work: [], home: [], personal: [], later: [] };
                 tasks.forEach(t => {
                     if (categories[t.category]) categories[t.category].push(t);
                     else categories.later.push(t);
@@ -860,9 +981,9 @@ MAIN_PAGE = '''
     function renderTasks(categories) {
         const containerMap = {
             focus: { tasks: 'focusTasks', count: 'focusCount', empty: 'focusEmpty' },
-            important: { tasks: 'importantTasks', count: 'importantCount', empty: 'importantEmpty' },
-            medium: { tasks: 'mediumTasks', count: 'mediumCount', empty: 'mediumEmpty' },
-            later: { tasks: 'laterTasks', count: 'laterCount', empty: 'laterEmpty' }
+            work: { tasks: 'workTasks', count: 'workCount', empty: 'workEmpty' },
+            home: { tasks: 'homeTasks', count: 'homeCount', empty: 'homeEmpty' },
+            personal: { tasks: 'personalTasks', count: 'personalCount', empty: 'personalEmpty' }
         };
         
         for (const [cat, data] of Object.entries(containerMap)) {
@@ -879,7 +1000,6 @@ MAIN_PAGE = '''
             
             countEl.textContent = tasks.length;
             if (emptyEl) {
-                // Показываем empty-блок, только если нет задач
                 if (tasks.length === 0) {
                     emptyEl.style.display = 'block';
                 } else {
@@ -963,8 +1083,9 @@ MAIN_PAGE = '''
     function getCategoryName(cat) {
         const names = {
             'focus': '🎯 Фокус',
-            'important': '🔥 Важное',
-            'medium': '⚖️ Среднее',
+            'work': '💼 Работа',
+            'home': '🏠 Дом',
+            'personal': '❤️ Личное',
             'later': '🕰️ Позже'
         };
         return names[cat] || cat;
@@ -1131,7 +1252,8 @@ MAIN_PAGE = '''
         fetch('/api/tasks')
             .then(res => res.json())
             .then(tasks => {
-                const backlogTasks = tasks.filter(t => t.category === 'later');
+                // Задачи из "Распределить" — те, у которых category = 'later' и нет привязки к кварталам
+                const backlogTasks = tasks.filter(t => t.category === 'later' && (!t.quarter || t.quarter === ''));
                 const container = document.getElementById('backlogList');
                 container.innerHTML = '';
                 backlogTasks.forEach(task => {
@@ -1144,7 +1266,6 @@ MAIN_PAGE = '''
                     container.appendChild(item);
                 });
                 
-                // Обработчики для кнопок перемещения
                 document.querySelectorAll('.move-btn').forEach(btn => {
                     btn.addEventListener('click', function() {
                         const taskId = this.dataset.taskId;
@@ -1153,9 +1274,6 @@ MAIN_PAGE = '''
                 });
             });
     }
-    
-    // --- Кварталы (переход по ссылкам) ---
-    // Кнопка "3 месяца" теперь ссылка, всё работает через href
     
     // --- Загрузка при старте ---
     loadTasks();
@@ -1171,7 +1289,7 @@ QUARTER_PAGE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ quarter_name }} — Мой органайзер</title>
+    <title>{{ quarter_name }} {{ quarter_year }} — Мой органайзер</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -1205,6 +1323,31 @@ QUARTER_PAGE = '''
             cursor: pointer;
         }
         .header .btn-back:hover { background: #4b5563; }
+        
+        .quarter-nav {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .quarter-nav .q-link {
+            padding: 8px 16px;
+            border-radius: 8px;
+            text-decoration: none;
+            background: white;
+            color: #1a1a2e;
+            border: 1.5px solid #ddd;
+            font-size: 14px;
+            transition: 0.2s;
+        }
+        .quarter-nav .q-link:hover { border-color: #4361ee; background: #f8f9ff; }
+        .quarter-nav .q-link.current {
+            background: #4361ee;
+            color: white;
+            border-color: #4361ee;
+        }
+        .quarter-nav .q-link.past { opacity: 0.6; }
         
         .add-sphere {
             background: white;
@@ -1310,18 +1453,32 @@ QUARTER_PAGE = '''
             .header { flex-direction: column; text-align: center; }
             .add-sphere { flex-direction: column; }
             .add-sphere input { width: 100%; }
+            .quarter-nav { justify-content: center; }
         }
     </style>
 </head>
 <body>
 <div class="container">
     <div class="header">
-        <h1>🗓️ {{ quarter_name }}</h1>
+        <h1>🗓️ {{ quarter_name }} {{ quarter_year }}</h1>
         <div>
             <span class="user">👤 {{ username }}</span>
             <a href="/" class="btn-back" style="margin-left:12px;">← Назад</a>
             <a href="/logout" class="btn-back" style="margin-left:8px; background:#e74c3c;">Выйти</a>
         </div>
+    </div>
+    
+    <!-- Навигация по кварталам -->
+    <div class="quarter-nav">
+        {% for q in quarters %}
+        <a href="/quarter/{{ q.id }}" class="q-link 
+            {% if q.id == quarter %}current{% endif %}
+            {% if q.id != quarter and q.id < current_quarter %}past{% endif %}
+        ">
+            {{ q.name }} {{ q.year }}
+            {% if q.current %}⭐{% endif %}
+        </a>
+        {% endfor %}
     </div>
     
     <div class="add-sphere">
@@ -1371,7 +1528,6 @@ QUARTER_PAGE = '''
 <script>
     const quarter = '{{ quarter }}';
     
-    // --- Добавление сферы ---
     document.getElementById('addSphereBtn').addEventListener('click', function() {
         const name = document.getElementById('sphereName').value.trim();
         if (!name) { alert('Введите название сферы'); return; }
@@ -1382,18 +1538,13 @@ QUARTER_PAGE = '''
             body: JSON.stringify({ name, quarter })
         })
         .then(res => res.json())
-        .then(() => {
-            location.reload();
-        });
+        .then(() => location.reload());
     });
     
     document.getElementById('sphereName').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') {
-            document.getElementById('addSphereBtn').click();
-        }
+        if (e.key === 'Enter') document.getElementById('addSphereBtn').click();
     });
     
-    // --- Добавление задачи в сферу ---
     document.querySelectorAll('.addTaskBtn').forEach(btn => {
         btn.addEventListener('click', function() {
             const sphere = this.dataset.sphere;
@@ -1411,23 +1562,18 @@ QUARTER_PAGE = '''
                 body: JSON.stringify({ title, sphere, quarter, date })
             })
             .then(res => res.json())
-            .then(() => {
-                location.reload();
-            });
+            .then(() => location.reload());
         });
     });
     
-    // Enter для задач
     document.querySelectorAll('.taskInput').forEach(input => {
         input.addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
-                const btn = this.closest('.add-task-form').querySelector('.addTaskBtn');
-                btn.click();
+                this.closest('.add-task-form').querySelector('.addTaskBtn').click();
             }
         });
     });
     
-    // --- Выполнение задачи в квартале ---
     document.querySelectorAll('.done-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
@@ -1436,7 +1582,198 @@ QUARTER_PAGE = '''
         });
     });
     
-    // --- Удаление задачи в квартале ---
+    document.querySelectorAll('.delete-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const taskId = this.dataset.taskId;
+            if (confirm('Удалить задачу?')) {
+                fetch(`/api/task/${taskId}`, { method: 'DELETE' })
+                    .then(() => location.reload());
+            }
+        });
+    });
+</script>
+</body>
+</html>
+'''
+
+LATER_PAGE = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🕰️ Позже — Мой органайзер</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f4f6f9;
+            padding: 16px;
+            min-height: 100vh;
+        }
+        .container { max-width: 800px; margin: 0 auto; }
+        .header {
+            background: white;
+            border-radius: 12px;
+            padding: 16px 24px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }
+        .header h1 { font-size: 22px; color: #1a1a2e; }
+        .header .user { color: #6b7280; font-size: 14px; }
+        .header .btn-back {
+            background: #6b7280;
+            color: white;
+            border: none;
+            padding: 8px 18px;
+            border-radius: 8px;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        .header .btn-back:hover { background: #4b5563; }
+        
+        .add-task {
+            background: white;
+            border-radius: 12px;
+            padding: 16px 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .add-task input {
+            flex: 1;
+            padding: 10px 14px;
+            border: 1.5px solid #ddd;
+            border-radius: 8px;
+            font-size: 14px;
+            min-width: 150px;
+        }
+        .add-task input:focus { outline: none; border-color: #4361ee; }
+        .add-task button {
+            background: #4361ee;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 24px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .add-task button:hover { background: #3a56d4; }
+        
+        .task-list {
+            background: white;
+            border-radius: 12px;
+            padding: 18px 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }
+        .task-list .task-item {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .task-list .task-item .task-info {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .task-list .task-item .task-actions button {
+            background: none;
+            border: none;
+            color: #9ca3af;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 0 4px;
+        }
+        .task-list .task-item .task-actions button:hover { color: #4361ee; }
+        
+        .empty-list { color: #bbb; text-align: center; padding: 30px; }
+        
+        @media (max-width: 600px) {
+            .header { flex-direction: column; text-align: center; }
+            .add-task { flex-direction: column; }
+            .add-task input { width: 100%; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>🕰️ Позже</h1>
+        <div>
+            <span class="user">👤 {{ username }}</span>
+            <a href="/" class="btn-back" style="margin-left:12px;">← Назад</a>
+            <a href="/logout" class="btn-back" style="margin-left:8px; background:#e74c3c;">Выйти</a>
+        </div>
+    </div>
+    
+    <div class="add-task">
+        <input type="text" id="laterTaskInput" placeholder="Что хотите отложить?" />
+        <button id="addLaterBtn">➕ Добавить</button>
+    </div>
+    
+    <div class="task-list" id="laterTasks">
+        {% for task in tasks %}
+        <div class="task-item" data-task-id="{{ task.id }}">
+            <div class="task-info">
+                <span>{{ task.title }}</span>
+            </div>
+            <div class="task-actions">
+                <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
+                <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
+            </div>
+        </div>
+        {% else %}
+        <div class="empty-list">📭 Здесь пока пусто. Добавьте задачи, которые хотите отложить на потом.</div>
+        {% endfor %}
+    </div>
+</div>
+
+<script>
+    // --- Добавление задачи в "Позже" ---
+    document.getElementById('addLaterBtn').addEventListener('click', function() {
+        const input = document.getElementById('laterTaskInput');
+        const title = input.value.trim();
+        if (!title) { alert('Введите название задачи'); return; }
+        
+        fetch('/api/task/later', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title })
+        })
+        .then(res => res.json())
+        .then(() => location.reload());
+    });
+    
+    document.getElementById('laterTaskInput').addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') {
+            document.getElementById('addLaterBtn').click();
+        }
+    });
+    
+    // --- Выполнение задачи ---
+    document.querySelectorAll('.done-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const taskId = this.dataset.taskId;
+            fetch(`/api/task/${taskId}/done`, { method: 'POST' })
+                .then(() => location.reload());
+        });
+    });
+    
+    // --- Удаление задачи ---
     document.querySelectorAll('.delete-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
