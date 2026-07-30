@@ -129,9 +129,8 @@ def index():
     }
     
     for task in tasks:
-        cat = task['category'] if task['category'] in categories else 'later'
-        # Задачи с категорией 'later' не показываются на главной
-        if cat != 'later':
+        cat = task['category'] if task['category'] in categories else None
+        if cat and cat != 'later':
             categories[cat].append(dict(task))
     
     current_quarter = get_current_quarter()
@@ -154,7 +153,6 @@ def later_page():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    # Получаем все задачи со статусом later (нераспределённые)
     cur.execute('''
         SELECT * FROM tasks 
         WHERE user_id = %s AND category = %s AND status = %s AND (later_group IS NULL OR later_group = '')
@@ -162,11 +160,9 @@ def later_page():
     ''', (user_id, 'later', 'active'))
     tasks = cur.fetchall()
     
-    # Получаем все группы для блока "Позже"
     cur.execute('SELECT * FROM later_groups WHERE user_id = %s ORDER BY created_at ASC', (user_id,))
     groups = cur.fetchall()
     
-    # Для каждой группы получаем задачи
     for group in groups:
         cur.execute('SELECT * FROM tasks WHERE user_id = %s AND later_group = %s AND status = %s ORDER BY created_at DESC', 
                    (user_id, group['name'], 'active'))
@@ -549,7 +545,8 @@ def logout():
     session.clear()
     return redirect('/login')
 
-# --- HTML ШАБЛОНЫ ---
+# ====== ИСПРАВЛЕННЫЕ HTML ШАБЛОНЫ (синтаксис) ======
+
 MAIN_PAGE = '''
 <!DOCTYPE html>
 <html lang="ru">
@@ -574,7 +571,6 @@ MAIN_PAGE = '''
             align-items: flex-start;
             flex-wrap: wrap;
         }
-        
         .left-column {
             flex: 0 0 240px;
             background: #fcfaff;
@@ -1451,10 +1447,6 @@ MAIN_PAGE = '''
                 document.getElementById('moveModal').classList.remove('open');
                 loadTasks();
                 loadBacklog();
-                // Если категория "later", обновляем страницу "Позже" при переходе
-                if (category === 'later') {
-                    // Ничего не делаем, данные обновятся при загрузке страницы
-                }
             });
         });
     });
@@ -1595,7 +1587,6 @@ LATER_PAGE = '''
         
         .empty-list { color: #c5b8d8; text-align: center; padding: 30px; }
         
-        /* Группы справа */
         .group-section {
             background: #fcfaff;
             border-radius: 12px;
@@ -1735,7 +1726,6 @@ LATER_PAGE = '''
     </div>
     
     <div class="later-layout">
-        <!-- ЛЕВАЯ КОЛОНКА: Общий список -->
         <div class="left-panel">
             <div class="add-task">
                 <input type="text" id="laterTaskInput" placeholder="Новая задача в общий список..." autofocus>
@@ -1759,7 +1749,6 @@ LATER_PAGE = '''
             </div>
         </div>
         
-        <!-- ПРАВАЯ КОЛОНКА: Группы -->
         <div class="right-panel">
             <div class="add-group">
                 <input type="text" id="newGroupInput" placeholder="Название группы (например: Идеи, Проекты...)">
@@ -1796,7 +1785,6 @@ LATER_PAGE = '''
 </div>
 
 <script>
-    // --- Добавление в общий список ---
     document.getElementById('addLaterBtn').addEventListener('click', function() {
         const input = document.getElementById('laterTaskInput');
         const title = input.value.trim();
@@ -1815,7 +1803,6 @@ LATER_PAGE = '''
         if (e.key === 'Enter') document.getElementById('addLaterBtn').click();
     });
     
-    // --- Создание группы ---
     document.getElementById('addGroupBtn').addEventListener('click', function() {
         const input = document.getElementById('newGroupInput');
         const name = input.value.trim();
@@ -1834,7 +1821,6 @@ LATER_PAGE = '''
         if (e.key === 'Enter') document.getElementById('addGroupBtn').click();
     });
     
-    // --- Перемещение задачи в группу (из общего списка) ---
     document.querySelectorAll('.move-to-group-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
@@ -1851,7 +1837,6 @@ LATER_PAGE = '''
         });
     });
     
-    // --- Добавление задачи напрямую в группу ---
     document.querySelectorAll('.add-group-task-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const group = this.dataset.group;
@@ -1878,7 +1863,6 @@ LATER_PAGE = '''
         });
     });
     
-    // --- Удаление группы ---
     document.querySelectorAll('.delete-group').forEach(btn => {
         btn.addEventListener('click', function() {
             const groupId = this.dataset.groupId;
@@ -1890,7 +1874,6 @@ LATER_PAGE = '''
         });
     });
     
-    // --- Выполнение задачи ---
     document.querySelectorAll('.done-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
@@ -1899,7 +1882,6 @@ LATER_PAGE = '''
         });
     });
     
-    // --- Удаление задачи ---
     document.querySelectorAll('.delete-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
