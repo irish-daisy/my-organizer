@@ -42,7 +42,8 @@ def init_db():
             status TEXT DEFAULT 'active',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             quarter TEXT,
-            sphere TEXT
+            sphere TEXT,
+            later_group TEXT
         )
     ''')
     
@@ -52,6 +53,15 @@ def init_db():
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             name TEXT NOT NULL,
             quarter TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS later_groups (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -115,13 +125,14 @@ def index():
         'focus': [],
         'work': [],
         'home': [],
-        'personal': [],
-        'later': []
+        'personal': []
     }
     
     for task in tasks:
         cat = task['category'] if task['category'] in categories else 'later'
-        categories[cat].append(dict(task))
+        # Задачи с категорией 'later' не показываются на главной
+        if cat != 'later':
+            categories[cat].append(dict(task))
     
     current_quarter = get_current_quarter()
     
@@ -130,57 +141,8 @@ def index():
                                    work_tasks=categories['work'],
                                    home_tasks=categories['home'],
                                    personal_tasks=categories['personal'],
-                                   later_tasks=categories['later'],
                                    username=session.get('username', 'Пользователь'),
                                    current_quarter=current_quarter)
-
-# --- КВАРТАЛЫ ---
-@app.route('/quarter/<quarter>')
-def quarter_page(quarter):
-    if 'user_id' not in session:
-        return redirect('/login')
-    
-    valid_quarters = ['Q1', 'Q2', 'Q3', 'Q4']
-    if quarter not in valid_quarters:
-        return redirect('/')
-    
-    user_id = session['user_id']
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    
-    cur.execute('SELECT * FROM spheres WHERE user_id = %s AND quarter = %s ORDER BY created_at ASC', (user_id, quarter))
-    spheres = cur.fetchall()
-    
-    for sphere in spheres:
-        cur.execute('SELECT * FROM tasks WHERE user_id = %s AND sphere = %s AND quarter = %s AND status = %s ORDER BY date ASC', 
-                   (user_id, sphere['name'], quarter, 'active'))
-        sphere['tasks'] = cur.fetchall()
-    
-    conn.close()
-    
-    quarters = ['Q1', 'Q2', 'Q3', 'Q4']
-    current_q = get_current_quarter()
-    
-    quarter_data = []
-    for q in quarters:
-        q_year = get_quarter_year(q)
-        q_name = get_quarter_name(q)
-        is_current = (q == current_q)
-        quarter_data.append({
-            'id': q,
-            'name': q_name,
-            'year': q_year,
-            'current': is_current
-        })
-    
-    return render_template_string(QUARTER_PAGE, 
-                                   quarter=quarter,
-                                   quarter_name=get_quarter_name(quarter),
-                                   quarter_year=get_quarter_year(quarter),
-                                   quarters=quarter_data,
-                                   spheres=spheres,
-                                   username=session.get('username', 'Пользователь'),
-                                   current_quarter=current_q)
 
 # --- СТРАНИЦА "ПОЗЖЕ" ---
 @app.route('/later')
@@ -192,19 +154,111 @@ def later_page():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
+    # Получаем все задачи со статусом later (нераспределённые)
     cur.execute('''
         SELECT * FROM tasks 
-        WHERE user_id = %s AND category = %s AND status = %s
+        WHERE user_id = %s AND category = %s AND status = %s AND (later_group IS NULL OR later_group = '')
         ORDER BY created_at DESC
     ''', (user_id, 'later', 'active'))
     tasks = cur.fetchall()
+    
+    # Получаем все группы для блока "Позже"
+    cur.execute('SELECT * FROM later_groups WHERE user_id = %s ORDER BY created_at ASC', (user_id,))
+    groups = cur.fetchall()
+    
+    # Для каждой группы получаем задачи
+    for group in groups:
+        cur.execute('SELECT * FROM tasks WHERE user_id = %s AND later_group = %s AND status = %s ORDER BY created_at DESC', 
+                   (user_id, group['name'], 'active'))
+        group['tasks'] = cur.fetchall()
+    
     conn.close()
     
     return render_template_string(LATER_PAGE, 
                                    tasks=tasks,
+                                   groups=groups,
                                    username=session.get('username', 'Пользователь'))
 
-# --- API: Добавить задачу в "Позже" ---
+# --- API: Добавить группу в "Позже" ---
+@app.route('/api/later/group', methods=['POST'])
+def add_later_group():
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.json
+    name = data.get('name', '').strip()
+    
+    if not name:
+        return jsonify({'error': 'Name is required'}), 400
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('INSERT INTO later_groups (user_id, name) VALUES (%s, %s)', (session['user_id'], name))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': 'Group added'})
+
+# --- API: Добавить задачу в группу "Позже" ---
+@app.route('/api/task/later/group', methods=['POST'])
+def add_task_to_later_group():
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.json
+    title = data.get('title', '').strip()
+    group = data.get('group', '')
+    
+    if not title or not group:
+        return jsonify({'error': 'Title and group are required'}), 400
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT INTO tasks (user_id, title, category, date, repeat_type, repeat_day, status, later_group)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, 'later', '', 'none', None, 'active', group))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': 'Task added to later group'})
+
+# --- API: Переместить задачу в группу "Позже" ---
+@app.route('/api/task/<int:task_id>/move_to_later_group', methods=['PUT'])
+def move_to_later_group(task_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.json
+    group = data.get('group', '')
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('UPDATE tasks SET later_group = %s WHERE id = %s AND user_id = %s', (group, task_id, session['user_id']))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': 'Task moved to later group'})
+
+# --- API: Удалить группу "Позже" ---
+@app.route('/api/later/group/<int:group_id>', methods=['DELETE'])
+def delete_later_group(group_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('SELECT name FROM later_groups WHERE id = %s AND user_id = %s', (group_id, session['user_id']))
+    group = cur.fetchone()
+    if group:
+        cur.execute('UPDATE tasks SET later_group = NULL WHERE user_id = %s AND later_group = %s', (session['user_id'], group[0]))
+    cur.execute('DELETE FROM later_groups WHERE id = %s AND user_id = %s', (group_id, session['user_id']))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': 'Group deleted'})
+
+# --- API: Добавить задачу в "Позже" (в общий список) ---
 @app.route('/api/task/later', methods=['POST'])
 def add_later_task():
     if 'user_id' not in session:
@@ -395,9 +449,9 @@ def done_task(task_id):
             new_date = (today + timedelta(days=days_ahead)).strftime('%Y-%m-%d')
         
         cur.execute('''
-            INSERT INTO tasks (user_id, title, category, date, repeat_type, repeat_day, status, quarter, sphere)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (task['user_id'], task['title'], task['category'], new_date, task['repeat_type'], task['repeat_day'], 'active', task.get('quarter'), task.get('sphere')))
+            INSERT INTO tasks (user_id, title, category, date, repeat_type, repeat_day, status, quarter, sphere, later_group)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ''', (task['user_id'], task['title'], task['category'], new_date, task['repeat_type'], task['repeat_day'], 'active', task.get('quarter'), task.get('sphere'), task.get('later_group')))
     
     cur.execute('UPDATE tasks SET status = %s WHERE id = %s', ('done', task_id))
     conn.commit()
@@ -521,7 +575,6 @@ MAIN_PAGE = '''
             flex-wrap: wrap;
         }
         
-        /* Левая колонка */
         .left-column {
             flex: 0 0 240px;
             background: #fcfaff;
@@ -578,13 +631,8 @@ MAIN_PAGE = '''
             padding: 4px 8px;
         }
         .backlog-item .move-btn:hover { color: #8b7bb5; }
-        .backlog-hint {
-            font-size: 11px;
-            color: #c5b8d8;
-            margin-top: 8px;
-        }
+        .backlog-hint { font-size: 11px; color: #c5b8d8; margin-top: 8px; }
         
-        /* Центр */
         .center-column { flex: 1; min-width: 280px; }
         .header {
             background: #fcfaff;
@@ -610,7 +658,6 @@ MAIN_PAGE = '''
         }
         .header .btn-exit:hover { background: #c5b8d8; }
         
-        /* Фокус */
         .focus-block {
             background: #fcfaff;
             border-radius: 14px;
@@ -636,6 +683,38 @@ MAIN_PAGE = '''
             padding: 2px 14px;
             border-radius: 20px;
         }
+        
+        .block-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
+        .block {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 14px 16px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+            min-height: 180px;
+        }
+        .block .block-header {
+            font-size: 14px;
+            font-weight: 600;
+            color: #4a3f5e;
+            margin-bottom: 10px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #ede5f5;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .block .block-header .count {
+            font-size: 11px;
+            font-weight: 400;
+            color: #8b7bb5;
+            background: #f0e8fa;
+            padding: 2px 10px;
+            border-radius: 12px;
+        }
+        .block-work .block-header { border-bottom-color: #ede5f5; }
+        .block-home .block-header { border-bottom-color: #ede5f5; }
+        .block-personal .block-header { border-bottom-color: #ede5f5; }
+        
         .task-card {
             background: #faf5ff;
             border-radius: 10px;
@@ -668,55 +747,21 @@ MAIN_PAGE = '''
         .task-card.tag-work { border-left-color: #8b7bb5; }
         .task-card.tag-home { border-left-color: #8b7bb5; }
         .task-card.tag-personal { border-left-color: #8b7bb5; }
-        .task-card.tag-later { border-left-color: #c5b8d8; }
         
         .empty-block { color: #c5b8d8; font-size: 13px; text-align: center; padding: 16px; }
         .add-task-btn {
-            display: inline-block;
-            background: #8b7bb5;
-            color: white;
+            background: none;
             border: none;
-            border-radius: 8px;
-            padding: 4px 12px;
-            font-size: 13px;
-            cursor: pointer;
-            margin-top: 6px;
-        }
-        .add-task-btn:hover { background: #7a69a4; }
-        
-        /* Блоки столбиком */
-        .block-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
-        .block {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 14px 16px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-            min-height: 180px;
-        }
-        .block .block-header {
-            font-size: 14px;
-            font-weight: 600;
-            color: #4a3f5e;
-            margin-bottom: 10px;
-            padding-bottom: 8px;
-            border-bottom: 2px solid #ede5f5;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .block .block-header .count {
-            font-size: 11px;
-            font-weight: 400;
             color: #8b7bb5;
-            background: #f0e8fa;
-            padding: 2px 10px;
-            border-radius: 12px;
+            cursor: pointer;
+            font-size: 20px;
+            padding: 4px 8px;
+            display: block;
+            margin: 4px auto 0;
+            transition: 0.2s;
         }
-        .block-work .block-header { border-bottom-color: #ede5f5; }
-        .block-home .block-header { border-bottom-color: #ede5f5; }
-        .block-personal .block-header { border-bottom-color: #ede5f5; }
+        .add-task-btn:hover { color: #7a69a4; transform: scale(1.1); }
         
-        /* Правая колонка */
         .right-column { flex: 0 0 160px; display: flex; flex-direction: column; gap: 12px; }
         .sidebar-card {
             background: #fcfaff;
@@ -755,7 +800,6 @@ MAIN_PAGE = '''
         }
         .sidebar-card .big-btn-secondary:hover { background: #c5b8d8; }
         
-        /* Модалки */
         .modal-overlay {
             display: none;
             position: fixed;
@@ -813,13 +857,13 @@ MAIN_PAGE = '''
         .modal .btn-cancel { background: #ede5f5; color: #4a3f5e; }
         .modal .btn-cancel:hover { background: #e0d5ec; }
         
-        .modal .move-options {
+        .move-options {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 8px;
             margin-top: 12px;
         }
-        .modal .move-options button {
+        .move-options button {
             padding: 10px;
             border: 1.5px solid #ede5f5;
             border-radius: 8px;
@@ -829,8 +873,8 @@ MAIN_PAGE = '''
             transition: 0.2s;
             color: #4a3f5e;
         }
-        .modal .move-options button:hover { border-color: #8b7bb5; background: #f8f2fd; }
-        .modal .move-options button .cat-icon { display: block; font-size: 20px; }
+        .move-options button:hover { border-color: #8b7bb5; background: #f8f2fd; }
+        .move-options button .cat-icon { display: block; font-size: 20px; }
         
         @media (max-width: 1024px) {
             .left-column { flex: 1 1 100%; }
@@ -877,7 +921,7 @@ MAIN_PAGE = '''
             <div id="focusTasks"></div>
             <div class="empty-block" id="focusEmpty">
                 Нет задач в фокусе
-                <button class="add-task-btn" data-category="focus">➕ Добавить задачу</button>
+                <button class="add-task-btn" data-category="focus">➕</button>
             </div>
         </div>
 
@@ -888,7 +932,7 @@ MAIN_PAGE = '''
                 <div id="workTasks"></div>
                 <div class="empty-block" id="workEmpty">
                     Нет задач
-                    <button class="add-task-btn" data-category="work">➕ Добавить задачу</button>
+                    <button class="add-task-btn" data-category="work">➕</button>
                 </div>
             </div>
             <div class="block block-home" id="homeBlock">
@@ -896,7 +940,7 @@ MAIN_PAGE = '''
                 <div id="homeTasks"></div>
                 <div class="empty-block" id="homeEmpty">
                     Нет задач
-                    <button class="add-task-btn" data-category="home">➕ Добавить задачу</button>
+                    <button class="add-task-btn" data-category="home">➕</button>
                 </div>
             </div>
             <div class="block block-personal" id="personalBlock">
@@ -904,7 +948,7 @@ MAIN_PAGE = '''
                 <div id="personalTasks"></div>
                 <div class="empty-block" id="personalEmpty">
                     Нет задач
-                    <button class="add-task-btn" data-category="personal">➕ Добавить задачу</button>
+                    <button class="add-task-btn" data-category="personal">➕</button>
                 </div>
             </div>
         </div>
@@ -974,6 +1018,7 @@ MAIN_PAGE = '''
             <button class="move-cat-btn" data-category="work"><span class="cat-icon">💼</span> Работа</button>
             <button class="move-cat-btn" data-category="home"><span class="cat-icon">🏠</span> Дом</button>
             <button class="move-cat-btn" data-category="personal"><span class="cat-icon">❤️</span> Личное</button>
+            <button class="move-cat-btn" data-category="later" style="grid-column: span 2;"><span class="cat-icon">🕰️</span> Позже</button>
         </div>
         <div class="modal-actions">
             <button class="btn-cancel" id="cancelMoveBtn">Отмена</button>
@@ -1037,10 +1082,9 @@ MAIN_PAGE = '''
         fetch('/api/tasks')
             .then(res => res.json())
             .then(tasks => {
-                const categories = { focus: [], work: [], home: [], personal: [], later: [] };
+                const categories = { focus: [], work: [], home: [], personal: [] };
                 tasks.forEach(t => {
                     if (categories[t.category]) categories[t.category].push(t);
-                    else categories.later.push(t);
                 });
                 renderTasks(categories);
             });
@@ -1082,6 +1126,8 @@ MAIN_PAGE = '''
         if (task.date) {
             const d = new Date(task.date + 'T00:00:00');
             metaHTML += `📅 ${d.toLocaleDateString('ru-RU')}`;
+        } else {
+            metaHTML = '📅 Сегодня';
         }
         if (task.repeat_type && task.repeat_type !== 'none') {
             let label = '';
@@ -1097,7 +1143,7 @@ MAIN_PAGE = '''
         div.innerHTML = `
             <div class="task-info">
                 <span>${task.title}</span>
-                ${metaHTML ? `<span class="task-meta">${metaHTML}</span>` : ''}
+                <span class="task-meta">${metaHTML}</span>
             </div>
             <div class="task-actions">
                 <button class="edit-btn" title="Редактировать">✏️</button>
@@ -1405,6 +1451,10 @@ MAIN_PAGE = '''
                 document.getElementById('moveModal').classList.remove('open');
                 loadTasks();
                 loadBacklog();
+                // Если категория "later", обновляем страницу "Позже" при переходе
+                if (category === 'later') {
+                    // Ничего не делаем, данные обновятся при загрузке страницы
+                }
             });
         });
     });
@@ -1415,324 +1465,6 @@ MAIN_PAGE = '''
     
     loadTasks();
     loadBacklog();
-</script>
-</body>
-</html>
-'''
-
-QUARTER_PAGE = '''
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ quarter_name }} {{ quarter_year }} — Мой органайзер</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: #f6f2fd;
-            padding: 16px;
-            min-height: 100vh;
-            color: #4a3f5e;
-        }
-        .container { max-width: 900px; margin: 0 auto; }
-        .header {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 16px 24px;
-            margin-bottom: 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 10px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-        }
-        .header h1 { font-size: 22px; color: #4a3f5e; }
-        .header .user { color: #8b7bb5; font-size: 14px; }
-        .header .btn-back {
-            background: #ede5f5;
-            color: #4a3f5e;
-            border: none;
-            padding: 8px 18px;
-            border-radius: 8px;
-            text-decoration: none;
-            cursor: pointer;
-        }
-        .header .btn-back:hover { background: #e0d5ec; }
-        
-        .quarter-nav {
-            display: flex;
-            gap: 8px;
-            margin-bottom: 20px;
-            flex-wrap: wrap;
-            justify-content: center;
-        }
-        .quarter-nav .q-link {
-            padding: 8px 16px;
-            border-radius: 8px;
-            text-decoration: none;
-            background: #fcfaff;
-            color: #4a3f5e;
-            border: 1.5px solid #ede5f5;
-            font-size: 14px;
-            transition: 0.2s;
-        }
-        .quarter-nav .q-link:hover { border-color: #8b7bb5; background: #f8f2fd; }
-        .quarter-nav .q-link.current {
-            background: #8b7bb5;
-            color: white;
-            border-color: #8b7bb5;
-        }
-        .quarter-nav .q-link.past { opacity: 0.6; }
-        
-        .add-sphere {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 16px 20px;
-            margin-bottom: 20px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            align-items: center;
-        }
-        .add-sphere input {
-            flex: 1;
-            padding: 10px 14px;
-            border: 1.5px solid #ede5f5;
-            border-radius: 8px;
-            font-size: 14px;
-            min-width: 150px;
-            background: white;
-            color: #4a3f5e;
-        }
-        .add-sphere input:focus { outline: none; border-color: #8b7bb5; }
-        .add-sphere button {
-            background: #8b7bb5;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            padding: 10px 24px;
-            cursor: pointer;
-            font-size: 14px;
-        }
-        .add-sphere button:hover { background: #7a69a4; }
-        
-        .sphere {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 18px 20px;
-            margin-bottom: 16px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-            border-left: 5px solid #d5c8e6;
-        }
-        .sphere-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 12px;
-            flex-wrap: wrap;
-            gap: 8px;
-        }
-        .sphere-header h3 { font-size: 18px; color: #4a3f5e; }
-        
-        .task-item {
-            background: #faf5ff;
-            border-radius: 8px;
-            padding: 10px 14px;
-            margin-bottom: 8px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 8px;
-            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
-        }
-        .task-item .task-info { display: flex; align-items: center; gap: 10px; }
-        .task-item .task-meta { font-size: 12px; color: #b5a7cc; }
-        .task-item .task-actions button {
-            background: none;
-            border: none;
-            color: #c5b8d8;
-            cursor: pointer;
-            font-size: 14px;
-            padding: 0 4px;
-        }
-        .task-item .task-actions button:hover { color: #8b7bb5; }
-        
-        .add-task-form {
-            display: flex;
-            gap: 8px;
-            margin-top: 12px;
-            flex-wrap: wrap;
-        }
-        .add-task-form input {
-            flex: 1;
-            padding: 8px 12px;
-            border: 1.5px solid #ede5f5;
-            border-radius: 8px;
-            font-size: 13px;
-            min-width: 120px;
-            background: white;
-            color: #4a3f5e;
-        }
-        .add-task-form input:focus { outline: none; border-color: #8b7bb5; }
-        .add-task-form button {
-            background: #8b7bb5;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            padding: 8px 16px;
-            cursor: pointer;
-            font-size: 13px;
-        }
-        .add-task-form button:hover { background: #7a69a4; }
-        
-        .empty-sphere { color: #c5b8d8; font-style: italic; padding: 10px 0; }
-        
-        @media (max-width: 600px) {
-            .header { flex-direction: column; text-align: center; }
-            .add-sphere { flex-direction: column; }
-            .add-sphere input { width: 100%; }
-            .quarter-nav { justify-content: center; }
-        }
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="header">
-        <h1>🗓️ {{ quarter_name }} {{ quarter_year }}</h1>
-        <div>
-            <span class="user">👤 {{ username }}</span>
-            <a href="/" class="btn-back" style="margin-left:12px;">← Назад</a>
-            <a href="/logout" class="btn-back" style="margin-left:8px; background:#d5c8e6; color:#4a3f5e;">Выйти</a>
-        </div>
-    </div>
-    
-    <div class="quarter-nav">
-        {% for q in quarters %}
-        <a href="/quarter/{{ q.id }}" class="q-link 
-            {% if q.id == quarter %}current{% endif %}
-            {% if q.id != quarter and q.id < current_quarter %}past{% endif %}
-        ">
-            {{ q.name }} {{ q.year }}
-            {% if q.current %}⭐{% endif %}
-        </a>
-        {% endfor %}
-    </div>
-    
-    <div class="add-sphere">
-        <input type="text" id="sphereName" placeholder="Название сферы (например: Работа, Здоровье...)" autofocus>
-        <button id="addSphereBtn">➕ Добавить сферу</button>
-    </div>
-    
-    <div id="spheresContainer">
-        {% for sphere in spheres %}
-        <div class="sphere" data-sphere="{{ sphere.name }}">
-            <div class="sphere-header">
-                <h3>📂 {{ sphere.name }}</h3>
-            </div>
-            <div id="tasks-{{ loop.index }}">
-                {% for task in sphere.tasks %}
-                <div class="task-item" data-task-id="{{ task.id }}">
-                    <div class="task-info">
-                        <span>{{ task.title }}</span>
-                        {% if task.date %}
-                        <span class="task-meta">📅 {{ task.date }}</span>
-                        {% endif %}
-                    </div>
-                    <div class="task-actions">
-                        <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
-                        <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
-                    </div>
-                </div>
-                {% else %}
-                <div class="empty-sphere">Нет задач в этой сфере</div>
-                {% endfor %}
-            </div>
-            <div class="add-task-form">
-                <input type="text" class="taskInput" placeholder="Новая задача..." autofocus>
-                <input type="date" class="taskDate" />
-                <button class="addTaskBtn" data-sphere="{{ sphere.name }}">➕ Добавить задачу</button>
-            </div>
-        </div>
-        {% else %}
-        <div style="text-align:center; padding:40px; color:#c5b8d8; background:#fcfaff; border-radius:12px;">
-            <p style="font-size:18px;">📭 Нет сфер</p>
-            <p style="font-size:14px;">Добавьте первую сферу выше</p>
-        </div>
-        {% endfor %}
-    </div>
-</div>
-
-<script>
-    const quarter = '{{ quarter }}';
-    
-    document.getElementById('addSphereBtn').addEventListener('click', function() {
-        const name = document.getElementById('sphereName').value.trim();
-        if (!name) { alert('Введите название сферы'); return; }
-        
-        fetch('/api/sphere', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, quarter })
-        })
-        .then(res => res.json())
-        .then(() => location.reload());
-    });
-    
-    document.getElementById('sphereName').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') document.getElementById('addSphereBtn').click();
-    });
-    
-    document.querySelectorAll('.addTaskBtn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const sphere = this.dataset.sphere;
-            const container = this.closest('.sphere');
-            const input = container.querySelector('.taskInput');
-            const dateInput = container.querySelector('.taskDate');
-            const title = input.value.trim();
-            const date = dateInput.value;
-            
-            if (!title) { alert('Введите название задачи'); return; }
-            
-            fetch('/api/task/quarter', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ title, sphere, quarter, date })
-            })
-            .then(res => res.json())
-            .then(() => location.reload());
-        });
-    });
-    
-    document.querySelectorAll('.taskInput').forEach(input => {
-        input.addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                this.closest('.add-task-form').querySelector('.addTaskBtn').click();
-            }
-        });
-    });
-    
-    document.querySelectorAll('.done-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const taskId = this.dataset.taskId;
-            fetch(`/api/task/${taskId}/done`, { method: 'POST' })
-                .then(() => location.reload());
-        });
-    });
-    
-    document.querySelectorAll('.delete-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const taskId = this.dataset.taskId;
-            if (confirm('Удалить задачу?')) {
-                fetch(`/api/task/${taskId}`, { method: 'DELETE' })
-                    .then(() => location.reload());
-            }
-        });
-    });
 </script>
 </body>
 </html>
@@ -1754,7 +1486,7 @@ LATER_PAGE = '''
             min-height: 100vh;
             color: #4a3f5e;
         }
-        .container { max-width: 800px; margin: 0 auto; }
+        .container { max-width: 1200px; margin: 0 auto; }
         .header {
             background: #fcfaff;
             border-radius: 12px;
@@ -1779,6 +1511,21 @@ LATER_PAGE = '''
             cursor: pointer;
         }
         .header .btn-back:hover { background: #e0d5ec; }
+        
+        .later-layout {
+            display: flex;
+            gap: 20px;
+            align-items: flex-start;
+        }
+        
+        .left-panel {
+            flex: 1;
+            min-width: 280px;
+        }
+        .right-panel {
+            flex: 1;
+            min-width: 280px;
+        }
         
         .add-task {
             background: #fcfaff;
@@ -1848,10 +1595,131 @@ LATER_PAGE = '''
         
         .empty-list { color: #c5b8d8; text-align: center; padding: 30px; }
         
-        @media (max-width: 600px) {
-            .header { flex-direction: column; text-align: center; }
-            .add-task { flex-direction: column; }
-            .add-task input { width: 100%; }
+        /* Группы справа */
+        .group-section {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 18px 20px;
+            margin-bottom: 16px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        }
+        .group-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .group-header h3 { font-size: 16px; color: #4a3f5e; }
+        .group-header .delete-group {
+            background: none;
+            border: none;
+            color: #c5b8d8;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .group-header .delete-group:hover { color: #e74c3c; }
+        
+        .add-group {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 16px 20px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        .add-group input {
+            flex: 1;
+            padding: 10px 14px;
+            border: 1.5px solid #ede5f5;
+            border-radius: 8px;
+            font-size: 14px;
+            min-width: 150px;
+            background: white;
+            color: #4a3f5e;
+        }
+        .add-group input:focus { outline: none; border-color: #8b7bb5; }
+        .add-group button {
+            background: #8b7bb5;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 24px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .add-group button:hover { background: #7a69a4; }
+        
+        .group-task-item {
+            background: #faf5ff;
+            border-radius: 8px;
+            padding: 8px 14px;
+            margin-bottom: 6px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 6px;
+            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
+            font-size: 14px;
+        }
+        .group-task-item .task-actions button {
+            background: none;
+            border: none;
+            color: #c5b8d8;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 0 4px;
+        }
+        .group-task-item .task-actions button:hover { color: #8b7bb5; }
+        
+        .add-group-task {
+            display: flex;
+            gap: 6px;
+            margin-top: 8px;
+            flex-wrap: wrap;
+        }
+        .add-group-task input {
+            flex: 1;
+            padding: 6px 10px;
+            border: 1.5px solid #ede5f5;
+            border-radius: 6px;
+            font-size: 13px;
+            background: white;
+            color: #4a3f5e;
+            min-width: 100px;
+        }
+        .add-group-task input:focus { outline: none; border-color: #8b7bb5; }
+        .add-group-task button {
+            background: #8b7bb5;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            padding: 6px 14px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        .add-group-task button:hover { background: #7a69a4; }
+        
+        .move-to-group-btn {
+            background: none;
+            border: none;
+            color: #b5a7cc;
+            cursor: pointer;
+            font-size: 16px;
+            padding: 0 6px;
+        }
+        .move-to-group-btn:hover { color: #8b7bb5; }
+        
+        .group-task-list {
+            margin-top: 6px;
+        }
+        
+        @media (max-width: 900px) {
+            .later-layout { flex-direction: column; }
+            .left-panel, .right-panel { flex: 1 1 100%; }
         }
     </style>
 </head>
@@ -1866,29 +1734,69 @@ LATER_PAGE = '''
         </div>
     </div>
     
-    <div class="add-task">
-        <input type="text" id="laterTaskInput" placeholder="Что хотите отложить?" autofocus>
-        <button id="addLaterBtn">➕ Добавить</button>
-    </div>
-    
-    <div class="task-list" id="laterTasks">
-        {% for task in tasks %}
-        <div class="task-item" data-task-id="{{ task.id }}">
-            <div class="task-info">
-                <span>{{ task.title }}</span>
+    <div class="later-layout">
+        <!-- ЛЕВАЯ КОЛОНКА: Общий список -->
+        <div class="left-panel">
+            <div class="add-task">
+                <input type="text" id="laterTaskInput" placeholder="Новая задача в общий список..." autofocus>
+                <button id="addLaterBtn">➕ Добавить</button>
             </div>
-            <div class="task-actions">
-                <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
-                <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
+            <div class="task-list" id="laterTasks">
+                {% for task in tasks %}
+                <div class="task-item" data-task-id="{{ task.id }}">
+                    <div class="task-info">
+                        <span>{{ task.title }}</span>
+                    </div>
+                    <div class="task-actions">
+                        <button class="move-to-group-btn" data-task-id="{{ task.id }}" title="Переместить в группу">📂</button>
+                        <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
+                        <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
+                    </div>
+                </div>
+                {% else %}
+                <div class="empty-list">📭 Здесь пока пусто. Добавьте задачи в общий список.</div>
+                {% endfor %}
             </div>
         </div>
-        {% else %}
-        <div class="empty-list">📭 Здесь пока пусто. Добавьте задачи, которые хотите отложить на потом.</div>
-        {% endfor %}
+        
+        <!-- ПРАВАЯ КОЛОНКА: Группы -->
+        <div class="right-panel">
+            <div class="add-group">
+                <input type="text" id="newGroupInput" placeholder="Название группы (например: Идеи, Проекты...)">
+                <button id="addGroupBtn">➕ Создать группу</button>
+            </div>
+            
+            {% for group in groups %}
+            <div class="group-section" data-group="{{ group.name }}">
+                <div class="group-header">
+                    <h3>📂 {{ group.name }}</h3>
+                    <button class="delete-group" data-group-id="{{ group.id }}" data-group-name="{{ group.name }}">✕</button>
+                </div>
+                <div class="group-task-list">
+                    {% for task in group.tasks %}
+                    <div class="group-task-item" data-task-id="{{ task.id }}">
+                        <span>{{ task.title }}</span>
+                        <div class="task-actions">
+                            <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
+                            <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
+                        </div>
+                    </div>
+                    {% else %}
+                    <div class="empty-list" style="padding:10px; font-size:13px;">Нет задач в этой группе</div>
+                    {% endfor %}
+                </div>
+                <div class="add-group-task">
+                    <input type="text" class="group-task-input" placeholder="Новая задача в группу...">
+                    <button class="add-group-task-btn" data-group="{{ group.name }}">➕</button>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
     </div>
 </div>
 
 <script>
+    // --- Добавление в общий список ---
     document.getElementById('addLaterBtn').addEventListener('click', function() {
         const input = document.getElementById('laterTaskInput');
         const title = input.value.trim();
@@ -1904,11 +1812,85 @@ LATER_PAGE = '''
     });
     
     document.getElementById('laterTaskInput').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') {
-            document.getElementById('addLaterBtn').click();
-        }
+        if (e.key === 'Enter') document.getElementById('addLaterBtn').click();
     });
     
+    // --- Создание группы ---
+    document.getElementById('addGroupBtn').addEventListener('click', function() {
+        const input = document.getElementById('newGroupInput');
+        const name = input.value.trim();
+        if (!name) { alert('Введите название группы'); return; }
+        
+        fetch('/api/later/group', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name })
+        })
+        .then(res => res.json())
+        .then(() => location.reload());
+    });
+    
+    document.getElementById('newGroupInput').addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') document.getElementById('addGroupBtn').click();
+    });
+    
+    // --- Перемещение задачи в группу (из общего списка) ---
+    document.querySelectorAll('.move-to-group-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const taskId = this.dataset.taskId;
+            const groupName = prompt('Введите название группы, куда переместить задачу:');
+            if (!groupName) return;
+            
+            fetch(`/api/task/${taskId}/move_to_later_group`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ group: groupName })
+            })
+            .then(res => res.json())
+            .then(() => location.reload());
+        });
+    });
+    
+    // --- Добавление задачи напрямую в группу ---
+    document.querySelectorAll('.add-group-task-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const group = this.dataset.group;
+            const container = this.closest('.group-section');
+            const input = container.querySelector('.group-task-input');
+            const title = input.value.trim();
+            if (!title) { alert('Введите название задачи'); return; }
+            
+            fetch('/api/task/later/group', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title, group })
+            })
+            .then(res => res.json())
+            .then(() => location.reload());
+        });
+    });
+    
+    document.querySelectorAll('.group-task-input').forEach(input => {
+        input.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                this.closest('.group-section').querySelector('.add-group-task-btn').click();
+            }
+        });
+    });
+    
+    // --- Удаление группы ---
+    document.querySelectorAll('.delete-group').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const groupId = this.dataset.groupId;
+            const groupName = this.dataset.groupName;
+            if (confirm(`Удалить группу "${groupName}"? Задачи вернутся в общий список.`)) {
+                fetch(`/api/later/group/${groupId}`, { method: 'DELETE' })
+                    .then(() => location.reload());
+            }
+        });
+    });
+    
+    // --- Выполнение задачи ---
     document.querySelectorAll('.done-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
@@ -1917,6 +1899,7 @@ LATER_PAGE = '''
         });
     });
     
+    // --- Удаление задачи ---
     document.querySelectorAll('.delete-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
