@@ -118,7 +118,7 @@ def index():
     # Только задачи без привязки к кварталам
     cur.execute('''
         SELECT * FROM tasks 
-        WHERE user_id = %s AND status = %s AND (quarter IS NULL OR quarter = '') 
+        WHERE user_id = %s AND status = %s AND quarter IS NULL
         ORDER BY date ASC
     ''', (user_id, 'active'))
     tasks = cur.fetchall()
@@ -196,20 +196,25 @@ def later_page():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    # Только задачи с category='later' и без привязки к кварталам
+    # Задачи без группы и без привязки к кварталам
     cur.execute('''
         SELECT * FROM tasks 
-        WHERE user_id = %s AND category = %s AND status = %s AND (quarter IS NULL OR quarter = '') AND (later_group IS NULL OR later_group = '')
+        WHERE user_id = %s AND category = %s AND status = %s AND quarter IS NULL AND later_group IS NULL
         ORDER BY created_at DESC
     ''', (user_id, 'later', 'active'))
     tasks = cur.fetchall()
     
+    # Группы
     cur.execute('SELECT * FROM later_groups WHERE user_id = %s ORDER BY created_at ASC', (user_id,))
     groups = cur.fetchall()
     
+    # Задачи в группах
     for group in groups:
-        cur.execute('SELECT * FROM tasks WHERE user_id = %s AND later_group = %s AND status = %s AND (quarter IS NULL OR quarter = '') ORDER BY created_at DESC', 
-                   (user_id, group['name'], 'active'))
+        cur.execute('''
+            SELECT * FROM tasks 
+            WHERE user_id = %s AND later_group = %s AND status = %s AND quarter IS NULL
+            ORDER BY created_at DESC
+        ''', (user_id, group['name'], 'active'))
         group['tasks'] = cur.fetchall()
     
     conn.close()
@@ -241,6 +246,29 @@ def done_page():
     return render_template_string(DONE_PAGE, 
                                    tasks=tasks,
                                    username=session.get('username', 'Пользователь'))
+
+# --- API: Добавить задачу в "Позже" (в общий список) ---
+@app.route('/api/task/later', methods=['POST'])
+def add_later_task():
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.json
+    title = data.get('title', '').strip()
+    
+    if not title:
+        return jsonify({'error': 'Title is required'}), 400
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT INTO tasks (user_id, title, category, date, repeat_type, repeat_day, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, 'later', '', 'none', None, 'active'))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': 'Task added to later'})
 
 # --- API: Добавить группу в "Позже" ---
 @app.route('/api/later/group', methods=['POST'])
@@ -320,29 +348,6 @@ def delete_later_group(group_id):
     conn.close()
     
     return jsonify({'success': True, 'message': 'Group deleted'})
-
-# --- API: Добавить задачу в "Позже" (в общий список) ---
-@app.route('/api/task/later', methods=['POST'])
-def add_later_task():
-    if 'user_id' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    data = request.json
-    title = data.get('title', '').strip()
-    
-    if not title:
-        return jsonify({'error': 'Title is required'}), 400
-    
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('''
-        INSERT INTO tasks (user_id, title, category, date, repeat_type, repeat_day, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, 'later', '', 'none', None, 'active'))
-    conn.commit()
-    conn.close()
-    
-    return jsonify({'success': True, 'message': 'Task added to later'})
 
 # --- API: Добавить сферу в квартал ---
 @app.route('/api/sphere', methods=['POST'])
@@ -633,7 +638,7 @@ def get_tasks():
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute('''
         SELECT * FROM tasks 
-        WHERE user_id = %s AND status = %s AND (quarter IS NULL OR quarter = '')
+        WHERE user_id = %s AND status = %s AND quarter IS NULL
         ORDER BY date ASC
     ''', (session['user_id'], 'active'))
     tasks = cur.fetchall()
@@ -1512,7 +1517,7 @@ MAIN_PAGE = '''
         fetch('/api/tasks')
             .then(res => res.json())
             .then(tasks => {
-                const backlogTasks = tasks.filter(t => t.category === 'later' && (!t.quarter || t.quarter === ''));
+                const backlogTasks = tasks.filter(t => t.category === 'later');
                 const container = document.getElementById('backlogList');
                 container.innerHTML = '';
                 backlogTasks.forEach(task => {
@@ -1756,7 +1761,6 @@ QUARTER_PAGE = '''
         
         .empty-sphere { color: #c5b8d8; font-style: italic; padding: 10px 0; }
         
-        /* Модалка скрыта по умолчанию */
         .edit-sphere-modal .modal-overlay { display: none; }
         .edit-sphere-modal .modal-overlay.open { display: flex; }
         
