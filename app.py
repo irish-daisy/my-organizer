@@ -22,7 +22,6 @@ def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # Таблица пользователей
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -31,7 +30,6 @@ def init_db():
         )
     ''')
     
-    # Таблица задач
     cur.execute('''
         CREATE TABLE IF NOT EXISTS tasks (
             id SERIAL PRIMARY KEY,
@@ -48,7 +46,6 @@ def init_db():
         )
     ''')
     
-    # Таблица сфер для кварталов
     cur.execute('''
         CREATE TABLE IF NOT EXISTS spheres (
             id SERIAL PRIMARY KEY,
@@ -69,7 +66,6 @@ def get_user_id():
     return session.get('user_id')
 
 def get_current_quarter():
-    """Возвращает текущий квартал в формате Q1, Q2, Q3, Q4"""
     now = datetime.now()
     month = now.month
     if month in [1, 2, 3]:
@@ -91,10 +87,8 @@ def get_quarter_name(quarter):
     return names.get(quarter, quarter)
 
 def get_quarter_year(quarter):
-    """Возвращает год для квартала"""
     now = datetime.now()
     year = now.year
-    # Если квартал Q4 и сейчас Q1, то год -1
     if quarter == 'Q4' and now.month in [1, 2, 3]:
         return year - 1
     return year
@@ -109,7 +103,6 @@ def index():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    # Получаем задачи, которые НЕ привязаны к кварталам (или привязаны к пустому)
     cur.execute('''
         SELECT * FROM tasks 
         WHERE user_id = %s AND status = %s AND (quarter IS NULL OR quarter = '') 
@@ -119,6 +112,7 @@ def index():
     conn.close()
     
     categories = {
+        'focus': [],
         'work': [],
         'home': [],
         'personal': [],
@@ -129,28 +123,34 @@ def index():
         cat = task['category'] if task['category'] in categories else 'later'
         categories[cat].append(dict(task))
     
+    current_quarter = get_current_quarter()
+    
     return render_template_string(MAIN_PAGE, 
+                                   focus_tasks=categories['focus'],
                                    work_tasks=categories['work'],
                                    home_tasks=categories['home'],
                                    personal_tasks=categories['personal'],
                                    later_tasks=categories['later'],
-                                   username=session.get('username', 'Пользователь'))
+                                   username=session.get('username', 'Пользователь'),
+                                   current_quarter=current_quarter)
 
-# --- КВАРТАЛЫ (3 МЕСЯЦА) ---
+# --- КВАРТАЛЫ ---
 @app.route('/quarter/<quarter>')
 def quarter_page(quarter):
     if 'user_id' not in session:
         return redirect('/login')
     
+    valid_quarters = ['Q1', 'Q2', 'Q3', 'Q4']
+    if quarter not in valid_quarters:
+        return redirect('/')
+    
     user_id = session['user_id']
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    # Получаем сферы для этого квартала
     cur.execute('SELECT * FROM spheres WHERE user_id = %s AND quarter = %s ORDER BY created_at ASC', (user_id, quarter))
     spheres = cur.fetchall()
     
-    # Для каждой сферы получаем задачи
     for sphere in spheres:
         cur.execute('SELECT * FROM tasks WHERE user_id = %s AND sphere = %s AND quarter = %s AND status = %s ORDER BY date ASC', 
                    (user_id, sphere['name'], quarter, 'active'))
@@ -158,9 +158,7 @@ def quarter_page(quarter):
     
     conn.close()
     
-    # Получаем все кварталы для навигации
     quarters = ['Q1', 'Q2', 'Q3', 'Q4']
-    current_year = datetime.now().year
     current_q = get_current_quarter()
     
     quarter_data = []
@@ -194,7 +192,6 @@ def later_page():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    # Получаем все задачи со статусом "later" (позже)
     cur.execute('''
         SELECT * FROM tasks 
         WHERE user_id = %s AND category = %s AND status = %s
@@ -278,7 +275,7 @@ def add_quarter_task():
     
     return jsonify({'success': True, 'message': 'Task added to quarter'})
 
-# --- API: Добавить задачу напрямую в категорию (с главной страницы) ---
+# --- API: Добавить задачу напрямую в категорию ---
 @app.route('/api/task/direct', methods=['POST'])
 def add_direct_task():
     if 'user_id' not in session:
@@ -305,7 +302,7 @@ def add_direct_task():
     
     return jsonify({'success': True, 'message': 'Task added'})
 
-# --- API: Добавить задачу в бэклог (Распределить) ---
+# --- API: Добавить задачу в бэклог ---
 @app.route('/api/task', methods=['POST'])
 def add_task():
     if 'user_id' not in session:
@@ -408,6 +405,23 @@ def done_task(task_id):
     
     return jsonify({'success': True, 'message': 'Task done'})
 
+# --- API: Переместить задачу из бэклога в категорию ---
+@app.route('/api/task/<int:task_id>/move', methods=['PUT'])
+def move_task(task_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.json
+    category = data.get('category', 'later')
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('UPDATE tasks SET category = %s WHERE id = %s AND user_id = %s', (category, task_id, session['user_id']))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': 'Task moved'})
+
 # --- API: Получить все задачи ---
 @app.route('/api/tasks')
 def get_tasks():
@@ -493,9 +507,10 @@ MAIN_PAGE = '''
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: #f4f6f9;
+            background: #f6f2fd;
             padding: 16px;
             min-height: 100vh;
+            color: #4a3f5e;
         }
         .app-container {
             display: flex;
@@ -509,12 +524,13 @@ MAIN_PAGE = '''
         /* Левая колонка */
         .left-column {
             flex: 0 0 240px;
-            background: #f0f2f5;
+            background: #fcfaff;
             border-radius: 14px;
             padding: 18px 14px;
             min-height: 400px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
         }
-        .left-column h2 { font-size: 15px; color: #6b7280; margin-bottom: 12px; }
+        .left-column h2 { font-size: 15px; color: #8b7bb5; margin-bottom: 12px; }
         .backlog-add {
             display: flex;
             gap: 6px;
@@ -524,19 +540,23 @@ MAIN_PAGE = '''
         .backlog-add input {
             flex: 1;
             padding: 8px 12px;
-            border: 1px solid #ddd;
+            border: 1.5px solid #ede5f5;
             border-radius: 8px;
             font-size: 13px;
             min-width: 100px;
+            background: white;
+            color: #4a3f5e;
         }
+        .backlog-add input:focus { outline: none; border-color: #8b7bb5; }
         .backlog-add button {
-            background: #4361ee;
+            background: #8b7bb5;
             color: white;
             border: none;
             border-radius: 8px;
             padding: 8px 14px;
             cursor: pointer;
         }
+        .backlog-add button:hover { background: #7a69a4; }
         .backlog-item {
             background: white;
             border-radius: 8px;
@@ -546,26 +566,28 @@ MAIN_PAGE = '''
             justify-content: space-between;
             align-items: center;
             font-size: 14px;
-            border-left: 4px solid #9ca3af;
+            border-left: 4px solid #d5c8e6;
+            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.06);
         }
         .backlog-item .move-btn {
             background: none;
             border: none;
-            color: #9ca3af;
+            color: #b5a7cc;
             cursor: pointer;
             font-size: 16px;
+            padding: 4px 8px;
         }
-        .backlog-item .move-btn:hover { color: #4361ee; }
+        .backlog-item .move-btn:hover { color: #8b7bb5; }
         .backlog-hint {
             font-size: 11px;
-            color: #bbb;
+            color: #c5b8d8;
             margin-top: 8px;
         }
         
         /* Центр */
         .center-column { flex: 1; min-width: 280px; }
         .header {
-            background: white;
+            background: #fcfaff;
             border-radius: 12px;
             padding: 12px 20px;
             margin-bottom: 16px;
@@ -574,32 +596,33 @@ MAIN_PAGE = '''
             align-items: center;
             flex-wrap: wrap;
             gap: 8px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
         }
-        .header h1 { font-size: 20px; color: #1a1a2e; }
-        .header .user { color: #6b7280; font-size: 14px; }
+        .header h1 { font-size: 20px; color: #4a3f5e; }
+        .header .user { color: #8b7bb5; font-size: 14px; }
         .header .btn-exit {
-            background: #e74c3c;
-            color: white;
+            background: #d5c8e6;
+            color: #4a3f5e;
             border: none;
             padding: 6px 14px;
             border-radius: 8px;
             cursor: pointer;
         }
+        .header .btn-exit:hover { background: #c5b8d8; }
         
         /* Фокус */
         .focus-block {
-            background: white;
+            background: #fcfaff;
             border-radius: 14px;
             padding: 18px 20px;
             margin-bottom: 20px;
-            border: 2px solid #4361ee;
-            box-shadow: 0 2px 12px rgba(67,97,238,0.08);
+            border: 2px solid #d5c8e6;
+            box-shadow: 0 2px 12px rgba(139, 123, 181, 0.06);
         }
         .focus-block .block-header {
             font-size: 18px;
             font-weight: 700;
-            color: #1a1a2e;
+            color: #4a3f5e;
             margin-bottom: 12px;
             display: flex;
             justify-content: space-between;
@@ -608,13 +631,13 @@ MAIN_PAGE = '''
         .focus-block .block-header .count {
             font-size: 13px;
             font-weight: 400;
-            color: #6b7280;
-            background: #f0f2f5;
+            color: #8b7bb5;
+            background: #f0e8fa;
             padding: 2px 14px;
             border-radius: 20px;
         }
         .task-card {
-            background: #f8f9fa;
+            background: #faf5ff;
             border-radius: 10px;
             padding: 10px 14px;
             margin-bottom: 8px;
@@ -623,32 +646,34 @@ MAIN_PAGE = '''
             align-items: center;
             flex-wrap: wrap;
             gap: 6px;
-            border-left: 4px solid #ddd;
+            border-left: 4px solid #d5c8e6;
             cursor: pointer;
             transition: 0.2s;
+            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
         }
-        .task-card:hover { background: #f0f2f5; }
+        .task-card:hover { background: #f5eefa; }
         .task-card .task-info { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-        .task-card .task-meta { font-size: 11px; color: #6b7280; display: flex; align-items: center; gap: 6px; }
-        .task-card .task-meta .repeat-icon { color: #f39c12; }
+        .task-card .task-meta { font-size: 11px; color: #b5a7cc; display: flex; align-items: center; gap: 6px; }
+        .task-card .task-meta .repeat-icon { color: #b5a7cc; }
         .task-card .task-actions button {
             background: none;
             border: none;
-            color: #9ca3af;
+            color: #c5b8d8;
             cursor: pointer;
             font-size: 14px;
             padding: 0 4px;
         }
-        .task-card .task-actions button:hover { color: #4361ee; }
-        .task-card.tag-work { border-left-color: #4361ee; }
-        .task-card.tag-home { border-left-color: #2ecc71; }
-        .task-card.tag-personal { border-left-color: #e74c3c; }
-        .task-card.tag-later { border-left-color: #9ca3af; }
+        .task-card .task-actions button:hover { color: #8b7bb5; }
+        .task-card.tag-focus { border-left-color: #8b7bb5; }
+        .task-card.tag-work { border-left-color: #8b7bb5; }
+        .task-card.tag-home { border-left-color: #8b7bb5; }
+        .task-card.tag-personal { border-left-color: #8b7bb5; }
+        .task-card.tag-later { border-left-color: #c5b8d8; }
         
-        .empty-block { color: #bbb; font-size: 13px; text-align: center; padding: 16px; }
+        .empty-block { color: #c5b8d8; font-size: 13px; text-align: center; padding: 16px; }
         .add-task-btn {
             display: inline-block;
-            background: #4361ee;
+            background: #8b7bb5;
             color: white;
             border: none;
             border-radius: 8px;
@@ -657,24 +682,24 @@ MAIN_PAGE = '''
             cursor: pointer;
             margin-top: 6px;
         }
-        .add-task-btn:hover { background: #3a56d4; }
+        .add-task-btn:hover { background: #7a69a4; }
         
         /* Блоки столбиком */
         .block-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
         .block {
-            background: white;
+            background: #fcfaff;
             border-radius: 12px;
             padding: 14px 16px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
             min-height: 180px;
         }
         .block .block-header {
             font-size: 14px;
             font-weight: 600;
-            color: #1a1a2e;
+            color: #4a3f5e;
             margin-bottom: 10px;
             padding-bottom: 8px;
-            border-bottom: 2px solid #f0f2f5;
+            border-bottom: 2px solid #ede5f5;
             display: flex;
             justify-content: space-between;
             align-items: center;
@@ -682,26 +707,26 @@ MAIN_PAGE = '''
         .block .block-header .count {
             font-size: 11px;
             font-weight: 400;
-            color: #9ca3af;
-            background: #f0f2f5;
+            color: #8b7bb5;
+            background: #f0e8fa;
             padding: 2px 10px;
             border-radius: 12px;
         }
-        .block-work .block-header { border-bottom-color: #4361ee; }
-        .block-home .block-header { border-bottom-color: #2ecc71; }
-        .block-personal .block-header { border-bottom-color: #e74c3c; }
+        .block-work .block-header { border-bottom-color: #ede5f5; }
+        .block-home .block-header { border-bottom-color: #ede5f5; }
+        .block-personal .block-header { border-bottom-color: #ede5f5; }
         
         /* Правая колонка */
         .right-column { flex: 0 0 160px; display: flex; flex-direction: column; gap: 12px; }
         .sidebar-card {
-            background: white;
+            background: #fcfaff;
             border-radius: 12px;
             padding: 14px;
             text-align: center;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
         }
         .sidebar-card .big-btn {
-            background: #4361ee;
+            background: #8b7bb5;
             color: white;
             border: none;
             border-radius: 10px;
@@ -713,10 +738,10 @@ MAIN_PAGE = '''
             text-decoration: none;
             display: inline-block;
         }
-        .sidebar-card .big-btn:hover { background: #3a56d4; }
+        .sidebar-card .big-btn:hover { background: #7a69a4; }
         .sidebar-card .big-btn-secondary {
-            background: #6b7280;
-            color: white;
+            background: #d5c8e6;
+            color: #4a3f5e;
             border: none;
             border-radius: 10px;
             padding: 12px;
@@ -728,14 +753,14 @@ MAIN_PAGE = '''
             display: inline-block;
             margin-top: 8px;
         }
-        .sidebar-card .big-btn-secondary:hover { background: #4b5563; }
+        .sidebar-card .big-btn-secondary:hover { background: #c5b8d8; }
         
-        /* Модалка */
+        /* Модалки */
         .modal-overlay {
             display: none;
             position: fixed;
             top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(0,0,0,0.3);
+            background: rgba(74, 63, 94, 0.3);
             backdrop-filter: blur(4px);
             z-index: 999;
             justify-content: center;
@@ -743,48 +768,69 @@ MAIN_PAGE = '''
         }
         .modal-overlay.open { display: flex; }
         .modal {
-            background: white;
+            background: #fcfaff;
             border-radius: 18px;
             padding: 24px 28px;
             max-width: 420px;
             width: 90%;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.2);
+            box-shadow: 0 20px 60px rgba(74, 63, 94, 0.15);
             max-height: 90vh;
             overflow-y: auto;
         }
-        .modal h3 { font-size: 18px; margin-bottom: 4px; }
-        .modal .sub { font-size: 13px; color: #6b7280; margin-bottom: 16px; }
-        .modal label { font-size: 12px; font-weight: 600; color: #1a1a2e; display: block; margin-top: 12px; margin-bottom: 4px; }
+        .modal h3 { font-size: 18px; margin-bottom: 4px; color: #4a3f5e; }
+        .modal .sub { font-size: 13px; color: #8b7bb5; margin-bottom: 16px; }
+        .modal label { font-size: 12px; font-weight: 600; color: #4a3f5e; display: block; margin-top: 12px; margin-bottom: 4px; }
         .modal input, .modal select {
             width: 100%;
             padding: 8px 12px;
-            border: 1.5px solid #ddd;
+            border: 1.5px solid #ede5f5;
             border-radius: 8px;
             font-size: 14px;
+            background: white;
+            color: #4a3f5e;
         }
-        .modal input:focus, .modal select:focus { outline: none; border-color: #4361ee; }
+        .modal input:focus, .modal select:focus { outline: none; border-color: #8b7bb5; }
         .modal .checkbox-group {
             display: flex;
             align-items: center;
             gap: 8px;
             margin-top: 12px;
         }
-        .modal .checkbox-group input[type="checkbox"] { width: 18px; height: 18px; accent-color: #4361ee; }
+        .modal .checkbox-group input[type="checkbox"] { width: 18px; height: 18px; accent-color: #8b7bb5; }
         .modal .checkbox-group label { margin: 0; font-weight: 400; font-size: 14px; }
         .modal .repeat-options {
             display: none;
             margin-top: 8px;
             padding: 12px;
-            background: #f8f9fa;
+            background: #f8f2fd;
             border-radius: 8px;
         }
         .modal .repeat-options.visible { display: block; }
         .modal .modal-actions { display: flex; gap: 10px; margin-top: 18px; }
         .modal .modal-actions button { flex: 1; padding: 10px; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; }
-        .modal .btn-save { background: #4361ee; color: white; }
-        .modal .btn-save:hover { background: #3a56d4; }
-        .modal .btn-cancel { background: #f0f2f5; color: #6b7280; }
-        .modal .btn-cancel:hover { background: #e5e7eb; }
+        .modal .btn-save { background: #8b7bb5; color: white; }
+        .modal .btn-save:hover { background: #7a69a4; }
+        .modal .btn-cancel { background: #ede5f5; color: #4a3f5e; }
+        .modal .btn-cancel:hover { background: #e0d5ec; }
+        
+        .modal .move-options {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .modal .move-options button {
+            padding: 10px;
+            border: 1.5px solid #ede5f5;
+            border-radius: 8px;
+            background: white;
+            cursor: pointer;
+            font-size: 14px;
+            transition: 0.2s;
+            color: #4a3f5e;
+        }
+        .modal .move-options button:hover { border-color: #8b7bb5; background: #f8f2fd; }
+        .modal .move-options button .cat-icon { display: block; font-size: 20px; }
         
         @media (max-width: 1024px) {
             .left-column { flex: 1 1 100%; }
@@ -805,7 +851,7 @@ MAIN_PAGE = '''
     <div class="left-column">
         <h2>📥 Распределить</h2>
         <div class="backlog-add">
-            <input type="text" id="newTaskInput" placeholder="Новая задача...">
+            <input type="text" id="newTaskInput" placeholder="Новая задача..." autofocus>
             <button id="addBacklogBtn">+</button>
         </div>
         <div id="backlogList"></div>
@@ -880,9 +926,13 @@ MAIN_PAGE = '''
         <p class="sub" id="addTaskModalSub">Добавьте задачу в категорию</p>
         <input type="hidden" id="addTaskCategory">
         <label for="addTaskTitle">Название задачи</label>
-        <input type="text" id="addTaskTitle" placeholder="Что нужно сделать?">
+        <input type="text" id="addTaskTitle" placeholder="Что нужно сделать?" autofocus>
         <label for="addTaskDate">Дата выполнения</label>
-        <input type="date" id="addTaskDate">
+        <div style="display:flex; gap:8px; align-items:center;">
+            <input type="text" id="addTaskDateDisplay" placeholder="Сегодня" style="flex:1;">
+            <input type="date" id="addTaskDateHidden" style="display:none;">
+            <button id="addTaskDateToggle" style="padding:8px 12px; border:1.5px solid #ede5f5; border-radius:8px; background:white; cursor:pointer; color:#4a3f5e;">📅</button>
+        </div>
         <div class="checkbox-group">
             <input type="checkbox" id="addTaskRepeat">
             <label for="addTaskRepeat">🔄 Повторяющаяся задача</label>
@@ -909,6 +959,24 @@ MAIN_PAGE = '''
         <div class="modal-actions">
             <button class="btn-save" id="saveAddTaskBtn">💾 Сохранить</button>
             <button class="btn-cancel" id="cancelAddTaskBtn">Отмена</button>
+        </div>
+    </div>
+</div>
+
+<!-- Модалка для перемещения задачи из бэклога -->
+<div class="modal-overlay" id="moveModal">
+    <div class="modal">
+        <h3>➡️ Переместить задачу</h3>
+        <p class="sub" id="moveTaskTitle">Выберите категорию</p>
+        <input type="hidden" id="moveTaskId">
+        <div class="move-options">
+            <button class="move-cat-btn" data-category="focus"><span class="cat-icon">🎯</span> Фокус</button>
+            <button class="move-cat-btn" data-category="work"><span class="cat-icon">💼</span> Работа</button>
+            <button class="move-cat-btn" data-category="home"><span class="cat-icon">🏠</span> Дом</button>
+            <button class="move-cat-btn" data-category="personal"><span class="cat-icon">❤️</span> Личное</button>
+        </div>
+        <div class="modal-actions">
+            <button class="btn-cancel" id="cancelMoveBtn">Отмена</button>
         </div>
     </div>
 </div>
@@ -963,8 +1031,8 @@ MAIN_PAGE = '''
 
 <script>
     let currentTaskId = null;
+    let moveTaskId = null;
     
-    // --- Загрузка задач ---
     function loadTasks() {
         fetch('/api/tasks')
             .then(res => res.json())
@@ -1000,11 +1068,7 @@ MAIN_PAGE = '''
             
             countEl.textContent = tasks.length;
             if (emptyEl) {
-                if (tasks.length === 0) {
-                    emptyEl.style.display = 'block';
-                } else {
-                    emptyEl.style.display = 'none';
-                }
+                emptyEl.style.display = tasks.length === 0 ? 'block' : 'none';
             }
         }
     }
@@ -1064,7 +1128,6 @@ MAIN_PAGE = '''
         return div;
     }
     
-    // --- Добавление задачи в категорию (модалка) ---
     document.querySelectorAll('.add-task-btn').forEach(btn => {
         btn.addEventListener('click', function(e) {
             e.stopPropagation();
@@ -1072,11 +1135,13 @@ MAIN_PAGE = '''
             document.getElementById('addTaskCategory').value = category;
             document.getElementById('addTaskModalSub').textContent = `Добавьте задачу в категорию: ${getCategoryName(category)}`;
             document.getElementById('addTaskTitle').value = '';
-            document.getElementById('addTaskDate').value = '';
+            document.getElementById('addTaskDateDisplay').value = 'Сегодня';
+            document.getElementById('addTaskDateHidden').value = '';
             document.getElementById('addTaskRepeat').checked = false;
             document.getElementById('addRepeatOptions').classList.remove('visible');
             document.getElementById('addWeeklyDayGroup').style.display = 'none';
             document.getElementById('addTaskModal').classList.add('open');
+            setTimeout(() => document.getElementById('addTaskTitle').focus(), 100);
         });
     });
     
@@ -1091,6 +1156,38 @@ MAIN_PAGE = '''
         return names[cat] || cat;
     }
     
+    document.getElementById('addTaskDateDisplay').addEventListener('focus', function() {
+        const hidden = document.getElementById('addTaskDateHidden');
+        hidden.style.display = 'inline-block';
+        hidden.focus();
+    });
+    
+    document.getElementById('addTaskDateHidden').addEventListener('change', function() {
+        if (this.value) {
+            const d = new Date(this.value + 'T00:00:00');
+            document.getElementById('addTaskDateDisplay').value = d.toLocaleDateString('ru-RU');
+        } else {
+            document.getElementById('addTaskDateDisplay').value = 'Сегодня';
+        }
+        this.style.display = 'none';
+    });
+    
+    document.getElementById('addTaskDateDisplay').addEventListener('blur', function() {
+        setTimeout(() => {
+            document.getElementById('addTaskDateHidden').style.display = 'none';
+        }, 200);
+    });
+    
+    document.getElementById('addTaskDateToggle').addEventListener('click', function() {
+        const hidden = document.getElementById('addTaskDateHidden');
+        if (hidden.style.display === 'none') {
+            hidden.style.display = 'inline-block';
+            hidden.focus();
+        } else {
+            hidden.style.display = 'none';
+        }
+    });
+    
     document.getElementById('cancelAddTaskBtn').addEventListener('click', () => {
         document.getElementById('addTaskModal').classList.remove('open');
     });
@@ -1098,7 +1195,14 @@ MAIN_PAGE = '''
     document.getElementById('saveAddTaskBtn').addEventListener('click', () => {
         const category = document.getElementById('addTaskCategory').value;
         const title = document.getElementById('addTaskTitle').value.trim();
-        const date = document.getElementById('addTaskDate').value;
+        const dateDisplay = document.getElementById('addTaskDateDisplay').value;
+        let date = document.getElementById('addTaskDateHidden').value;
+        if (!date && dateDisplay !== 'Сегодня' && dateDisplay !== '') {
+            const parts = dateDisplay.split('.');
+            if (parts.length === 3) {
+                date = `${parts[2]}-${parts[1]}-${parts[0]}`;
+            }
+        }
         const isRepeating = document.getElementById('addTaskRepeat').checked;
         let repeatType = 'none';
         let repeatDay = null;
@@ -1121,10 +1225,14 @@ MAIN_PAGE = '''
         .then(() => {
             document.getElementById('addTaskModal').classList.remove('open');
             loadTasks();
+            loadBacklog();
         });
     });
     
-    // Показ/скрытие опций повторения в модалке добавления
+    document.getElementById('addTaskTitle').addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') document.getElementById('saveAddTaskBtn').click();
+    });
+    
     document.getElementById('addTaskRepeat').addEventListener('change', function() {
         const options = document.getElementById('addRepeatOptions');
         if (this.checked) {
@@ -1142,7 +1250,6 @@ MAIN_PAGE = '''
         document.getElementById('addWeeklyDayGroup').style.display = this.value === 'weekly' ? 'block' : 'none';
     });
     
-    // --- Редактирование ---
     function openEditModal(task) {
         currentTaskId = task.id;
         document.getElementById('editTaskId').value = task.id;
@@ -1169,6 +1276,7 @@ MAIN_PAGE = '''
         }
         
         document.getElementById('editModal').classList.add('open');
+        setTimeout(() => document.getElementById('editTaskTitle').focus(), 100);
     }
     
     document.getElementById('cancelEditBtn').addEventListener('click', () => {
@@ -1205,7 +1313,10 @@ MAIN_PAGE = '''
         });
     });
     
-    // Показ/скрытие опций повторения в модалке редактирования
+    document.getElementById('editTaskTitle').addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') document.getElementById('saveEditBtn').click();
+    });
+    
     document.getElementById('editTaskRepeat').addEventListener('change', function() {
         const options = document.getElementById('editRepeatOptions');
         if (this.checked) {
@@ -1223,7 +1334,6 @@ MAIN_PAGE = '''
         document.getElementById('editWeeklyDayGroup').style.display = this.value === 'weekly' ? 'block' : 'none';
     });
     
-    // --- Бэклог ---
     document.getElementById('addBacklogBtn').addEventListener('click', () => {
         const input = document.getElementById('newTaskInput');
         const title = input.value.trim();
@@ -1252,7 +1362,6 @@ MAIN_PAGE = '''
         fetch('/api/tasks')
             .then(res => res.json())
             .then(tasks => {
-                // Задачи из "Распределить" — те, у которых category = 'later' и нет привязки к кварталам
                 const backlogTasks = tasks.filter(t => t.category === 'later' && (!t.quarter || t.quarter === ''));
                 const container = document.getElementById('backlogList');
                 container.innerHTML = '';
@@ -1267,15 +1376,43 @@ MAIN_PAGE = '''
                 });
                 
                 document.querySelectorAll('.move-btn').forEach(btn => {
-                    btn.addEventListener('click', function() {
+                    btn.addEventListener('click', function(e) {
+                        e.stopPropagation();
                         const taskId = this.dataset.taskId;
-                        alert('⬅️ Переместить задачу (будет реализовано позже)');
+                        const task = backlogTasks.find(t => t.id == taskId);
+                        if (task) {
+                            document.getElementById('moveTaskId').value = taskId;
+                            document.getElementById('moveTaskTitle').textContent = `"${task.title}" → куда?`;
+                            document.getElementById('moveModal').classList.add('open');
+                        }
                     });
                 });
             });
     }
     
-    // --- Загрузка при старте ---
+    document.querySelectorAll('.move-cat-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const taskId = document.getElementById('moveTaskId').value;
+            const category = this.dataset.category;
+            
+            fetch(`/api/task/${taskId}/move`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ category })
+            })
+            .then(res => res.json())
+            .then(() => {
+                document.getElementById('moveModal').classList.remove('open');
+                loadTasks();
+                loadBacklog();
+            });
+        });
+    });
+    
+    document.getElementById('cancelMoveBtn').addEventListener('click', () => {
+        document.getElementById('moveModal').classList.remove('open');
+    });
+    
     loadTasks();
     loadBacklog();
 </script>
@@ -1294,13 +1431,14 @@ QUARTER_PAGE = '''
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: #f4f6f9;
+            background: #f6f2fd;
             padding: 16px;
             min-height: 100vh;
+            color: #4a3f5e;
         }
         .container { max-width: 900px; margin: 0 auto; }
         .header {
-            background: white;
+            background: #fcfaff;
             border-radius: 12px;
             padding: 16px 24px;
             margin-bottom: 20px;
@@ -1309,20 +1447,20 @@ QUARTER_PAGE = '''
             align-items: center;
             flex-wrap: wrap;
             gap: 10px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
         }
-        .header h1 { font-size: 22px; color: #1a1a2e; }
-        .header .user { color: #6b7280; font-size: 14px; }
+        .header h1 { font-size: 22px; color: #4a3f5e; }
+        .header .user { color: #8b7bb5; font-size: 14px; }
         .header .btn-back {
-            background: #6b7280;
-            color: white;
+            background: #ede5f5;
+            color: #4a3f5e;
             border: none;
             padding: 8px 18px;
             border-radius: 8px;
             text-decoration: none;
             cursor: pointer;
         }
-        .header .btn-back:hover { background: #4b5563; }
+        .header .btn-back:hover { background: #e0d5ec; }
         
         .quarter-nav {
             display: flex;
@@ -1335,26 +1473,26 @@ QUARTER_PAGE = '''
             padding: 8px 16px;
             border-radius: 8px;
             text-decoration: none;
-            background: white;
-            color: #1a1a2e;
-            border: 1.5px solid #ddd;
+            background: #fcfaff;
+            color: #4a3f5e;
+            border: 1.5px solid #ede5f5;
             font-size: 14px;
             transition: 0.2s;
         }
-        .quarter-nav .q-link:hover { border-color: #4361ee; background: #f8f9ff; }
+        .quarter-nav .q-link:hover { border-color: #8b7bb5; background: #f8f2fd; }
         .quarter-nav .q-link.current {
-            background: #4361ee;
+            background: #8b7bb5;
             color: white;
-            border-color: #4361ee;
+            border-color: #8b7bb5;
         }
         .quarter-nav .q-link.past { opacity: 0.6; }
         
         .add-sphere {
-            background: white;
+            background: #fcfaff;
             border-radius: 12px;
             padding: 16px 20px;
             margin-bottom: 20px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
             display: flex;
             gap: 10px;
             flex-wrap: wrap;
@@ -1363,14 +1501,16 @@ QUARTER_PAGE = '''
         .add-sphere input {
             flex: 1;
             padding: 10px 14px;
-            border: 1.5px solid #ddd;
+            border: 1.5px solid #ede5f5;
             border-radius: 8px;
             font-size: 14px;
             min-width: 150px;
+            background: white;
+            color: #4a3f5e;
         }
-        .add-sphere input:focus { outline: none; border-color: #4361ee; }
+        .add-sphere input:focus { outline: none; border-color: #8b7bb5; }
         .add-sphere button {
-            background: #4361ee;
+            background: #8b7bb5;
             color: white;
             border: none;
             border-radius: 8px;
@@ -1378,15 +1518,15 @@ QUARTER_PAGE = '''
             cursor: pointer;
             font-size: 14px;
         }
-        .add-sphere button:hover { background: #3a56d4; }
+        .add-sphere button:hover { background: #7a69a4; }
         
         .sphere {
-            background: white;
+            background: #fcfaff;
             border-radius: 12px;
             padding: 18px 20px;
             margin-bottom: 16px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-            border-left: 5px solid #4361ee;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+            border-left: 5px solid #d5c8e6;
         }
         .sphere-header {
             display: flex;
@@ -1396,10 +1536,10 @@ QUARTER_PAGE = '''
             flex-wrap: wrap;
             gap: 8px;
         }
-        .sphere-header h3 { font-size: 18px; color: #1a1a2e; }
+        .sphere-header h3 { font-size: 18px; color: #4a3f5e; }
         
         .task-item {
-            background: #f8f9fa;
+            background: #faf5ff;
             border-radius: 8px;
             padding: 10px 14px;
             margin-bottom: 8px;
@@ -1408,18 +1548,19 @@ QUARTER_PAGE = '''
             align-items: center;
             flex-wrap: wrap;
             gap: 8px;
+            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
         }
         .task-item .task-info { display: flex; align-items: center; gap: 10px; }
-        .task-item .task-meta { font-size: 12px; color: #6b7280; }
+        .task-item .task-meta { font-size: 12px; color: #b5a7cc; }
         .task-item .task-actions button {
             background: none;
             border: none;
-            color: #9ca3af;
+            color: #c5b8d8;
             cursor: pointer;
             font-size: 14px;
             padding: 0 4px;
         }
-        .task-item .task-actions button:hover { color: #4361ee; }
+        .task-item .task-actions button:hover { color: #8b7bb5; }
         
         .add-task-form {
             display: flex;
@@ -1430,14 +1571,16 @@ QUARTER_PAGE = '''
         .add-task-form input {
             flex: 1;
             padding: 8px 12px;
-            border: 1.5px solid #ddd;
+            border: 1.5px solid #ede5f5;
             border-radius: 8px;
             font-size: 13px;
             min-width: 120px;
+            background: white;
+            color: #4a3f5e;
         }
-        .add-task-form input:focus { outline: none; border-color: #4361ee; }
+        .add-task-form input:focus { outline: none; border-color: #8b7bb5; }
         .add-task-form button {
-            background: #2ecc71;
+            background: #8b7bb5;
             color: white;
             border: none;
             border-radius: 8px;
@@ -1445,9 +1588,9 @@ QUARTER_PAGE = '''
             cursor: pointer;
             font-size: 13px;
         }
-        .add-task-form button:hover { background: #27ae60; }
+        .add-task-form button:hover { background: #7a69a4; }
         
-        .empty-sphere { color: #bbb; font-style: italic; padding: 10px 0; }
+        .empty-sphere { color: #c5b8d8; font-style: italic; padding: 10px 0; }
         
         @media (max-width: 600px) {
             .header { flex-direction: column; text-align: center; }
@@ -1464,11 +1607,10 @@ QUARTER_PAGE = '''
         <div>
             <span class="user">👤 {{ username }}</span>
             <a href="/" class="btn-back" style="margin-left:12px;">← Назад</a>
-            <a href="/logout" class="btn-back" style="margin-left:8px; background:#e74c3c;">Выйти</a>
+            <a href="/logout" class="btn-back" style="margin-left:8px; background:#d5c8e6; color:#4a3f5e;">Выйти</a>
         </div>
     </div>
     
-    <!-- Навигация по кварталам -->
     <div class="quarter-nav">
         {% for q in quarters %}
         <a href="/quarter/{{ q.id }}" class="q-link 
@@ -1482,7 +1624,7 @@ QUARTER_PAGE = '''
     </div>
     
     <div class="add-sphere">
-        <input type="text" id="sphereName" placeholder="Название сферы (например: Работа, Здоровье...)" />
+        <input type="text" id="sphereName" placeholder="Название сферы (например: Работа, Здоровье...)" autofocus>
         <button id="addSphereBtn">➕ Добавить сферу</button>
     </div>
     
@@ -1511,13 +1653,13 @@ QUARTER_PAGE = '''
                 {% endfor %}
             </div>
             <div class="add-task-form">
-                <input type="text" class="taskInput" placeholder="Новая задача..." />
+                <input type="text" class="taskInput" placeholder="Новая задача..." autofocus>
                 <input type="date" class="taskDate" />
                 <button class="addTaskBtn" data-sphere="{{ sphere.name }}">➕ Добавить задачу</button>
             </div>
         </div>
         {% else %}
-        <div style="text-align:center; padding:40px; color:#aaa; background:white; border-radius:12px;">
+        <div style="text-align:center; padding:40px; color:#c5b8d8; background:#fcfaff; border-radius:12px;">
             <p style="font-size:18px;">📭 Нет сфер</p>
             <p style="font-size:14px;">Добавьте первую сферу выше</p>
         </div>
@@ -1607,13 +1749,14 @@ LATER_PAGE = '''
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: #f4f6f9;
+            background: #f6f2fd;
             padding: 16px;
             min-height: 100vh;
+            color: #4a3f5e;
         }
         .container { max-width: 800px; margin: 0 auto; }
         .header {
-            background: white;
+            background: #fcfaff;
             border-radius: 12px;
             padding: 16px 24px;
             margin-bottom: 20px;
@@ -1622,27 +1765,27 @@ LATER_PAGE = '''
             align-items: center;
             flex-wrap: wrap;
             gap: 10px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
         }
-        .header h1 { font-size: 22px; color: #1a1a2e; }
-        .header .user { color: #6b7280; font-size: 14px; }
+        .header h1 { font-size: 22px; color: #4a3f5e; }
+        .header .user { color: #8b7bb5; font-size: 14px; }
         .header .btn-back {
-            background: #6b7280;
-            color: white;
+            background: #ede5f5;
+            color: #4a3f5e;
             border: none;
             padding: 8px 18px;
             border-radius: 8px;
             text-decoration: none;
             cursor: pointer;
         }
-        .header .btn-back:hover { background: #4b5563; }
+        .header .btn-back:hover { background: #e0d5ec; }
         
         .add-task {
-            background: white;
+            background: #fcfaff;
             border-radius: 12px;
             padding: 16px 20px;
             margin-bottom: 20px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
             display: flex;
             gap: 10px;
             flex-wrap: wrap;
@@ -1651,14 +1794,16 @@ LATER_PAGE = '''
         .add-task input {
             flex: 1;
             padding: 10px 14px;
-            border: 1.5px solid #ddd;
+            border: 1.5px solid #ede5f5;
             border-radius: 8px;
             font-size: 14px;
             min-width: 150px;
+            background: white;
+            color: #4a3f5e;
         }
-        .add-task input:focus { outline: none; border-color: #4361ee; }
+        .add-task input:focus { outline: none; border-color: #8b7bb5; }
         .add-task button {
-            background: #4361ee;
+            background: #8b7bb5;
             color: white;
             border: none;
             border-radius: 8px;
@@ -1666,16 +1811,16 @@ LATER_PAGE = '''
             cursor: pointer;
             font-size: 14px;
         }
-        .add-task button:hover { background: #3a56d4; }
+        .add-task button:hover { background: #7a69a4; }
         
         .task-list {
-            background: white;
+            background: #fcfaff;
             border-radius: 12px;
             padding: 18px 20px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
         }
         .task-list .task-item {
-            background: #f8f9fa;
+            background: #faf5ff;
             border-radius: 8px;
             padding: 12px 16px;
             margin-bottom: 8px;
@@ -1684,6 +1829,7 @@ LATER_PAGE = '''
             align-items: center;
             flex-wrap: wrap;
             gap: 8px;
+            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
         }
         .task-list .task-item .task-info {
             display: flex;
@@ -1693,14 +1839,14 @@ LATER_PAGE = '''
         .task-list .task-item .task-actions button {
             background: none;
             border: none;
-            color: #9ca3af;
+            color: #c5b8d8;
             cursor: pointer;
             font-size: 14px;
             padding: 0 4px;
         }
-        .task-list .task-item .task-actions button:hover { color: #4361ee; }
+        .task-list .task-item .task-actions button:hover { color: #8b7bb5; }
         
-        .empty-list { color: #bbb; text-align: center; padding: 30px; }
+        .empty-list { color: #c5b8d8; text-align: center; padding: 30px; }
         
         @media (max-width: 600px) {
             .header { flex-direction: column; text-align: center; }
@@ -1716,12 +1862,12 @@ LATER_PAGE = '''
         <div>
             <span class="user">👤 {{ username }}</span>
             <a href="/" class="btn-back" style="margin-left:12px;">← Назад</a>
-            <a href="/logout" class="btn-back" style="margin-left:8px; background:#e74c3c;">Выйти</a>
+            <a href="/logout" class="btn-back" style="margin-left:8px; background:#d5c8e6; color:#4a3f5e;">Выйти</a>
         </div>
     </div>
     
     <div class="add-task">
-        <input type="text" id="laterTaskInput" placeholder="Что хотите отложить?" />
+        <input type="text" id="laterTaskInput" placeholder="Что хотите отложить?" autofocus>
         <button id="addLaterBtn">➕ Добавить</button>
     </div>
     
@@ -1743,7 +1889,6 @@ LATER_PAGE = '''
 </div>
 
 <script>
-    // --- Добавление задачи в "Позже" ---
     document.getElementById('addLaterBtn').addEventListener('click', function() {
         const input = document.getElementById('laterTaskInput');
         const title = input.value.trim();
@@ -1764,7 +1909,6 @@ LATER_PAGE = '''
         }
     });
     
-    // --- Выполнение задачи ---
     document.querySelectorAll('.done-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
@@ -1773,7 +1917,6 @@ LATER_PAGE = '''
         });
     });
     
-    // --- Удаление задачи ---
     document.querySelectorAll('.delete-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
@@ -1796,16 +1939,17 @@ REGISTER_PAGE = '''
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Регистрация</title>
     <style>
-        body { font-family: 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f4f6f9; margin: 0; }
-        .card { background: white; padding: 40px; border-radius: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); width: 100%; max-width: 360px; }
-        h2 { margin-bottom: 20px; color: #1a1a2e; }
-        input { width: 100%; padding: 10px 14px; margin: 8px 0; border: 1.5px solid #ddd; border-radius: 8px; font-size: 14px; box-sizing: border-box; }
-        input:focus { outline: none; border-color: #4361ee; }
-        button { width: 100%; padding: 12px; background: #4361ee; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 12px; }
-        button:hover { background: #3a56d4; }
-        .error { color: #e74c3c; font-size: 14px; margin-bottom: 10px; }
-        .link { text-align: center; margin-top: 16px; font-size: 14px; color: #6b7280; }
-        .link a { color: #4361ee; text-decoration: none; }
+        body { font-family: 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f6f2fd; margin: 0; color: #4a3f5e; }
+        .card { background: #fcfaff; padding: 40px; border-radius: 16px; box-shadow: 0 4px 30px rgba(139, 123, 181, 0.10); width: 100%; max-width: 360px; }
+        h2 { margin-bottom: 20px; color: #4a3f5e; }
+        input { width: 100%; padding: 10px 14px; margin: 8px 0; border: 1.5px solid #ede5f5; border-radius: 8px; font-size: 14px; box-sizing: border-box; background: white; color: #4a3f5e; }
+        input:focus { outline: none; border-color: #8b7bb5; }
+        button { width: 100%; padding: 12px; background: #8b7bb5; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 12px; }
+        button:hover { background: #7a69a4; }
+        .error { color: #d5a0a0; font-size: 14px; margin-bottom: 10px; }
+        .link { text-align: center; margin-top: 16px; font-size: 14px; color: #b5a7cc; }
+        .link a { color: #8b7bb5; text-decoration: none; }
+        .link a:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
@@ -1833,16 +1977,17 @@ LOGIN_PAGE = '''
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Вход</title>
     <style>
-        body { font-family: 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f4f6f9; margin: 0; }
-        .card { background: white; padding: 40px; border-radius: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); width: 100%; max-width: 360px; }
-        h2 { margin-bottom: 20px; color: #1a1a2e; }
-        input { width: 100%; padding: 10px 14px; margin: 8px 0; border: 1.5px solid #ddd; border-radius: 8px; font-size: 14px; box-sizing: border-box; }
-        input:focus { outline: none; border-color: #4361ee; }
-        button { width: 100%; padding: 12px; background: #4361ee; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 12px; }
-        button:hover { background: #3a56d4; }
-        .error { color: #e74c3c; font-size: 14px; margin-bottom: 10px; }
-        .link { text-align: center; margin-top: 16px; font-size: 14px; color: #6b7280; }
-        .link a { color: #4361ee; text-decoration: none; }
+        body { font-family: 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f6f2fd; margin: 0; color: #4a3f5e; }
+        .card { background: #fcfaff; padding: 40px; border-radius: 16px; box-shadow: 0 4px 30px rgba(139, 123, 181, 0.10); width: 100%; max-width: 360px; }
+        h2 { margin-bottom: 20px; color: #4a3f5e; }
+        input { width: 100%; padding: 10px 14px; margin: 8px 0; border: 1.5px solid #ede5f5; border-radius: 8px; font-size: 14px; box-sizing: border-box; background: white; color: #4a3f5e; }
+        input:focus { outline: none; border-color: #8b7bb5; }
+        button { width: 100%; padding: 12px; background: #8b7bb5; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 12px; }
+        button:hover { background: #7a69a4; }
+        .error { color: #d5a0a0; font-size: 14px; margin-bottom: 10px; }
+        .link { text-align: center; margin-top: 16px; font-size: 14px; color: #b5a7cc; }
+        .link a { color: #8b7bb5; text-decoration: none; }
+        .link a:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
