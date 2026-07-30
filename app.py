@@ -1,5 +1,6 @@
 from flask import Flask, request, render_template_string, redirect, session, url_for, jsonify
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import hashlib
 from datetime import datetime, timedelta
 import json
@@ -8,42 +9,55 @@ import os
 app = Flask(__name__)
 app.secret_key = 'секретный_ключ_для_сессий_12345'
 
-# --- БАЗА ДАННЫХ ---
+# --- ПОДКЛЮЧЕНИЕ К POSTGRESQL ---
+def get_db_connection():
+    # Используем переменную окружения DATABASE_URL (её добавим на Render)
+    database_url = os.environ.get('DATABASE_URL')
+    if not database_url:
+        # Для локального теста (если запускаете на компьютере)
+        database_url = "postgresql://organizer_user:пароль@localhost:5432/organizer"
+    
+    conn = psycopg2.connect(database_url)
+    return conn
+
+# --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ---
 def init_db():
-    conn = sqlite3.connect('organizer.db')
+    conn = get_db_connection()
     cur = conn.cursor()
     
-    cur.execute('''CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE,
-        password TEXT
-    )''')
+    # Создаём таблицу пользователей
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL
+        )
+    ''')
     
-    cur.execute('''CREATE TABLE IF NOT EXISTS tasks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        title TEXT,
-        category TEXT,
-        date TEXT,
-        repeat_type TEXT,
-        repeat_day INTEGER,
-        status TEXT DEFAULT 'active',
-        created_at TEXT,
-        FOREIGN KEY (user_id) REFERENCES users (id)
-    )''')
+    # Создаём таблицу задач
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS tasks (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            category TEXT DEFAULT 'later',
+            date TEXT,
+            repeat_type TEXT DEFAULT 'none',
+            repeat_day INTEGER,
+            status TEXT DEFAULT 'active',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
     
     conn.commit()
     conn.close()
 
+# Вызываем инициализацию при старте
 init_db()
 
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_user_id():
     return session.get('user_id')
-
-def get_db():
-    conn = sqlite3.connect('organizer.db')
-    conn.row_factory = sqlite3.Row
-    return conn
 
 # --- ГЛАВНАЯ СТРАНИЦА ---
 @app.route('/')
@@ -52,10 +66,12 @@ def index():
         return redirect('/login')
     
     user_id = session['user_id']
-    conn = get_db()
-    cur = conn.cursor()
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    tasks = cur.execute('SELECT * FROM tasks WHERE user_id = ? AND status = "active" ORDER BY date ASC', (user_id,)).fetchall()
+    cur.execute('SELECT * FROM tasks WHERE user_id = %s AND status = %s ORDER BY date ASC', (user_id, 'active'))
+    tasks = cur.fetchall()
+    conn.close()
     
     categories = {
         'focus': [],
@@ -67,8 +83,6 @@ def index():
     for task in tasks:
         cat = task['category'] if task['category'] in categories else 'later'
         categories[cat].append(dict(task))
-    
-    conn.close()
     
     return render_template_string(MAIN_PAGE, 
                                    focus_tasks=categories['focus'],
@@ -89,11 +103,12 @@ def add_task():
     if not title:
         return jsonify({'error': 'Title is required'}), 400
     
-    conn = get_db()
+    conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('''INSERT INTO tasks (user_id, title, category, date, repeat_type, repeat_day, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, datetime("now"))''',
-                   (session['user_id'], title, 'later', '', 'none', None, 'active'))
+    cur.execute('''
+        INSERT INTO tasks (user_id, title, category, date, repeat_type, repeat_day, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, 'later', '', 'none', None, 'active'))
     conn.commit()
     conn.close()
     
@@ -115,12 +130,13 @@ def update_task(task_id):
     if not title:
         return jsonify({'error': 'Title is required'}), 400
     
-    conn = get_db()
+    conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('''UPDATE tasks SET 
-                   title = ?, category = ?, date = ?, repeat_type = ?, repeat_day = ?
-                   WHERE id = ? AND user_id = ?''',
-                   (title, category, date, repeat_type, repeat_day, task_id, session['user_id']))
+    cur.execute('''
+        UPDATE tasks SET 
+            title = %s, category = %s, date = %s, repeat_type = %s, repeat_day = %s
+        WHERE id = %s AND user_id = %s
+    ''', (title, category, date, repeat_type, repeat_day, task_id, session['user_id']))
     conn.commit()
     conn.close()
     
@@ -132,9 +148,9 @@ def delete_task(task_id):
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
     
-    conn = get_db()
+    conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('DELETE FROM tasks WHERE id = ? AND user_id = ?', (task_id, session['user_id']))
+    cur.execute('DELETE FROM tasks WHERE id = %s AND user_id = %s', (task_id, session['user_id']))
     conn.commit()
     conn.close()
     
@@ -146,13 +162,17 @@ def done_task(task_id):
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
     
-    conn = get_db()
-    cur = conn.cursor()
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    task = cur.execute('SELECT * FROM tasks WHERE id = ? AND user_id = ?', (task_id, session['user_id'])).fetchone()
+    cur.execute('SELECT * FROM tasks WHERE id = %s AND user_id = %s', (task_id, session['user_id']))
+    task = cur.fetchone()
+    
     if not task:
+        conn.close()
         return jsonify({'error': 'Task not found'}), 404
     
+    # Если повторяющаяся — создаём новую
     if task['repeat_type'] != 'none':
         new_date = None
         if task['repeat_type'] == 'daily':
@@ -164,11 +184,12 @@ def done_task(task_id):
                 days_ahead += 7
             new_date = (today + timedelta(days=days_ahead)).strftime('%Y-%m-%d')
         
-        cur.execute('''INSERT INTO tasks (user_id, title, category, date, repeat_type, repeat_day, status, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, datetime("now"))''',
-                       (task['user_id'], task['title'], task['category'], new_date, task['repeat_type'], task['repeat_day'], 'active'))
+        cur.execute('''
+            INSERT INTO tasks (user_id, title, category, date, repeat_type, repeat_day, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ''', (task['user_id'], task['title'], task['category'], new_date, task['repeat_type'], task['repeat_day'], 'active'))
     
-    cur.execute('UPDATE tasks SET status = "done" WHERE id = ?', (task_id,))
+    cur.execute('UPDATE tasks SET status = %s WHERE id = %s', ('done', task_id))
     conn.commit()
     conn.close()
     
@@ -180,9 +201,10 @@ def get_tasks():
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
     
-    conn = get_db()
-    cur = conn.cursor()
-    tasks = cur.execute('SELECT * FROM tasks WHERE user_id = ? AND status = "active" ORDER BY date ASC', (session['user_id'],)).fetchall()
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT * FROM tasks WHERE user_id = %s AND status = %s ORDER BY date ASC', (session['user_id'], 'active'))
+    tasks = cur.fetchall()
     conn.close()
     
     result = []
@@ -201,13 +223,15 @@ def register():
         if not username or not password:
             return render_template_string(REGISTER_PAGE, error='Заполните все поля')
         
-        conn = get_db()
+        conn = get_db_connection()
+        cur = conn.cursor()
         try:
-            conn.execute('INSERT INTO users (username, password) VALUES (?, ?)', (username, password))
+            cur.execute('INSERT INTO users (username, password) VALUES (%s, %s)', (username, password))
             conn.commit()
             conn.close()
             return redirect('/login')
-        except sqlite3.IntegrityError:
+        except psycopg2.IntegrityError:
+            conn.close()
             return render_template_string(REGISTER_PAGE, error='Пользователь уже существует')
     
     return render_template_string(REGISTER_PAGE, error=None)
@@ -219,8 +243,10 @@ def login():
         username = request.form['username'].strip()
         password = hashlib.md5(request.form['password'].encode()).hexdigest()
         
-        conn = get_db()
-        user = conn.execute('SELECT id, username FROM users WHERE username = ? AND password = ?', (username, password)).fetchone()
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('SELECT id, username FROM users WHERE username = %s AND password = %s', (username, password))
+        user = cur.fetchone()
         conn.close()
         
         if user:
