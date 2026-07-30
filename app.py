@@ -43,7 +43,8 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             quarter TEXT,
             sphere TEXT,
-            later_group TEXT
+            later_group TEXT,
+            completed_at TIMESTAMP
         )
     ''')
     
@@ -157,7 +158,7 @@ def quarter_page(quarter):
     spheres = cur.fetchall()
     
     for sphere in spheres:
-        cur.execute('SELECT * FROM tasks WHERE user_id = %s AND sphere = %s AND quarter = %s AND status = %s ORDER BY date ASC', 
+        cur.execute('SELECT * FROM tasks WHERE user_id = %s AND sphere = %s AND quarter = %s AND status = %s ORDER BY created_at ASC', 
                    (user_id, sphere['name'], quarter, 'active'))
         sphere['tasks'] = cur.fetchall()
     
@@ -339,6 +340,42 @@ def add_sphere():
     
     return jsonify({'success': True, 'message': 'Sphere added'})
 
+# --- API: Обновить сферу в квартале ---
+@app.route('/api/sphere/<int:sphere_id>', methods=['PUT'])
+def update_sphere(sphere_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.json
+    name = data.get('name', '').strip()
+    
+    if not name:
+        return jsonify({'error': 'Name is required'}), 400
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('UPDATE spheres SET name = %s WHERE id = %s AND user_id = %s', (name, sphere_id, session['user_id']))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': 'Sphere updated'})
+
+# --- API: Удалить сферу в квартале ---
+@app.route('/api/sphere/<int:sphere_id>', methods=['DELETE'])
+def delete_sphere(sphere_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Удаляем задачи, связанные с этой сферой
+    cur.execute('DELETE FROM tasks WHERE sphere_id = %s AND user_id = %s', (sphere_id, session['user_id']))
+    cur.execute('DELETE FROM spheres WHERE id = %s AND user_id = %s', (sphere_id, session['user_id']))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': 'Sphere deleted'})
+
 # --- API: Добавить задачу в сферу (квартал) ---
 @app.route('/api/task/quarter', methods=['POST'])
 def add_quarter_task():
@@ -356,10 +393,15 @@ def add_quarter_task():
     
     conn = get_db_connection()
     cur = conn.cursor()
+    # Получаем id сферы
+    cur.execute('SELECT id FROM spheres WHERE user_id = %s AND name = %s AND quarter = %s', (session['user_id'], sphere, quarter))
+    sphere_result = cur.fetchone()
+    sphere_id = sphere_result[0] if sphere_result else None
+    
     cur.execute('''
-        INSERT INTO tasks (user_id, title, category, date, status, quarter, sphere)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, 'later', date, 'active', quarter, sphere))
+        INSERT INTO tasks (user_id, title, category, date, status, quarter, sphere, sphere_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, 'later', date, 'active', quarter, sphere, sphere_id))
     conn.commit()
     conn.close()
     
@@ -473,6 +515,10 @@ def done_task(task_id):
         conn.close()
         return jsonify({'error': 'Task not found'}), 404
     
+    # Помечаем задачу как выполненную с временем завершения
+    cur.execute('UPDATE tasks SET status = %s, completed_at = %s WHERE id = %s', ('done', datetime.now(), task_id))
+    
+    # Если повторяющаяся — создаём новую
     if task['repeat_type'] != 'none':
         new_date = None
         if task['repeat_type'] == 'daily':
@@ -485,15 +531,53 @@ def done_task(task_id):
             new_date = (today + timedelta(days=days_ahead)).strftime('%Y-%m-%d')
         
         cur.execute('''
-            INSERT INTO tasks (user_id, title, category, date, repeat_type, repeat_day, status, quarter, sphere, later_group)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (task['user_id'], task['title'], task['category'], new_date, task['repeat_type'], task['repeat_day'], 'active', task.get('quarter'), task.get('sphere'), task.get('later_group')))
+            INSERT INTO tasks (user_id, title, category, date, repeat_type, repeat_day, status, quarter, sphere, later_group, sphere_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ''', (task['user_id'], task['title'], task['category'], new_date, task['repeat_type'], task['repeat_day'], 'active', task.get('quarter'), task.get('sphere'), task.get('later_group'), task.get('sphere_id')))
     
-    cur.execute('UPDATE tasks SET status = %s WHERE id = %s', ('done', task_id))
     conn.commit()
     conn.close()
     
     return jsonify({'success': True, 'message': 'Task done'})
+
+# --- API: Восстановить задачу из "Готово" ---
+@app.route('/api/task/<int:task_id>/restore', methods=['POST'])
+def restore_task(task_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('UPDATE tasks SET status = %s, completed_at = NULL WHERE id = %s AND user_id = %s', ('active', task_id, session['user_id']))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': 'Task restored'})
+
+# --- API: Получить выполненные задачи (за 24 часа) ---
+@app.route('/api/tasks/done')
+def get_done_tasks():
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    # Задачи, выполненные за последние 24 часа
+    yesterday = datetime.now() - timedelta(days=1)
+    cur.execute('''
+        SELECT * FROM tasks 
+        WHERE user_id = %s AND status = %s AND completed_at >= %s
+        ORDER BY completed_at DESC
+    ''', (session['user_id'], 'done', yesterday))
+    tasks = cur.fetchall()
+    conn.close()
+    
+    result = []
+    for task in tasks:
+        result.append(dict(task))
+    
+    return jsonify(result)
 
 # --- API: Переместить задачу из бэклога в категорию ---
 @app.route('/api/task/<int:task_id>/move', methods=['PUT'])
@@ -719,6 +803,7 @@ MAIN_PAGE = '''
             padding: 2px 14px;
             border-radius: 20px;
         }
+        .focus-block .empty-block { color: #c5b8d8; font-size: 13px; text-align: center; padding: 16px; }
         
         .block-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
         .block {
@@ -835,6 +920,21 @@ MAIN_PAGE = '''
             margin-top: 8px;
         }
         .sidebar-card .big-btn-secondary:hover { background: #c5b8d8; }
+        .sidebar-card .big-btn-done {
+            background: #27ae60;
+            color: white;
+            border: none;
+            border-radius: 10px;
+            padding: 12px;
+            font-size: 15px;
+            font-weight: 600;
+            width: 100%;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            margin-top: 8px;
+        }
+        .sidebar-card .big-btn-done:hover { background: #2ecc71; }
         
         .modal-overlay {
             display: none;
@@ -948,17 +1048,14 @@ MAIN_PAGE = '''
             </div>
         </div>
 
-        <!-- Фокус -->
+        <!-- Фокус (без кнопки добавления) -->
         <div class="focus-block" id="focusBlock">
             <div class="block-header">
                 🎯 Фокус
                 <span class="count" id="focusCount">0</span>
             </div>
             <div id="focusTasks"></div>
-            <div class="empty-block" id="focusEmpty">
-                Нет задач в фокусе
-                <button class="add-task-btn" data-category="focus">➕</button>
-            </div>
+            <div class="empty-block" id="focusEmpty">Нет задач в фокусе</div>
         </div>
 
         <!-- Блоки столбиком -->
@@ -995,6 +1092,7 @@ MAIN_PAGE = '''
         <div class="sidebar-card">
             <a href="/quarter/{{ current_quarter }}" class="big-btn">🗓️ 3 месяца</a>
             <a href="/later" class="big-btn-secondary">🕰️ Позже</a>
+            <a href="/done" class="big-btn-done">✅ Готово</a>
         </div>
     </div>
 </div>
@@ -1185,6 +1283,7 @@ MAIN_PAGE = '''
                 <button class="edit-btn" title="Редактировать">✏️</button>
                 <button class="done-btn" title="Выполнено">✅</button>
                 <button class="delete-btn" title="Удалить">🗑️</button>
+                <button class="move-to-focus-btn" title="В фокус" data-task-id="${task.id}" style="display:${task.category !== 'focus' ? 'inline' : 'none'}">⭐</button>
             </div>
         `;
         
@@ -1196,16 +1295,30 @@ MAIN_PAGE = '''
         div.querySelector('.done-btn').addEventListener('click', (e) => {
             e.stopPropagation();
             fetch(`/api/task/${task.id}/done`, { method: 'POST' })
-                .then(() => loadTasks());
+                .then(() => { loadTasks(); loadBacklog(); });
         });
         
         div.querySelector('.delete-btn').addEventListener('click', (e) => {
             e.stopPropagation();
             if (confirm('Удалить задачу?')) {
                 fetch(`/api/task/${task.id}`, { method: 'DELETE' })
-                    .then(() => loadTasks());
+                    .then(() => { loadTasks(); loadBacklog(); });
             }
         });
+        
+        const focusBtn = div.querySelector('.move-to-focus-btn');
+        if (focusBtn) {
+            focusBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                const taskId = this.dataset.taskId;
+                fetch(`/api/task/${taskId}/move`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ category: 'focus' })
+                })
+                .then(() => { loadTasks(); loadBacklog(); });
+            });
+        }
         
         return div;
     }
@@ -1619,6 +1732,21 @@ QUARTER_PAGE = '''
             gap: 8px;
         }
         .sphere-header h3 { font-size: 18px; color: #4a3f5e; }
+        .sphere-header .sphere-actions {
+            display: flex;
+            gap: 6px;
+        }
+        .sphere-header .sphere-actions button {
+            background: none;
+            border: none;
+            color: #b5a7cc;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 4px 8px;
+            border-radius: 6px;
+            transition: 0.2s;
+        }
+        .sphere-header .sphere-actions button:hover { background: #ede5f5; color: #8b7bb5; }
         
         .task-item {
             background: #faf5ff;
@@ -1633,7 +1761,6 @@ QUARTER_PAGE = '''
             box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
         }
         .task-item .task-info { display: flex; align-items: center; gap: 10px; }
-        .task-item .task-meta { font-size: 12px; color: #b5a7cc; }
         .task-item .task-actions button {
             background: none;
             border: none;
@@ -1674,6 +1801,8 @@ QUARTER_PAGE = '''
         
         .empty-sphere { color: #c5b8d8; font-style: italic; padding: 10px 0; }
         
+        .edit-sphere-modal .modal { max-width: 380px; }
+        
         @media (max-width: 600px) {
             .header { flex-direction: column; text-align: center; }
             .add-sphere { flex-direction: column; }
@@ -1712,18 +1841,19 @@ QUARTER_PAGE = '''
     
     <div id="spheresContainer">
         {% for sphere in spheres %}
-        <div class="sphere" data-sphere="{{ sphere.name }}">
+        <div class="sphere" data-sphere-id="{{ sphere.id }}" data-sphere-name="{{ sphere.name }}">
             <div class="sphere-header">
                 <h3>📂 {{ sphere.name }}</h3>
+                <div class="sphere-actions">
+                    <button class="edit-sphere-btn" data-sphere-id="{{ sphere.id }}" data-sphere-name="{{ sphere.name }}" title="Переименовать">✏️</button>
+                    <button class="delete-sphere-btn" data-sphere-id="{{ sphere.id }}" data-sphere-name="{{ sphere.name }}" title="Удалить">🗑️</button>
+                </div>
             </div>
             <div id="tasks-{{ loop.index }}">
                 {% for task in sphere.tasks %}
                 <div class="task-item" data-task-id="{{ task.id }}">
                     <div class="task-info">
                         <span>{{ task.title }}</span>
-                        {% if task.date %}
-                        <span class="task-meta">📅 {{ task.date }}</span>
-                        {% endif %}
                     </div>
                     <div class="task-actions">
                         <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
@@ -1736,7 +1866,6 @@ QUARTER_PAGE = '''
             </div>
             <div class="add-task-form">
                 <input type="text" class="taskInput" placeholder="Новая задача..." autofocus>
-                <input type="date" class="taskDate" />
                 <button class="addTaskBtn" data-sphere="{{ sphere.name }}">➕ Добавить задачу</button>
             </div>
         </div>
@@ -1749,9 +1878,25 @@ QUARTER_PAGE = '''
     </div>
 </div>
 
+<!-- Модалка для переименования сферы -->
+<div class="modal-overlay edit-sphere-modal" id="editSphereModal">
+    <div class="modal">
+        <h3>✏️ Переименовать сферу</h3>
+        <p class="sub">Введите новое название</p>
+        <input type="hidden" id="editSphereId">
+        <label for="editSphereName">Новое название</label>
+        <input type="text" id="editSphereName" placeholder="Название сферы...">
+        <div class="modal-actions">
+            <button class="btn-save" id="saveSphereEditBtn">💾 Сохранить</button>
+            <button class="btn-cancel" id="cancelSphereEditBtn">Отмена</button>
+        </div>
+    </div>
+</div>
+
 <script>
     const quarter = '{{ quarter }}';
     
+    // --- Добавление сферы ---
     document.getElementById('addSphereBtn').addEventListener('click', function() {
         const name = document.getElementById('sphereName').value.trim();
         if (!name) { alert('Введите название сферы'); return; }
@@ -1769,21 +1914,66 @@ QUARTER_PAGE = '''
         if (e.key === 'Enter') document.getElementById('addSphereBtn').click();
     });
     
+    // --- Редактирование сферы ---
+    document.querySelectorAll('.edit-sphere-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const sphereId = this.dataset.sphereId;
+            const sphereName = this.dataset.sphereName;
+            document.getElementById('editSphereId').value = sphereId;
+            document.getElementById('editSphereName').value = sphereName;
+            document.getElementById('editSphereModal').classList.add('open');
+            setTimeout(() => document.getElementById('editSphereName').focus(), 100);
+        });
+    });
+    
+    document.getElementById('saveSphereEditBtn').addEventListener('click', function() {
+        const sphereId = document.getElementById('editSphereId').value;
+        const name = document.getElementById('editSphereName').value.trim();
+        if (!name) { alert('Введите название'); return; }
+        
+        fetch(`/api/sphere/${sphereId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name })
+        })
+        .then(res => res.json())
+        .then(() => location.reload());
+    });
+    
+    document.getElementById('cancelSphereEditBtn').addEventListener('click', function() {
+        document.getElementById('editSphereModal').classList.remove('open');
+    });
+    
+    document.getElementById('editSphereName').addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') document.getElementById('saveSphereEditBtn').click();
+    });
+    
+    // --- Удаление сферы ---
+    document.querySelectorAll('.delete-sphere-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const sphereId = this.dataset.sphereId;
+            const sphereName = this.dataset.sphereName;
+            if (confirm(`Удалить сферу "${sphereName}" и все её задачи?`)) {
+                fetch(`/api/sphere/${sphereId}`, { method: 'DELETE' })
+                    .then(() => location.reload());
+            }
+        });
+    });
+    
+    // --- Добавление задачи в сферу ---
     document.querySelectorAll('.addTaskBtn').forEach(btn => {
         btn.addEventListener('click', function() {
             const sphere = this.dataset.sphere;
             const container = this.closest('.sphere');
             const input = container.querySelector('.taskInput');
-            const dateInput = container.querySelector('.taskDate');
             const title = input.value.trim();
-            const date = dateInput.value;
             
             if (!title) { alert('Введите название задачи'); return; }
             
             fetch('/api/task/quarter', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ title, sphere, quarter, date })
+                body: JSON.stringify({ title, sphere, quarter, date: '' })
             })
             .then(res => res.json())
             .then(() => location.reload());
@@ -1798,6 +1988,7 @@ QUARTER_PAGE = '''
         });
     });
     
+    // --- Выполнение задачи в квартале ---
     document.querySelectorAll('.done-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
@@ -1806,6 +1997,7 @@ QUARTER_PAGE = '''
         });
     });
     
+    // --- Удаление задачи в квартале ---
     document.querySelectorAll('.delete-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
@@ -2254,6 +2446,189 @@ LATER_PAGE = '''
 </html>
 '''
 
+DONE_PAGE = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>✅ Готово — Мой органайзер</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f6f2fd;
+            padding: 16px;
+            min-height: 100vh;
+            color: #4a3f5e;
+        }
+        .container { max-width: 800px; margin: 0 auto; }
+        .header {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 16px 24px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        }
+        .header h1 { font-size: 22px; color: #4a3f5e; }
+        .header .user { color: #8b7bb5; font-size: 14px; }
+        .header .btn-back {
+            background: #ede5f5;
+            color: #4a3f5e;
+            border: none;
+            padding: 8px 18px;
+            border-radius: 8px;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        .header .btn-back:hover { background: #e0d5ec; }
+        
+        .task-list {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 18px 20px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        }
+        .task-item {
+            background: #faf5ff;
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
+            border-left: 4px solid #27ae60;
+        }
+        .task-item .task-info {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .task-item .task-info .completed-time {
+            font-size: 12px;
+            color: #b5a7cc;
+        }
+        .task-item .task-actions button {
+            background: none;
+            border: none;
+            color: #c5b8d8;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 0 4px;
+        }
+        .task-item .task-actions button:hover { color: #8b7bb5; }
+        .task-item .task-actions .restore-btn:hover { color: #27ae60; }
+        
+        .empty-list { color: #c5b8d8; text-align: center; padding: 30px; }
+        
+        .info-note {
+            margin-top: 12px;
+            padding: 12px 16px;
+            background: #f0e8fa;
+            border-radius: 8px;
+            font-size: 13px;
+            color: #8b7bb5;
+            text-align: center;
+        }
+        
+        @media (max-width: 600px) {
+            .header { flex-direction: column; text-align: center; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>✅ Готово</h1>
+        <div>
+            <span class="user">👤 {{ username }}</span>
+            <a href="/" class="btn-back" style="margin-left:12px;">← Назад</a>
+            <a href="/logout" class="btn-back" style="margin-left:8px; background:#d5c8e6; color:#4a3f5e;">Выйти</a>
+        </div>
+    </div>
+    
+    <div class="task-list" id="doneTasks">
+        {% for task in tasks %}
+        <div class="task-item" data-task-id="{{ task.id }}">
+            <div class="task-info">
+                <span>{{ task.title }}</span>
+                <span class="completed-time">✅ {{ task.completed_at }}</span>
+            </div>
+            <div class="task-actions">
+                <button class="restore-btn" data-task-id="{{ task.id }}" title="Восстановить">↩️</button>
+                <button class="delete-btn" data-task-id="{{ task.id }}" title="Удалить навсегда">🗑️</button>
+            </div>
+        </div>
+        {% else %}
+        <div class="empty-list">📭 Здесь пока пусто. Выполненные задачи появятся здесь на 24 часа.</div>
+        {% endfor %}
+    </div>
+    <div class="info-note">⏳ Задачи хранятся 24 часа, затем удаляются автоматически</div>
+</div>
+
+<script>
+    function loadDoneTasks() {
+        fetch('/api/tasks/done')
+            .then(res => res.json())
+            .then(tasks => {
+                const container = document.getElementById('doneTasks');
+                if (tasks.length === 0) {
+                    container.innerHTML = '<div class="empty-list">📭 Здесь пока пусто. Выполненные задачи появятся здесь на 24 часа.</div>';
+                    return;
+                }
+                container.innerHTML = '';
+                tasks.forEach(task => {
+                    const item = document.createElement('div');
+                    item.className = 'task-item';
+                    item.dataset.taskId = task.id;
+                    const completedTime = task.completed_at ? new Date(task.completed_at).toLocaleString('ru-RU') : 'только что';
+                    item.innerHTML = `
+                        <div class="task-info">
+                            <span>${task.title}</span>
+                            <span class="completed-time">✅ ${completedTime}</span>
+                        </div>
+                        <div class="task-actions">
+                            <button class="restore-btn" data-task-id="${task.id}" title="Восстановить">↩️</button>
+                            <button class="delete-btn" data-task-id="${task.id}" title="Удалить навсегда">🗑️</button>
+                        </div>
+                    `;
+                    container.appendChild(item);
+                });
+                
+                document.querySelectorAll('.restore-btn').forEach(btn => {
+                    btn.addEventListener('click', function() {
+                        const taskId = this.dataset.taskId;
+                        fetch(`/api/task/${taskId}/restore`, { method: 'POST' })
+                            .then(() => loadDoneTasks());
+                    });
+                });
+                
+                document.querySelectorAll('.delete-btn').forEach(btn => {
+                    btn.addEventListener('click', function() {
+                        const taskId = this.dataset.taskId;
+                        if (confirm('Удалить задачу навсегда?')) {
+                            fetch(`/api/task/${taskId}`, { method: 'DELETE' })
+                                .then(() => loadDoneTasks());
+                        }
+                    });
+                });
+            });
+    }
+    
+    loadDoneTasks();
+</script>
+</body>
+</html>
+'''
+
 REGISTER_PAGE = '''
 <!DOCTYPE html>
 <html>
@@ -2329,6 +2704,29 @@ LOGIN_PAGE = '''
 </body>
 </html>
 '''
+
+# --- СТРАНИЦА "ГОТОВО" ---
+@app.route('/done')
+def done_page():
+    if 'user_id' not in session:
+        return redirect('/login')
+    
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    yesterday = datetime.now() - timedelta(days=1)
+    cur.execute('''
+        SELECT * FROM tasks 
+        WHERE user_id = %s AND status = %s AND completed_at >= %s
+        ORDER BY completed_at DESC
+    ''', (user_id, 'done', yesterday))
+    tasks = cur.fetchall()
+    conn.close()
+    
+    return render_template_string(DONE_PAGE, 
+                                   tasks=tasks,
+                                   username=session.get('username', 'Пользователь'))
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
