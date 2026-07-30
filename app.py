@@ -44,6 +44,7 @@ def init_db():
             quarter TEXT,
             sphere TEXT,
             later_group TEXT,
+            sphere_id INTEGER,
             completed_at TIMESTAMP
         )
     ''')
@@ -114,6 +115,7 @@ def index():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
+    # Только задачи без привязки к кварталам
     cur.execute('''
         SELECT * FROM tasks 
         WHERE user_id = %s AND status = %s AND (quarter IS NULL OR quarter = '') 
@@ -158,8 +160,8 @@ def quarter_page(quarter):
     spheres = cur.fetchall()
     
     for sphere in spheres:
-        cur.execute('SELECT * FROM tasks WHERE user_id = %s AND sphere = %s AND quarter = %s AND status = %s ORDER BY created_at ASC', 
-                   (user_id, sphere['name'], quarter, 'active'))
+        cur.execute('SELECT * FROM tasks WHERE user_id = %s AND sphere_id = %s AND quarter = %s AND status = %s ORDER BY created_at ASC', 
+                   (user_id, sphere['id'], quarter, 'active'))
         sphere['tasks'] = cur.fetchall()
     
     conn.close()
@@ -194,9 +196,10 @@ def later_page():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
+    # Только задачи с category='later' и без привязки к кварталам
     cur.execute('''
         SELECT * FROM tasks 
-        WHERE user_id = %s AND category = %s AND status = %s AND (later_group IS NULL OR later_group = '')
+        WHERE user_id = %s AND category = %s AND status = %s AND (quarter IS NULL OR quarter = '') AND (later_group IS NULL OR later_group = '')
         ORDER BY created_at DESC
     ''', (user_id, 'later', 'active'))
     tasks = cur.fetchall()
@@ -205,7 +208,7 @@ def later_page():
     groups = cur.fetchall()
     
     for group in groups:
-        cur.execute('SELECT * FROM tasks WHERE user_id = %s AND later_group = %s AND status = %s ORDER BY created_at DESC', 
+        cur.execute('SELECT * FROM tasks WHERE user_id = %s AND later_group = %s AND status = %s AND (quarter IS NULL OR quarter = '') ORDER BY created_at DESC', 
                    (user_id, group['name'], 'active'))
         group['tasks'] = cur.fetchall()
     
@@ -214,6 +217,29 @@ def later_page():
     return render_template_string(LATER_PAGE, 
                                    tasks=tasks,
                                    groups=groups,
+                                   username=session.get('username', 'Пользователь'))
+
+# --- СТРАНИЦА "ГОТОВО" ---
+@app.route('/done')
+def done_page():
+    if 'user_id' not in session:
+        return redirect('/login')
+    
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    yesterday = datetime.now() - timedelta(days=1)
+    cur.execute('''
+        SELECT * FROM tasks 
+        WHERE user_id = %s AND status = %s AND completed_at >= %s
+        ORDER BY completed_at DESC
+    ''', (user_id, 'done', yesterday))
+    tasks = cur.fetchall()
+    conn.close()
+    
+    return render_template_string(DONE_PAGE, 
+                                   tasks=tasks,
                                    username=session.get('username', 'Пользователь'))
 
 # --- API: Добавить группу в "Позже" ---
@@ -368,8 +394,11 @@ def delete_sphere(sphere_id):
     
     conn = get_db_connection()
     cur = conn.cursor()
-    # Удаляем задачи, связанные с этой сферой
-    cur.execute('DELETE FROM tasks WHERE sphere_id = %s AND user_id = %s', (sphere_id, session['user_id']))
+    # Получаем название сферы для удаления задач
+    cur.execute('SELECT name FROM spheres WHERE id = %s AND user_id = %s', (sphere_id, session['user_id']))
+    sphere = cur.fetchone()
+    if sphere:
+        cur.execute('DELETE FROM tasks WHERE user_id = %s AND sphere = %s', (session['user_id'], sphere[0]))
     cur.execute('DELETE FROM spheres WHERE id = %s AND user_id = %s', (sphere_id, session['user_id']))
     conn.commit()
     conn.close()
@@ -386,7 +415,6 @@ def add_quarter_task():
     title = data.get('title', '').strip()
     sphere = data.get('sphere', '')
     quarter = data.get('quarter', '')
-    date = data.get('date', '')
     
     if not title or not sphere or not quarter:
         return jsonify({'error': 'Title, sphere and quarter are required'}), 400
@@ -401,7 +429,7 @@ def add_quarter_task():
     cur.execute('''
         INSERT INTO tasks (user_id, title, category, date, status, quarter, sphere, sphere_id)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, 'later', date, 'active', quarter, sphere, sphere_id))
+    ''', (session['user_id'], title, 'later', '', 'active', quarter, sphere, sphere_id))
     conn.commit()
     conn.close()
     
@@ -563,7 +591,6 @@ def get_done_tasks():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    # Задачи, выполненные за последние 24 часа
     yesterday = datetime.now() - timedelta(days=1)
     cur.execute('''
         SELECT * FROM tasks 
@@ -853,8 +880,6 @@ MAIN_PAGE = '''
         }
         .task-card:hover { background: #f5eefa; }
         .task-card .task-info { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-        .task-card .task-meta { font-size: 11px; color: #b5a7cc; display: flex; align-items: center; gap: 6px; }
-        .task-card .task-meta .repeat-icon { color: #b5a7cc; }
         .task-card .task-actions button {
             background: none;
             border: none;
@@ -1048,7 +1073,7 @@ MAIN_PAGE = '''
             </div>
         </div>
 
-        <!-- Фокус (без кнопки добавления) -->
+        <!-- Фокус -->
         <div class="focus-block" id="focusBlock">
             <div class="block-header">
                 🎯 Фокус
@@ -1063,26 +1088,17 @@ MAIN_PAGE = '''
             <div class="block block-work" id="workBlock">
                 <div class="block-header">💼 Работа <span class="count" id="workCount">0</span></div>
                 <div id="workTasks"></div>
-                <div class="empty-block" id="workEmpty">
-                    Нет задач
-                    <button class="add-task-btn" data-category="work">➕</button>
-                </div>
+                <button class="add-task-btn" data-category="work">➕</button>
             </div>
             <div class="block block-home" id="homeBlock">
                 <div class="block-header">🏠 Дом <span class="count" id="homeCount">0</span></div>
                 <div id="homeTasks"></div>
-                <div class="empty-block" id="homeEmpty">
-                    Нет задач
-                    <button class="add-task-btn" data-category="home">➕</button>
-                </div>
+                <button class="add-task-btn" data-category="home">➕</button>
             </div>
             <div class="block block-personal" id="personalBlock">
                 <div class="block-header">❤️ Личное <span class="count" id="personalCount">0</span></div>
                 <div id="personalTasks"></div>
-                <div class="empty-block" id="personalEmpty">
-                    Нет задач
-                    <button class="add-task-btn" data-category="personal">➕</button>
-                </div>
+                <button class="add-task-btn" data-category="personal">➕</button>
             </div>
         </div>
     </div>
@@ -1107,9 +1123,7 @@ MAIN_PAGE = '''
         <input type="text" id="addTaskTitle" placeholder="Что нужно сделать?" autofocus>
         <label for="addTaskDate">Дата выполнения</label>
         <div style="display:flex; gap:8px; align-items:center;">
-            <input type="text" id="addTaskDateDisplay" placeholder="Сегодня" style="flex:1;">
-            <input type="date" id="addTaskDateHidden" style="display:none;">
-            <button id="addTaskDateToggle" style="padding:8px 12px; border:1.5px solid #ede5f5; border-radius:8px; background:white; cursor:pointer; color:#4a3f5e;">📅</button>
+            <input type="date" id="addTaskDate" style="flex:1;">
         </div>
         <div class="checkbox-group">
             <input type="checkbox" id="addTaskRepeat">
@@ -1256,28 +1270,9 @@ MAIN_PAGE = '''
         div.className = `task-card tag-${task.category || 'later'}`;
         div.dataset.taskId = task.id;
         
-        let metaHTML = '';
-        if (task.date) {
-            const d = new Date(task.date + 'T00:00:00');
-            metaHTML += `📅 ${d.toLocaleDateString('ru-RU')}`;
-        } else {
-            metaHTML = '📅 Сегодня';
-        }
-        if (task.repeat_type && task.repeat_type !== 'none') {
-            let label = '';
-            if (task.repeat_type === 'daily') label = '🔄 ежедневно';
-            else if (task.repeat_type === 'weekly') {
-                const days = ['вс','пн','вт','ср','чт','пт','сб'];
-                label = `🔄 еженедельно (${days[task.repeat_day || 0]})`;
-            }
-            if (metaHTML) metaHTML += ' ';
-            metaHTML += `<span class="repeat-icon">${label}</span>`;
-        }
-        
         div.innerHTML = `
             <div class="task-info">
                 <span>${task.title}</span>
-                <span class="task-meta">${metaHTML}</span>
             </div>
             <div class="task-actions">
                 <button class="edit-btn" title="Редактировать">✏️</button>
@@ -1330,8 +1325,7 @@ MAIN_PAGE = '''
             document.getElementById('addTaskCategory').value = category;
             document.getElementById('addTaskModalSub').textContent = `Добавьте задачу в категорию: ${getCategoryName(category)}`;
             document.getElementById('addTaskTitle').value = '';
-            document.getElementById('addTaskDateDisplay').value = 'Сегодня';
-            document.getElementById('addTaskDateHidden').value = '';
+            document.getElementById('addTaskDate').value = '';
             document.getElementById('addTaskRepeat').checked = false;
             document.getElementById('addRepeatOptions').classList.remove('visible');
             document.getElementById('addWeeklyDayGroup').style.display = 'none';
@@ -1351,38 +1345,6 @@ MAIN_PAGE = '''
         return names[cat] || cat;
     }
     
-    document.getElementById('addTaskDateDisplay').addEventListener('focus', function() {
-        const hidden = document.getElementById('addTaskDateHidden');
-        hidden.style.display = 'inline-block';
-        hidden.focus();
-    });
-    
-    document.getElementById('addTaskDateHidden').addEventListener('change', function() {
-        if (this.value) {
-            const d = new Date(this.value + 'T00:00:00');
-            document.getElementById('addTaskDateDisplay').value = d.toLocaleDateString('ru-RU');
-        } else {
-            document.getElementById('addTaskDateDisplay').value = 'Сегодня';
-        }
-        this.style.display = 'none';
-    });
-    
-    document.getElementById('addTaskDateDisplay').addEventListener('blur', function() {
-        setTimeout(() => {
-            document.getElementById('addTaskDateHidden').style.display = 'none';
-        }, 200);
-    });
-    
-    document.getElementById('addTaskDateToggle').addEventListener('click', function() {
-        const hidden = document.getElementById('addTaskDateHidden');
-        if (hidden.style.display === 'none') {
-            hidden.style.display = 'inline-block';
-            hidden.focus();
-        } else {
-            hidden.style.display = 'none';
-        }
-    });
-    
     document.getElementById('cancelAddTaskBtn').addEventListener('click', () => {
         document.getElementById('addTaskModal').classList.remove('open');
     });
@@ -1390,14 +1352,7 @@ MAIN_PAGE = '''
     document.getElementById('saveAddTaskBtn').addEventListener('click', () => {
         const category = document.getElementById('addTaskCategory').value;
         const title = document.getElementById('addTaskTitle').value.trim();
-        const dateDisplay = document.getElementById('addTaskDateDisplay').value;
-        let date = document.getElementById('addTaskDateHidden').value;
-        if (!date && dateDisplay !== 'Сегодня' && dateDisplay !== '') {
-            const parts = dateDisplay.split('.');
-            if (parts.length === 3) {
-                date = `${parts[2]}-${parts[1]}-${parts[0]}`;
-            }
-        }
+        const date = document.getElementById('addTaskDate').value;
         const isRepeating = document.getElementById('addTaskRepeat').checked;
         let repeatType = 'none';
         let repeatDay = null;
@@ -1801,7 +1756,9 @@ QUARTER_PAGE = '''
         
         .empty-sphere { color: #c5b8d8; font-style: italic; padding: 10px 0; }
         
-        .edit-sphere-modal .modal { max-width: 380px; }
+        /* Модалка скрыта по умолчанию */
+        .edit-sphere-modal .modal-overlay { display: none; }
+        .edit-sphere-modal .modal-overlay.open { display: flex; }
         
         @media (max-width: 600px) {
             .header { flex-direction: column; text-align: center; }
@@ -1879,7 +1836,7 @@ QUARTER_PAGE = '''
 </div>
 
 <!-- Модалка для переименования сферы -->
-<div class="modal-overlay edit-sphere-modal" id="editSphereModal">
+<div class="modal-overlay" id="editSphereModal">
     <div class="modal">
         <h3>✏️ Переименовать сферу</h3>
         <p class="sub">Введите новое название</p>
@@ -1896,7 +1853,6 @@ QUARTER_PAGE = '''
 <script>
     const quarter = '{{ quarter }}';
     
-    // --- Добавление сферы ---
     document.getElementById('addSphereBtn').addEventListener('click', function() {
         const name = document.getElementById('sphereName').value.trim();
         if (!name) { alert('Введите название сферы'); return; }
@@ -1914,7 +1870,7 @@ QUARTER_PAGE = '''
         if (e.key === 'Enter') document.getElementById('addSphereBtn').click();
     });
     
-    // --- Редактирование сферы ---
+    // Редактирование сферы
     document.querySelectorAll('.edit-sphere-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const sphereId = this.dataset.sphereId;
@@ -1948,7 +1904,7 @@ QUARTER_PAGE = '''
         if (e.key === 'Enter') document.getElementById('saveSphereEditBtn').click();
     });
     
-    // --- Удаление сферы ---
+    // Удаление сферы
     document.querySelectorAll('.delete-sphere-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const sphereId = this.dataset.sphereId;
@@ -1960,7 +1916,7 @@ QUARTER_PAGE = '''
         });
     });
     
-    // --- Добавление задачи в сферу ---
+    // Добавление задачи в сферу
     document.querySelectorAll('.addTaskBtn').forEach(btn => {
         btn.addEventListener('click', function() {
             const sphere = this.dataset.sphere;
@@ -1988,7 +1944,6 @@ QUARTER_PAGE = '''
         });
     });
     
-    // --- Выполнение задачи в квартале ---
     document.querySelectorAll('.done-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
@@ -1997,7 +1952,6 @@ QUARTER_PAGE = '''
         });
     });
     
-    // --- Удаление задачи в квартале ---
     document.querySelectorAll('.delete-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
@@ -2704,29 +2658,6 @@ LOGIN_PAGE = '''
 </body>
 </html>
 '''
-
-# --- СТРАНИЦА "ГОТОВО" ---
-@app.route('/done')
-def done_page():
-    if 'user_id' not in session:
-        return redirect('/login')
-    
-    user_id = session['user_id']
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    
-    yesterday = datetime.now() - timedelta(days=1)
-    cur.execute('''
-        SELECT * FROM tasks 
-        WHERE user_id = %s AND status = %s AND completed_at >= %s
-        ORDER BY completed_at DESC
-    ''', (user_id, 'done', yesterday))
-    tasks = cur.fetchall()
-    conn.close()
-    
-    return render_template_string(DONE_PAGE, 
-                                   tasks=tasks,
-                                   username=session.get('username', 'Пользователь'))
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
