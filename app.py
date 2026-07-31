@@ -37,7 +37,6 @@ def init_db():
             title TEXT NOT NULL,
             category TEXT DEFAULT 'later',
             date TEXT,
-            time TEXT,
             duration TEXT,
             repeat_type TEXT DEFAULT 'none',
             repeat_day INTEGER,
@@ -262,9 +261,9 @@ def add_later_task():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute('''
-        INSERT INTO tasks (user_id, title, category, date, time, duration, repeat_type, repeat_day, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, 'later', '', '', '', 'none', None, 'active'))
+        INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, 'later', '', '', 'none', None, 'active'))
     conn.commit()
     conn.close()
     
@@ -306,9 +305,9 @@ def add_task_to_later_group():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute('''
-        INSERT INTO tasks (user_id, title, category, date, time, duration, repeat_type, repeat_day, status, later_group)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, 'later', '', '', '', 'none', None, 'active', group))
+        INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status, later_group)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, 'later', '', '', 'none', None, 'active', group))
     conn.commit()
     conn.close()
     
@@ -430,9 +429,9 @@ def add_quarter_task():
     sphere_id = sphere_result[0] if sphere_result else None
     
     cur.execute('''
-        INSERT INTO tasks (user_id, title, category, date, time, duration, status, quarter, sphere, sphere_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, 'later', '', '', '', 'active', quarter, sphere, sphere_id))
+        INSERT INTO tasks (user_id, title, category, date, duration, status, quarter, sphere, sphere_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, 'later', '', '', 'active', quarter, sphere, sphere_id))
     conn.commit()
     conn.close()
     
@@ -448,7 +447,6 @@ def add_direct_task():
     title = data.get('title', '').strip()
     category = data.get('category', 'later')
     date = data.get('date', '')
-    time = data.get('time', '')
     duration = data.get('duration', '')
     repeat_type = data.get('repeat_type', 'none')
     repeat_day = data.get('repeat_day')
@@ -459,9 +457,9 @@ def add_direct_task():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute('''
-        INSERT INTO tasks (user_id, title, category, date, time, duration, repeat_type, repeat_day, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, category, date, time, duration, repeat_type, repeat_day, 'active'))
+        INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, category, date, duration, repeat_type, repeat_day, 'active'))
     conn.commit()
     conn.close()
     
@@ -482,9 +480,9 @@ def add_task():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute('''
-        INSERT INTO tasks (user_id, title, category, date, time, duration, repeat_type, repeat_day, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, 'later', '', '', '', 'none', None, 'active'))
+        INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, 'later', '', '', 'none', None, 'active'))
     conn.commit()
     conn.close()
     
@@ -500,7 +498,6 @@ def update_task(task_id):
     title = data.get('title', '').strip()
     category = data.get('category', 'later')
     date = data.get('date', '')
-    time = data.get('time', '')
     duration = data.get('duration', '')
     repeat_type = data.get('repeat_type', 'none')
     repeat_day = data.get('repeat_day')
@@ -512,9 +509,9 @@ def update_task(task_id):
     cur = conn.cursor()
     cur.execute('''
         UPDATE tasks SET 
-            title = %s, category = %s, date = %s, time = %s, duration = %s, repeat_type = %s, repeat_day = %s
+            title = %s, category = %s, date = %s, duration = %s, repeat_type = %s, repeat_day = %s
         WHERE id = %s AND user_id = %s
-    ''', (title, category, date, time, duration, repeat_type, repeat_day, task_id, session['user_id']))
+    ''', (title, category, date, duration, repeat_type, repeat_day, task_id, session['user_id']))
     conn.commit()
     conn.close()
     
@@ -567,16 +564,14 @@ def done_task(task_id):
         conn.close()
         return jsonify({'error': 'Task not found'}), 404
     
-    # Помечаем задачу как выполненную
     cur.execute('UPDATE tasks SET status = %s, completed_at = %s WHERE id = %s', ('done', datetime.now(), task_id))
     
-    # Если повторяющаяся ежедневно — создаём новую на завтра
     if task['repeat_type'] == 'daily':
         new_date = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
         cur.execute('''
-            INSERT INTO tasks (user_id, title, category, date, time, duration, repeat_type, repeat_day, status, quarter, sphere, later_group, sphere_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (task['user_id'], task['title'], task['category'], new_date, task.get('time', ''), task.get('duration', ''), task['repeat_type'], task['repeat_day'], 'active', task.get('quarter'), task.get('sphere'), task.get('later_group'), task.get('sphere_id')))
+            INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status, quarter, sphere, later_group, sphere_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ''', (task['user_id'], task['title'], task['category'], new_date, task.get('duration', ''), task['repeat_type'], task['repeat_day'], 'active', task.get('quarter'), task.get('sphere'), task.get('later_group'), task.get('sphere_id')))
     elif task['repeat_type'] == 'weekly' and task['repeat_day'] is not None:
         today = datetime.now()
         days_ahead = task['repeat_day'] - today.weekday()
@@ -584,9 +579,9 @@ def done_task(task_id):
             days_ahead += 7
         new_date = (today + timedelta(days=days_ahead)).strftime('%Y-%m-%d')
         cur.execute('''
-            INSERT INTO tasks (user_id, title, category, date, time, duration, repeat_type, repeat_day, status, quarter, sphere, later_group, sphere_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (task['user_id'], task['title'], task['category'], new_date, task.get('time', ''), task.get('duration', ''), task['repeat_type'], task['repeat_day'], 'active', task.get('quarter'), task.get('sphere'), task.get('later_group'), task.get('sphere_id')))
+            INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status, quarter, sphere, later_group, sphere_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ''', (task['user_id'], task['title'], task['category'], new_date, task.get('duration', ''), task['repeat_type'], task['repeat_day'], 'active', task.get('quarter'), task.get('sphere'), task.get('later_group'), task.get('sphere_id')))
     
     conn.commit()
     conn.close()
@@ -1187,7 +1182,7 @@ MAIN_PAGE = '''
         <input type="text" id="addTaskTitle" placeholder="Что нужно сделать?" autofocus>
         <label for="addTaskDate">📅 Дата выполнения</label>
         <input type="date" id="addTaskDate">
-        <label for="addTaskDuration">⏱️ Время выполнения (например: 1 ч или 40 мин)</label>
+        <label for="addTaskDuration">⏱️ Время выполнения</label>
         <input type="text" id="addTaskDuration" placeholder="1 ч">
         <div class="checkbox-group">
             <input type="checkbox" id="addTaskRepeat">
@@ -1219,21 +1214,55 @@ MAIN_PAGE = '''
     </div>
 </div>
 
-<!-- Модалка для просмотра задачи -->
+<!-- Модалка для просмотра и редактирования задачи -->
 <div class="modal-overlay" id="viewTaskModal">
     <div class="modal">
         <h3 id="viewTaskTitle">📌 Задача</h3>
         <p class="sub" id="viewTaskCategory"></p>
-        <div class="task-detail" id="viewTaskDetails">
-            <div class="detail-row"><span class="detail-label">📅 Дата</span><span id="viewTaskDate">—</span></div>
-            <div class="detail-row"><span class="detail-label">⏱️ Время выполнения</span><span id="viewTaskDuration">—</span></div>
-            <div class="detail-row"><span class="detail-label">🔄 Повторение</span><span id="viewTaskRepeat">Нет</span></div>
-            <div class="detail-row"><span class="detail-label">📂 Категория</span><span id="viewTaskCategoryText">—</span></div>
+        <input type="hidden" id="viewTaskId">
+        <label for="viewTaskDate">📅 Дата выполнения</label>
+        <input type="date" id="viewTaskDate" style="margin-bottom:8px;">
+        <label for="viewTaskDuration">⏱️ Время выполнения</label>
+        <input type="text" id="viewTaskDuration" placeholder="1 ч" style="margin-bottom:8px;">
+        <label for="viewTaskCategorySelect">📂 Категория</label>
+        <select id="viewTaskCategorySelect" style="margin-bottom:8px;">
+            <option value="focus">🎯 Фокус</option>
+            <option value="urgent">⚡ До 15 минут</option>
+            <option value="work">💼 Работа</option>
+            <option value="home">🏠 Дом</option>
+            <option value="personal">❤️ Личное</option>
+            <option value="later">🕰️ Позже</option>
+        </select>
+        <div class="checkbox-group" style="margin-top:4px;">
+            <input type="checkbox" id="viewTaskRepeat">
+            <label for="viewTaskRepeat">🔄 Повторяющаяся задача</label>
+        </div>
+        <div class="repeat-options" id="viewRepeatOptions">
+            <label for="viewRepeatType">Тип повторения</label>
+            <select id="viewRepeatType">
+                <option value="daily">📆 Ежедневно</option>
+                <option value="weekly">📅 Еженедельно</option>
+            </select>
+            <div id="viewWeeklyDayGroup" style="margin-top:8px; display:none;">
+                <label for="viewRepeatDay">День недели</label>
+                <select id="viewRepeatDay">
+                    <option value="0">Воскресенье</option>
+                    <option value="1">Понедельник</option>
+                    <option value="2">Вторник</option>
+                    <option value="3">Среда</option>
+                    <option value="4">Четверг</option>
+                    <option value="5">Пятница</option>
+                    <option value="6">Суббота</option>
+                </select>
+            </div>
+        </div>
+        <div class="task-detail" style="margin-top:12px;" id="viewTaskDetails">
             <div class="detail-row"><span class="detail-label">📁 Группа</span><span id="viewTaskGroup">—</span></div>
             <div class="detail-row"><span class="detail-label">🗓️ Квартал</span><span id="viewTaskQuarter">—</span></div>
         </div>
         <div class="modal-actions">
-            <button class="btn-delete" id="viewTaskDelete">🗑️ Удалить задачу</button>
+            <button class="btn-save" id="viewTaskSave">💾 Сохранить изменения</button>
+            <button class="btn-delete" id="viewTaskDelete">🗑️ Удалить</button>
             <button class="btn-cancel" id="cancelViewBtn">Закрыть</button>
         </div>
     </div>
@@ -1324,7 +1353,6 @@ MAIN_PAGE = '''
             </div>
         `;
         
-        // Клик по названию задачи
         div.querySelector('.task-info').addEventListener('click', function(e) {
             e.stopPropagation();
             const taskId = this.dataset.taskId;
@@ -1359,33 +1387,74 @@ MAIN_PAGE = '''
             .then(res => res.json())
             .then(task => {
                 currentViewTaskId = task.id;
+                document.getElementById('viewTaskId').value = task.id;
                 document.getElementById('viewTaskTitle').textContent = `📌 ${task.title}`;
                 
-                const categoryNames = {
-                    'focus': '🎯 Фокус',
-                    'urgent': '⚡ До 15 минут',
-                    'work': '💼 Работа',
-                    'home': '🏠 Дом',
-                    'personal': '❤️ Личное',
-                    'later': '🕰️ Позже'
-                };
-                document.getElementById('viewTaskCategoryText').textContent = categoryNames[task.category] || task.category;
-                document.getElementById('viewTaskDate').textContent = task.date || '—';
-                document.getElementById('viewTaskDuration').textContent = task.duration || '—';
+                document.getElementById('viewTaskDate').value = task.date || '';
+                document.getElementById('viewTaskDuration').value = task.duration || '';
+                document.getElementById('viewTaskCategorySelect').value = task.category || 'later';
                 
-                let repeatText = 'Нет';
-                if (task.repeat_type === 'daily') repeatText = '📆 Ежедневно';
-                else if (task.repeat_type === 'weekly') {
-                    const days = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
-                    repeatText = `📅 Еженедельно (${days[task.repeat_day || 0]})`;
+                const isRepeating = task.repeat_type && task.repeat_type !== 'none';
+                document.getElementById('viewTaskRepeat').checked = isRepeating;
+                
+                const repeatOptions = document.getElementById('viewRepeatOptions');
+                if (isRepeating) {
+                    repeatOptions.classList.add('visible');
+                    document.getElementById('viewRepeatType').value = task.repeat_type || 'daily';
+                    if (task.repeat_type === 'weekly') {
+                        document.getElementById('viewWeeklyDayGroup').style.display = 'block';
+                        document.getElementById('viewRepeatDay').value = task.repeat_day || 0;
+                    } else {
+                        document.getElementById('viewWeeklyDayGroup').style.display = 'none';
+                    }
+                } else {
+                    repeatOptions.classList.remove('visible');
+                    document.getElementById('viewWeeklyDayGroup').style.display = 'none';
                 }
-                document.getElementById('viewTaskRepeat').textContent = repeatText;
+                
                 document.getElementById('viewTaskGroup').textContent = task.later_group || '—';
                 document.getElementById('viewTaskQuarter').textContent = task.quarter || '—';
                 
                 document.getElementById('viewTaskModal').classList.add('open');
             });
     }
+    
+    // --- Сохранение изменений в модалке просмотра ---
+    document.getElementById('viewTaskSave').addEventListener('click', function() {
+        const taskId = document.getElementById('viewTaskId').value;
+        const date = document.getElementById('viewTaskDate').value;
+        const duration = document.getElementById('viewTaskDuration').value.trim();
+        const category = document.getElementById('viewTaskCategorySelect').value;
+        const isRepeating = document.getElementById('viewTaskRepeat').checked;
+        let repeatType = 'none';
+        let repeatDay = null;
+        
+        if (isRepeating) {
+            repeatType = document.getElementById('viewRepeatType').value;
+            if (repeatType === 'weekly') {
+                repeatDay = parseInt(document.getElementById('viewRepeatDay').value);
+            }
+        }
+        
+        fetch(`/api/task/${taskId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                title: document.getElementById('viewTaskTitle').textContent.replace('📌 ', ''),
+                date, 
+                duration, 
+                category, 
+                repeat_type: repeatType, 
+                repeat_day: repeatDay 
+            })
+        })
+        .then(res => res.json())
+        .then(() => {
+            document.getElementById('viewTaskModal').classList.remove('open');
+            loadTasks();
+            loadBacklog();
+        });
+    });
     
     document.getElementById('viewTaskDelete').addEventListener('click', function() {
         if (currentViewTaskId && confirm('Удалить задачу навсегда?')) {
@@ -1400,6 +1469,23 @@ MAIN_PAGE = '''
     
     document.getElementById('cancelViewBtn').addEventListener('click', function() {
         document.getElementById('viewTaskModal').classList.remove('open');
+    });
+    
+    document.getElementById('viewTaskRepeat').addEventListener('change', function() {
+        const options = document.getElementById('viewRepeatOptions');
+        if (this.checked) {
+            options.classList.add('visible');
+            if (document.getElementById('viewRepeatType').value === 'weekly') {
+                document.getElementById('viewWeeklyDayGroup').style.display = 'block';
+            }
+        } else {
+            options.classList.remove('visible');
+            document.getElementById('viewWeeklyDayGroup').style.display = 'none';
+        }
+    });
+    
+    document.getElementById('viewRepeatType').addEventListener('change', function() {
+        document.getElementById('viewWeeklyDayGroup').style.display = this.value === 'weekly' ? 'block' : 'none';
     });
     
     // --- Добавление задачи в категорию ---
@@ -1761,8 +1847,13 @@ QUARTER_PAGE = '''
         
         .empty-sphere { color: #c5b8d8; font-style: italic; padding: 10px 0; }
         
-        .edit-sphere-modal .modal-overlay { display: none; }
-        .edit-sphere-modal .modal-overlay.open { display: flex; }
+        /* Модалка скрыта по умолчанию */
+        #editSphereModal {
+            display: none;
+        }
+        #editSphereModal.open {
+            display: flex;
+        }
         
         @media (max-width: 600px) {
             .header { flex-direction: column; text-align: center; }
