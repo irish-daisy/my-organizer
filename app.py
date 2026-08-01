@@ -181,7 +181,8 @@ def future_page():
     
     cur.execute('''
         SELECT * FROM tasks 
-        WHERE user_id = %s AND status = %s AND quarter IS NULL AND date IS NOT NULL AND date > %s
+        WHERE user_id = %s AND status = %s AND quarter IS NULL 
+        AND date IS NOT NULL AND date::date > %s
         ORDER BY date ASC
     ''', (user_id, 'active', today))
     tasks = cur.fetchall()
@@ -1478,6 +1479,14 @@ MAIN_PAGE = '''
             
             countEl.textContent = tasks.length;
             
+            // ✅ Для блока "Фокус" — скрываем надпись, если есть задачи
+            if (cat === 'focus') {
+                const emptyEl = document.getElementById('focusEmpty');
+                if (emptyEl) {
+                    emptyEl.style.display = tasks.length === 0 ? 'block' : 'none';
+                }
+            }
+            
             if (blockEl) {
                 if (tasks.length === 0) {
                     blockEl.classList.add('done');
@@ -1967,10 +1976,8 @@ FUTURE_PAGE = '''
 </html>
 '''
 
-# --- ОСТАЛЬНЫЕ ШАБЛОНЫ (QUARTER_PAGE, LATER_PAGE, DONE_PAGE, REGISTER_PAGE, LOGIN_PAGE) ---
-
-# Они остаются без изменений, я их не трогаю, чтобы не перегружать ответ.
-# Если нужно, я могу выдать их отдельно.
+# Остальные шаблоны (QUARTER_PAGE, LATER_PAGE, DONE_PAGE, REGISTER_PAGE, LOGIN_PAGE) — без изменений.
+# Они не влияют на текущие проблемы, но я могу выдать их отдельно, если нужно.
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
