@@ -1,10 +1,11 @@
+import os
+os.environ['TZ'] = 'Europe/Moscow'
 from flask import Flask, request, render_template_string, redirect, session, url_for, jsonify
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import hashlib
 from datetime import datetime, timedelta
 import json
-import os
 
 app = Flask(__name__)
 app.secret_key = 'секретный_ключ_для_сессий_12345'
@@ -123,6 +124,22 @@ def move_overdue_tasks_to_backlog(user_id):
     conn.commit()
     conn.close()
 
+def format_date_ru(date_str):
+    """Форматирует дату в формате '31 июля'"""
+    if not date_str:
+        return ''
+    months = {
+        '01': 'января', '02': 'февраля', '03': 'марта', '04': 'апреля',
+        '05': 'мая', '06': 'июня', '07': 'июля', '08': 'августа',
+        '09': 'сентября', '10': 'октября', '11': 'ноября', '12': 'декабря'
+    }
+    parts = date_str.split('-')
+    if len(parts) == 3:
+        day = str(int(parts[2]))
+        month = months.get(parts[1], parts[1])
+        return f"{day} {month}"
+    return date_str
+
 # --- ГЛАВНАЯ СТРАНИЦА ---
 @app.route('/')
 def index():
@@ -208,8 +225,21 @@ def future_page():
     tasks = cur.fetchall()
     conn.close()
     
+    # Группировка по датам
+    tasks_by_date = {}
+    for task in tasks:
+        if task['date']:
+            date_key = task['date']
+            if date_key not in tasks_by_date:
+                tasks_by_date[date_key] = []
+            tasks_by_date[date_key].append(dict(task))
+    
+    sorted_dates = sorted(tasks_by_date.keys())
+    
     return render_template_string(FUTURE_PAGE, 
-                                   tasks=tasks,
+                                   tasks_by_date=tasks_by_date,
+                                   sorted_dates=sorted_dates,
+                                   format_date_ru=format_date_ru,
                                    username=session.get('username', 'Пользователь'))
 
 # --- СТРАНИЦА КВАРТАЛОВ (3 МЕСЯЦА) ---
@@ -319,6 +349,7 @@ def done_page():
     return render_template_string(DONE_PAGE, 
                                    tasks_by_date=tasks_by_date,
                                    sorted_dates=sorted_dates,
+                                   format_date_ru=format_date_ru,
                                    username=session.get('username', 'Пользователь'))
 
 # --- API: Добавить задачу в "Позже" ---
@@ -1925,11 +1956,16 @@ FUTURE_PAGE = '''
         }
         .header .btn-back:hover { background: #e0d5ec; }
         
-        .task-list {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 18px 20px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        .date-group {
+            margin-bottom: 20px;
+        }
+        .date-group .date-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #4a3f5e;
+            margin-bottom: 10px;
+            padding-bottom: 6px;
+            border-bottom: 2px solid #ede5f5;
         }
         .task-item {
             background: #faf5ff;
@@ -1949,10 +1985,6 @@ FUTURE_PAGE = '''
             align-items: center;
             gap: 10px;
             flex-wrap: wrap;
-        }
-        .task-item .task-info .task-date {
-            font-size: 12px;
-            color: #b5a7cc;
         }
         .task-item .task-info .task-duration {
             font-size: 11px;
@@ -1989,24 +2021,30 @@ FUTURE_PAGE = '''
         </div>
     </div>
     
-    <div class="task-list">
-        {% for task in tasks %}
-        <div class="task-item" data-task-id="{{ task.id }}">
-            <div class="task-info">
-                <span>{{ task.title }}</span>
-                <span class="task-date">📅 {{ task.date }}</span>
-                {% if task.duration %}
-                <span class="task-duration">⏱️ {{ task.duration }}</span>
-                {% endif %}
+    <div id="futureContainer">
+        {% if sorted_dates %}
+            {% for date_key in sorted_dates %}
+            <div class="date-group">
+                <div class="date-title">{{ format_date_ru(date_key) }}</div>
+                {% for task in tasks_by_date[date_key] %}
+                <div class="task-item" data-task-id="{{ task.id }}">
+                    <div class="task-info">
+                        <span>{{ task.title }}</span>
+                        {% if task.duration %}
+                        <span class="task-duration">⏱️ {{ task.duration }}</span>
+                        {% endif %}
+                    </div>
+                    <div class="task-actions">
+                        <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
+                        <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
+                    </div>
+                </div>
+                {% endfor %}
             </div>
-            <div class="task-actions">
-                <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
-                <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
-            </div>
-        </div>
+            {% endfor %}
         {% else %}
-        <div class="empty-list">📭 Нет задач на будущие даты</div>
-        {% endfor %}
+            <div class="empty-list">📭 Нет задач на будущие даты</div>
+        {% endif %}
     </div>
 </div>
 
@@ -2975,7 +3013,7 @@ DONE_PAGE = '''
         {% if sorted_dates %}
             {% for date_key in sorted_dates %}
             <div class="date-group">
-                <div class="date-title">{{ date_key }}</div>
+                <div class="date-title">{{ format_date_ru(date_key) }}</div>
                 {% for task in tasks_by_date[date_key] %}
                 <div class="task-item" data-task-id="{{ task.id }}">
                     <div class="task-info">
@@ -3023,7 +3061,8 @@ DONE_PAGE = '''
                 sortedDates.forEach(dateKey => {
                     const dateGroup = document.createElement('div');
                     dateGroup.className = 'date-group';
-                    dateGroup.innerHTML = `<div class="date-title">${dateKey}</div>`;
+                    const formattedDate = dateKey.split('-').reverse().join('.');
+                    dateGroup.innerHTML = `<div class="date-title">${formattedDate}</div>`;
                     
                     tasksByDate[dateKey].forEach(task => {
                         const item = document.createElement('div');
