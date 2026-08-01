@@ -46,7 +46,8 @@ def init_db():
             sphere TEXT,
             later_group TEXT,
             sphere_id INTEGER,
-            completed_at TIMESTAMP
+            completed_at TIMESTAMP,
+            future BOOLEAN DEFAULT FALSE
         )
     ''')
     
@@ -106,6 +107,14 @@ def get_quarter_year(quarter):
         return year - 1
     return year
 
+def get_date_display(date_str):
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(date_str, '%Y-%m-%d').date()
+    except:
+        return None
+
 # --- ГЛАВНАЯ СТРАНИЦА ---
 @app.route('/')
 def index():
@@ -116,37 +125,87 @@ def index():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
+    # Получаем параметр даты из URL
+    view_date_str = request.args.get('date', datetime.now().strftime('%Y-%m-%d'))
+    view_date = datetime.strptime(view_date_str, '%Y-%m-%d').date()
+    
+    # Получаем задачи на выбранную дату (без привязки к кварталам)
     cur.execute('''
         SELECT * FROM tasks 
-        WHERE user_id = %s AND status = %s AND quarter IS NULL
-        ORDER BY date ASC
-    ''', (user_id, 'active'))
+        WHERE user_id = %s AND status = %s AND quarter IS NULL AND date = %s
+        ORDER BY id ASC
+    ''', (user_id, 'active', view_date_str))
     tasks = cur.fetchall()
     conn.close()
     
     categories = {
-        'focus': [],
         'urgent': [],
         'work': [],
         'home': [],
         'personal': []
     }
     
+    category_order = ['urgent', 'work', 'home', 'personal']
+    
     for task in tasks:
         cat = task['category'] if task['category'] in categories else 'later'
         if cat != 'later':
             categories[cat].append(dict(task))
     
+    # Сортируем блоки: сначала те, где есть задачи, потом пустые
+    sorted_categories = {}
+    for cat in category_order:
+        sorted_categories[cat] = categories[cat]
+    
     current_quarter = get_current_quarter()
     
+    # Определяем, сегодня ли выбранная дата, завтра или другая
+    today = datetime.now().date()
+    is_today = view_date == today
+    is_tomorrow = view_date == today + timedelta(days=1)
+    
+    # Формируем дату для отображения
+    if is_today:
+        date_label = f"{view_date.strftime('%d %B')} сегодня"
+    elif is_tomorrow:
+        date_label = f"{view_date.strftime('%d %B')} завтра"
+    else:
+        date_label = view_date.strftime('%d %B %Y')
+    
     return render_template_string(MAIN_PAGE, 
-                                   focus_tasks=categories['focus'],
-                                   urgent_tasks=categories['urgent'],
-                                   work_tasks=categories['work'],
-                                   home_tasks=categories['home'],
-                                   personal_tasks=categories['personal'],
+                                   categories=sorted_categories,
+                                   category_order=category_order,
                                    username=session.get('username', 'Пользователь'),
-                                   current_quarter=current_quarter)
+                                   current_quarter=current_quarter,
+                                   view_date=view_date_str,
+                                   date_label=date_label,
+                                   is_today=is_today,
+                                   is_tomorrow=is_tomorrow,
+                                   prev_date=(view_date - timedelta(days=1)).strftime('%Y-%m-%d'),
+                                   next_date=(view_date + timedelta(days=1)).strftime('%Y-%m-%d'))
+
+# --- СТРАНИЦА "БУДУЩИЕ" ---
+@app.route('/future')
+def future_page():
+    if 'user_id' not in session:
+        return redirect('/login')
+    
+    user_id = session['user_id']
+    today = datetime.now().date()
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    cur.execute('''
+        SELECT * FROM tasks 
+        WHERE user_id = %s AND status = %s AND quarter IS NULL AND date > %s
+        ORDER BY date ASC
+    ''', (user_id, 'active', today))
+    tasks = cur.fetchall()
+    conn.close()
+    
+    return render_template_string(FUTURE_PAGE, 
+                                   tasks=tasks,
+                                   username=session.get('username', 'Пользователь'))
 
 # --- СТРАНИЦА КВАРТАЛОВ (3 МЕСЯЦА) ---
 @app.route('/quarter/<quarter>')
@@ -246,7 +305,7 @@ def done_page():
                                    tasks=tasks,
                                    username=session.get('username', 'Пользователь'))
 
-# --- API: Добавить задачу в "Позже" (в общий список) ---
+# --- API: Добавить задачу в "Позже" ---
 @app.route('/api/task/later', methods=['POST'])
 def add_later_task():
     if 'user_id' not in session:
@@ -401,7 +460,8 @@ def delete_sphere(sphere_id):
     cur.execute('SELECT name FROM spheres WHERE id = %s AND user_id = %s', (sphere_id, session['user_id']))
     sphere = cur.fetchone()
     if sphere:
-        cur.execute('DELETE FROM tasks WHERE user_id = %s AND sphere = %s', (session['user_id'], sphere[0]))
+        # Перемещаем задачи из сферы в бэклог
+        cur.execute('UPDATE tasks SET category = %s, sphere = NULL, quarter = NULL, sphere_id = NULL WHERE user_id = %s AND sphere = %s', ('later', session['user_id'], sphere[0]))
     cur.execute('DELETE FROM spheres WHERE id = %s AND user_id = %s', (sphere_id, session['user_id']))
     conn.commit()
     conn.close()
@@ -566,6 +626,7 @@ def done_task(task_id):
     
     cur.execute('UPDATE tasks SET status = %s, completed_at = %s WHERE id = %s', ('done', datetime.now(), task_id))
     
+    # Если повторяющаяся — создаём новую на следующий день или через неделю
     if task['repeat_type'] == 'daily':
         new_date = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
         cur.execute('''
@@ -643,7 +704,7 @@ def move_task(task_id):
     
     return jsonify({'success': True, 'message': 'Task moved'})
 
-# --- API: Получить все задачи ---
+# --- API: Получить все задачи на сегодня ---
 @app.route('/api/tasks')
 def get_tasks():
     if 'user_id' not in session:
@@ -651,11 +712,34 @@ def get_tasks():
     
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
+    today = datetime.now().strftime('%Y-%m-%d')
     cur.execute('''
         SELECT * FROM tasks 
-        WHERE user_id = %s AND status = %s AND quarter IS NULL
-        ORDER BY date ASC
-    ''', (session['user_id'], 'active'))
+        WHERE user_id = %s AND status = %s AND quarter IS NULL AND date = %s
+        ORDER BY id ASC
+    ''', (session['user_id'], 'active', today))
+    tasks = cur.fetchall()
+    conn.close()
+    
+    result = []
+    for task in tasks:
+        result.append(dict(task))
+    
+    return jsonify(result)
+
+# --- API: Получить задачи на конкретную дату ---
+@app.route('/api/tasks/date/<date_str>')
+def get_tasks_by_date(date_str):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('''
+        SELECT * FROM tasks 
+        WHERE user_id = %s AND status = %s AND quarter IS NULL AND date = %s
+        ORDER BY id ASC
+    ''', (session['user_id'], 'active', date_str))
     tasks = cur.fetchall()
     conn.close()
     
@@ -825,6 +909,55 @@ MAIN_PAGE = '''
         }
         .header .btn-exit:hover { background: #c5b8d8; }
         
+        /* Дата-навигация */
+        .date-nav {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 16px;
+            margin-bottom: 16px;
+            background: #fcfaff;
+            padding: 10px 20px;
+            border-radius: 12px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        }
+        .date-nav .nav-btn {
+            background: none;
+            border: none;
+            font-size: 20px;
+            color: #8b7bb5;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 8px;
+            transition: 0.2s;
+        }
+        .date-nav .nav-btn:hover { background: #ede5f5; }
+        .date-nav .date-label {
+            font-size: 16px;
+            font-weight: 600;
+            color: #4a3f5e;
+            min-width: 180px;
+            text-align: center;
+        }
+        .date-nav .date-label .today-badge {
+            font-weight: 400;
+            font-size: 13px;
+            color: #27ae60;
+            background: #e8f5e9;
+            padding: 2px 10px;
+            border-radius: 12px;
+            margin-left: 6px;
+        }
+        .date-nav .date-label .tomorrow-badge {
+            font-weight: 400;
+            font-size: 13px;
+            color: #e67e22;
+            background: #fef5e7;
+            padding: 2px 10px;
+            border-radius: 12px;
+            margin-left: 6px;
+        }
+        
         .focus-block {
             background: #fcfaff;
             border-radius: 14px;
@@ -852,13 +985,18 @@ MAIN_PAGE = '''
         }
         .focus-block .empty-block { color: #c5b8d8; font-size: 13px; text-align: center; padding: 16px; }
         
-        .block-row { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 14px; }
+        .block-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
         .block {
             background: #fcfaff;
             border-radius: 12px;
             padding: 14px 16px;
             box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
             min-height: 180px;
+            transition: opacity 0.3s, transform 0.3s;
+        }
+        .block.done {
+            opacity: 0.6;
+            order: 999;
         }
         .block .block-header {
             font-size: 14px;
@@ -924,7 +1062,6 @@ MAIN_PAGE = '''
             padding: 0 4px;
         }
         .task-card .task-actions button:hover { color: #8b7bb5; }
-        .task-card.tag-focus { border-left-color: #8b7bb5; }
         .task-card.tag-urgent { border-left-color: #e67e22; }
         .task-card.tag-work { border-left-color: #3498db; }
         .task-card.tag-home { border-left-color: #2ecc71; }
@@ -1007,6 +1144,21 @@ MAIN_PAGE = '''
             margin-top: 8px;
         }
         .sidebar-card .big-btn-done:hover { background: #2ecc71; }
+        .sidebar-card .big-btn-future {
+            background: #8e44ad;
+            color: white;
+            border: none;
+            border-radius: 10px;
+            padding: 12px;
+            font-size: 15px;
+            font-weight: 600;
+            width: 100%;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            margin-top: 8px;
+        }
+        .sidebar-card .big-btn-future:hover { background: #7d3c98; }
         
         .modal-overlay {
             display: none;
@@ -1095,11 +1247,13 @@ MAIN_PAGE = '''
             .left-column { flex: 1 1 100%; }
             .right-column { flex: 1 1 100%; flex-direction: row; }
             .right-column .sidebar-card { flex: 1; }
-            .block-row { grid-template-columns: 1fr 1fr; }
+            .block-grid { grid-template-columns: 1fr 1fr; }
         }
         @media (max-width: 600px) {
-            .block-row { grid-template-columns: 1fr; }
+            .block-grid { grid-template-columns: 1fr; }
             .header { flex-direction: column; text-align: center; }
+            .date-nav { flex-wrap: wrap; }
+            .date-nav .date-label { min-width: auto; font-size: 14px; }
         }
     </style>
 </head>
@@ -1127,6 +1281,17 @@ MAIN_PAGE = '''
             </div>
         </div>
 
+        <!-- Дата-навигация -->
+        <div class="date-nav">
+            <a href="/?date={{ prev_date }}" class="nav-btn">◀</a>
+            <span class="date-label">
+                {{ date_label }}
+                {% if is_today %}<span class="today-badge">сегодня</span>{% endif %}
+                {% if is_tomorrow %}<span class="tomorrow-badge">завтра</span>{% endif %}
+            </span>
+            <a href="/?date={{ next_date }}" class="nav-btn">▶</a>
+        </div>
+
         <!-- Фокус -->
         <div class="focus-block" id="focusBlock">
             <div class="block-header">
@@ -1137,28 +1302,37 @@ MAIN_PAGE = '''
             <div class="empty-block" id="focusEmpty">Нет задач в фокусе</div>
         </div>
 
-        <!-- Блоки столбиком -->
-        <div class="block-row">
-            <div class="block block-urgent" id="urgentBlock">
-                <div class="block-header">⚡ До 15 минут <span class="count" id="urgentCount">0</span></div>
-                <div id="urgentTasks"></div>
-                <button class="add-task-btn" data-category="urgent" title="Добавить задачу">+</button>
+        <!-- Блоки (2+2) -->
+        <div class="block-grid" id="blockGrid">
+            {% for cat in category_order %}
+            <div class="block block-{{ cat }} {% if categories[cat]|length == 0 %}done{% endif %}" id="block-{{ cat }}">
+                <div class="block-header">
+                    {% if cat == 'urgent' %}⚡ До 15 минут
+                    {% elif cat == 'work' %}💼 Работа
+                    {% elif cat == 'home' %}🏠 Дом
+                    {% elif cat == 'personal' %}❤️ Личное
+                    {% endif %}
+                    <span class="count" id="count-{{ cat }}">{{ categories[cat]|length }}</span>
+                </div>
+                <div id="tasks-{{ cat }}">
+                    {% for task in categories[cat] %}
+                    <div class="task-card tag-{{ cat }}" data-task-id="{{ task.id }}">
+                        <div class="task-info" data-task-id="{{ task.id }}">
+                            <span>{{ task.title }}</span>
+                            {% if task.duration %}
+                            <span class="task-duration">⏱️ {{ task.duration }}</span>
+                            {% endif %}
+                        </div>
+                        <div class="task-actions">
+                            <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
+                            <button class="move-to-focus-btn" title="В фокус" data-task-id="{{ task.id }}">⭐</button>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+                <button class="add-task-btn" data-category="{{ cat }}" title="Добавить задачу">+</button>
             </div>
-            <div class="block block-work" id="workBlock">
-                <div class="block-header">💼 Работа <span class="count" id="workCount">0</span></div>
-                <div id="workTasks"></div>
-                <button class="add-task-btn" data-category="work" title="Добавить задачу">+</button>
-            </div>
-            <div class="block block-home" id="homeBlock">
-                <div class="block-header">🏠 Дом <span class="count" id="homeCount">0</span></div>
-                <div id="homeTasks"></div>
-                <button class="add-task-btn" data-category="home" title="Добавить задачу">+</button>
-            </div>
-            <div class="block block-personal" id="personalBlock">
-                <div class="block-header">❤️ Личное <span class="count" id="personalCount">0</span></div>
-                <div id="personalTasks"></div>
-                <button class="add-task-btn" data-category="personal" title="Добавить задачу">+</button>
-            </div>
+            {% endfor %}
         </div>
     </div>
 
@@ -1166,6 +1340,7 @@ MAIN_PAGE = '''
     <div class="right-column">
         <div class="sidebar-card">
             <a href="/quarter/{{ current_quarter }}" class="big-btn">🗓️ 3 месяца</a>
+            <a href="/future" class="big-btn-future">📅 Будущие</a>
             <a href="/later" class="big-btn-secondary">🕰️ Позже</a>
             <a href="/done" class="big-btn-done">✅ Готово</a>
         </div>
@@ -1181,7 +1356,7 @@ MAIN_PAGE = '''
         <label for="addTaskTitle">Название задачи</label>
         <input type="text" id="addTaskTitle" placeholder="Что нужно сделать?" autofocus>
         <label for="addTaskDate">📅 Дата выполнения</label>
-        <input type="date" id="addTaskDate">
+        <input type="date" id="addTaskDate" value="{{ view_date }}">
         <label for="addTaskDuration">⏱️ Время выполнения</label>
         <input type="text" id="addTaskDuration" placeholder="1 ч">
         <div class="checkbox-group">
@@ -1220,13 +1395,14 @@ MAIN_PAGE = '''
         <h3 id="viewTaskTitle">📌 Задача</h3>
         <p class="sub" id="viewTaskCategory"></p>
         <input type="hidden" id="viewTaskId">
+        <label for="viewTaskTitleInput">Название задачи</label>
+        <input type="text" id="viewTaskTitleInput" style="margin-bottom:8px;">
         <label for="viewTaskDate">📅 Дата выполнения</label>
         <input type="date" id="viewTaskDate" style="margin-bottom:8px;">
         <label for="viewTaskDuration">⏱️ Время выполнения</label>
         <input type="text" id="viewTaskDuration" placeholder="1 ч" style="margin-bottom:8px;">
         <label for="viewTaskCategorySelect">📂 Категория</label>
         <select id="viewTaskCategorySelect" style="margin-bottom:8px;">
-            <option value="focus">🎯 Фокус</option>
             <option value="urgent">⚡ До 15 минут</option>
             <option value="work">💼 Работа</option>
             <option value="home">🏠 Дом</option>
@@ -1275,7 +1451,6 @@ MAIN_PAGE = '''
         <p class="sub" id="moveTaskTitle">Выберите категорию</p>
         <input type="hidden" id="moveTaskId">
         <div class="move-options">
-            <button class="move-cat-btn" data-category="focus"><span class="cat-icon">🎯</span> Фокус</button>
             <button class="move-cat-btn" data-category="urgent"><span class="cat-icon">⚡</span> До 15 мин</button>
             <button class="move-cat-btn" data-category="work"><span class="cat-icon">💼</span> Работа</button>
             <button class="move-cat-btn" data-category="home"><span class="cat-icon">🏠</span> Дом</button>
@@ -1291,12 +1466,13 @@ MAIN_PAGE = '''
 <script>
     let currentViewTaskId = null;
     let moveTaskId = null;
+    let currentViewDate = '{{ view_date }}';
     
     function loadTasks() {
-        fetch('/api/tasks')
+        fetch(`/api/tasks/date/${currentViewDate}`)
             .then(res => res.json())
             .then(tasks => {
-                const categories = { focus: [], urgent: [], work: [], home: [], personal: [] };
+                const categories = { urgent: [], work: [], home: [], personal: [] };
                 tasks.forEach(t => {
                     if (categories[t.category]) categories[t.category].push(t);
                 });
@@ -1306,35 +1482,38 @@ MAIN_PAGE = '''
     
     function renderTasks(categories) {
         const containerMap = {
-            focus: { tasks: 'focusTasks', count: 'focusCount', empty: 'focusEmpty' },
-            urgent: { tasks: 'urgentTasks', count: 'urgentCount', empty: 'urgentEmpty' },
-            work: { tasks: 'workTasks', count: 'workCount', empty: 'workEmpty' },
-            home: { tasks: 'homeTasks', count: 'homeCount', empty: 'homeEmpty' },
-            personal: { tasks: 'personalTasks', count: 'personalCount', empty: 'personalEmpty' }
+            urgent: { tasks: 'tasks-urgent', count: 'count-urgent', block: 'block-urgent' },
+            work: { tasks: 'tasks-work', count: 'count-work', block: 'block-work' },
+            home: { tasks: 'tasks-home', count: 'count-home', block: 'block-home' },
+            personal: { tasks: 'tasks-personal', count: 'count-personal', block: 'block-personal' }
         };
         
         for (const [cat, data] of Object.entries(containerMap)) {
             const tasks = categories[cat] || [];
             const container = document.getElementById(data.tasks);
             const countEl = document.getElementById(data.count);
-            const emptyEl = document.getElementById(data.empty);
+            const blockEl = document.getElementById(data.block);
             
             container.innerHTML = '';
             tasks.forEach(task => {
-                const card = createTaskCard(task);
+                const card = createTaskCard(task, cat);
                 container.appendChild(card);
             });
             
             countEl.textContent = tasks.length;
-            if (emptyEl) {
-                emptyEl.style.display = tasks.length === 0 ? 'block' : 'none';
+            
+            // Если задач нет — блок становится "выполненным" (в конец)
+            if (tasks.length === 0) {
+                blockEl.classList.add('done');
+            } else {
+                blockEl.classList.remove('done');
             }
         }
     }
     
-    function createTaskCard(task) {
+    function createTaskCard(task, category) {
         const div = document.createElement('div');
-        div.className = `task-card tag-${task.category || 'later'}`;
+        div.className = `task-card tag-${category}`;
         div.dataset.taskId = task.id;
         
         let durationHtml = '';
@@ -1348,8 +1527,8 @@ MAIN_PAGE = '''
                 ${durationHtml}
             </div>
             <div class="task-actions">
-                <button class="done-btn" title="Выполнено">✅</button>
-                <button class="move-to-focus-btn" title="В фокус" data-task-id="${task.id}" style="display:${task.category !== 'focus' ? 'inline' : 'none'}">⭐</button>
+                <button class="done-btn" title="Выполнено" data-task-id="${task.id}">✅</button>
+                <button class="move-to-focus-btn" title="В фокус" data-task-id="${task.id}">⭐</button>
             </div>
         `;
         
@@ -1389,7 +1568,7 @@ MAIN_PAGE = '''
                 currentViewTaskId = task.id;
                 document.getElementById('viewTaskId').value = task.id;
                 document.getElementById('viewTaskTitle').textContent = `📌 ${task.title}`;
-                
+                document.getElementById('viewTaskTitleInput').value = task.title || '';
                 document.getElementById('viewTaskDate').value = task.date || '';
                 document.getElementById('viewTaskDuration').value = task.duration || '';
                 document.getElementById('viewTaskCategorySelect').value = task.category || 'later';
@@ -1422,12 +1601,15 @@ MAIN_PAGE = '''
     // --- Сохранение изменений в модалке просмотра ---
     document.getElementById('viewTaskSave').addEventListener('click', function() {
         const taskId = document.getElementById('viewTaskId').value;
+        const title = document.getElementById('viewTaskTitleInput').value.trim();
         const date = document.getElementById('viewTaskDate').value;
         const duration = document.getElementById('viewTaskDuration').value.trim();
         const category = document.getElementById('viewTaskCategorySelect').value;
         const isRepeating = document.getElementById('viewTaskRepeat').checked;
         let repeatType = 'none';
         let repeatDay = null;
+        
+        if (!title) { alert('Введите название'); return; }
         
         if (isRepeating) {
             repeatType = document.getElementById('viewRepeatType').value;
@@ -1440,7 +1622,7 @@ MAIN_PAGE = '''
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ 
-                title: document.getElementById('viewTaskTitle').textContent.replace('📌 ', ''),
+                title, 
                 date, 
                 duration, 
                 category, 
@@ -1496,7 +1678,7 @@ MAIN_PAGE = '''
             document.getElementById('addTaskCategory').value = category;
             document.getElementById('addTaskModalSub').textContent = `Добавьте задачу в категорию: ${getCategoryName(category)}`;
             document.getElementById('addTaskTitle').value = '';
-            document.getElementById('addTaskDate').value = '';
+            document.getElementById('addTaskDate').value = currentViewDate;
             document.getElementById('addTaskDuration').value = '';
             document.getElementById('addTaskRepeat').checked = false;
             document.getElementById('addRepeatOptions').classList.remove('visible');
@@ -1508,7 +1690,6 @@ MAIN_PAGE = '''
     
     function getCategoryName(cat) {
         const names = {
-            'focus': '🎯 Фокус',
             'urgent': '⚡ До 15 минут',
             'work': '💼 Работа',
             'home': '🏠 Дом',
@@ -1531,14 +1712,14 @@ MAIN_PAGE = '''
         let repeatType = 'none';
         let repeatDay = null;
         
+        if (!title) { alert('Введите название'); return; }
+        
         if (isRepeating) {
             repeatType = document.getElementById('addRepeatType').value;
             if (repeatType === 'weekly') {
                 repeatDay = parseInt(document.getElementById('addRepeatDay').value);
             }
         }
-        
-        if (!title) { alert('Введите название'); return; }
         
         fetch('/api/task/direct', {
             method: 'POST',
@@ -1656,6 +1837,156 @@ MAIN_PAGE = '''
     
     loadTasks();
     loadBacklog();
+</script>
+</body>
+</html>
+'''
+
+FUTURE_PAGE = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>📅 Будущие — Мой органайзер</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f6f2fd;
+            padding: 16px;
+            min-height: 100vh;
+            color: #4a3f5e;
+        }
+        .container { max-width: 800px; margin: 0 auto; }
+        .header {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 16px 24px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        }
+        .header h1 { font-size: 22px; color: #4a3f5e; }
+        .header .user { color: #8b7bb5; font-size: 14px; }
+        .header .btn-back {
+            background: #ede5f5;
+            color: #4a3f5e;
+            border: none;
+            padding: 8px 18px;
+            border-radius: 8px;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        .header .btn-back:hover { background: #e0d5ec; }
+        
+        .task-list {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 18px 20px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        }
+        .task-item {
+            background: #faf5ff;
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
+            border-left: 4px solid #8e44ad;
+        }
+        .task-item .task-info {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .task-item .task-info .task-date {
+            font-size: 12px;
+            color: #b5a7cc;
+        }
+        .task-item .task-info .task-duration {
+            font-size: 11px;
+            color: #b5a7cc;
+            background: #ede5f5;
+            padding: 1px 8px;
+            border-radius: 10px;
+        }
+        .task-item .task-actions button {
+            background: none;
+            border: none;
+            color: #c5b8d8;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 0 4px;
+        }
+        .task-item .task-actions button:hover { color: #8b7bb5; }
+        
+        .empty-list { color: #c5b8d8; text-align: center; padding: 30px; }
+        
+        @media (max-width: 600px) {
+            .header { flex-direction: column; text-align: center; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>📅 Будущие</h1>
+        <div>
+            <span class="user">👤 {{ username }}</span>
+            <a href="/" class="btn-back" style="margin-left:12px;">← Назад</a>
+            <a href="/logout" class="btn-back" style="margin-left:8px; background:#d5c8e6; color:#4a3f5e;">Выйти</a>
+        </div>
+    </div>
+    
+    <div class="task-list">
+        {% for task in tasks %}
+        <div class="task-item" data-task-id="{{ task.id }}">
+            <div class="task-info">
+                <span>{{ task.title }}</span>
+                <span class="task-date">📅 {{ task.date }}</span>
+                {% if task.duration %}
+                <span class="task-duration">⏱️ {{ task.duration }}</span>
+                {% endif %}
+            </div>
+            <div class="task-actions">
+                <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
+                <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
+            </div>
+        </div>
+        {% else %}
+        <div class="empty-list">📭 Нет задач на будущие даты</div>
+        {% endfor %}
+    </div>
+</div>
+
+<script>
+    document.querySelectorAll('.done-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const taskId = this.dataset.taskId;
+            fetch(`/api/task/${taskId}/done`, { method: 'POST' })
+                .then(() => location.reload());
+        });
+    });
+    
+    document.querySelectorAll('.delete-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const taskId = this.dataset.taskId;
+            if (confirm('Удалить задачу?')) {
+                fetch(`/api/task/${taskId}`, { method: 'DELETE' })
+                    .then(() => location.reload());
+            }
+        });
+    });
 </script>
 </body>
 </html>
@@ -1847,7 +2178,6 @@ QUARTER_PAGE = '''
         
         .empty-sphere { color: #c5b8d8; font-style: italic; padding: 10px 0; }
         
-        /* Модалка скрыта по умолчанию */
         #editSphereModal {
             display: none;
         }
@@ -1968,7 +2298,6 @@ QUARTER_PAGE = '''
         if (e.key === 'Enter') document.getElementById('addSphereBtn').click();
     });
     
-    // Редактирование сферы
     document.querySelectorAll('.edit-sphere-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const sphereId = this.dataset.sphereId;
@@ -2002,19 +2331,17 @@ QUARTER_PAGE = '''
         if (e.key === 'Enter') document.getElementById('saveSphereEditBtn').click();
     });
     
-    // Удаление сферы
     document.querySelectorAll('.delete-sphere-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const sphereId = this.dataset.sphereId;
             const sphereName = this.dataset.sphereName;
-            if (confirm(`Удалить сферу "${sphereName}" и все её задачи?`)) {
+            if (confirm(`Удалить сферу "${sphereName}"? Задачи переедут в "Распределить".`)) {
                 fetch(`/api/sphere/${sphereId}`, { method: 'DELETE' })
                     .then(() => location.reload());
             }
         });
     });
     
-    // Добавление задачи в сферу
     document.querySelectorAll('.addTaskBtn').forEach(btn => {
         btn.addEventListener('click', function() {
             const sphere = this.dataset.sphere;
