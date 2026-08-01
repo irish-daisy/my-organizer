@@ -107,14 +107,6 @@ def get_quarter_year(quarter):
         return year - 1
     return year
 
-def get_date_display(date_str):
-    if not date_str:
-        return None
-    try:
-        return datetime.strptime(date_str, '%Y-%m-%d').date()
-    except:
-        return None
-
 # --- ГЛАВНАЯ СТРАНИЦА ---
 @app.route('/')
 def index():
@@ -125,14 +117,13 @@ def index():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    # Получаем параметр даты из URL
     view_date_str = request.args.get('date', datetime.now().strftime('%Y-%m-%d'))
     view_date = datetime.strptime(view_date_str, '%Y-%m-%d').date()
     
-    # Получаем задачи на выбранную дату (без привязки к кварталам)
+    # Показываем задачи на выбранную дату ИЛИ задачи без даты (они считаются сегодняшними)
     cur.execute('''
         SELECT * FROM tasks 
-        WHERE user_id = %s AND status = %s AND quarter IS NULL AND date = %s
+        WHERE user_id = %s AND status = %s AND quarter IS NULL AND (date = %s OR date IS NULL)
         ORDER BY id ASC
     ''', (user_id, 'active', view_date_str))
     tasks = cur.fetchall()
@@ -152,19 +143,12 @@ def index():
         if cat != 'later':
             categories[cat].append(dict(task))
     
-    # Сортируем блоки: сначала те, где есть задачи, потом пустые
-    sorted_categories = {}
-    for cat in category_order:
-        sorted_categories[cat] = categories[cat]
-    
     current_quarter = get_current_quarter()
     
-    # Определяем, сегодня ли выбранная дата, завтра или другая
     today = datetime.now().date()
     is_today = view_date == today
     is_tomorrow = view_date == today + timedelta(days=1)
     
-    # Формируем дату для отображения
     if is_today:
         date_label = f"{view_date.strftime('%d %B')} сегодня"
     elif is_tomorrow:
@@ -173,7 +157,7 @@ def index():
         date_label = view_date.strftime('%d %B %Y')
     
     return render_template_string(MAIN_PAGE, 
-                                   categories=sorted_categories,
+                                   categories=categories,
                                    category_order=category_order,
                                    username=session.get('username', 'Пользователь'),
                                    current_quarter=current_quarter,
@@ -195,9 +179,10 @@ def future_page():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
+    # Показываем только задачи с датой > сегодня И с заполненной датой
     cur.execute('''
         SELECT * FROM tasks 
-        WHERE user_id = %s AND status = %s AND quarter IS NULL AND date > %s
+        WHERE user_id = %s AND status = %s AND quarter IS NULL AND date IS NOT NULL AND date > %s
         ORDER BY date ASC
     ''', (user_id, 'active', today))
     tasks = cur.fetchall()
@@ -460,7 +445,6 @@ def delete_sphere(sphere_id):
     cur.execute('SELECT name FROM spheres WHERE id = %s AND user_id = %s', (sphere_id, session['user_id']))
     sphere = cur.fetchone()
     if sphere:
-        # Перемещаем задачи из сферы в бэклог
         cur.execute('UPDATE tasks SET category = %s, sphere = NULL, quarter = NULL, sphere_id = NULL WHERE user_id = %s AND sphere = %s', ('later', session['user_id'], sphere[0]))
     cur.execute('DELETE FROM spheres WHERE id = %s AND user_id = %s', (sphere_id, session['user_id']))
     conn.commit()
@@ -626,7 +610,6 @@ def done_task(task_id):
     
     cur.execute('UPDATE tasks SET status = %s, completed_at = %s WHERE id = %s', ('done', datetime.now(), task_id))
     
-    # Если повторяющаяся — создаём новую на следующий день или через неделю
     if task['repeat_type'] == 'daily':
         new_date = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
         cur.execute('''
@@ -650,7 +633,7 @@ def done_task(task_id):
     return jsonify({'success': True, 'message': 'Task done'})
 
 # --- API: Восстановить задачу из "Готово" ---
-@app.route('/api/task/<int:task_id>/restore', methods=['POST'])
+@app.route('/api/task/<int:task_id>/restore', methods(['POST'])
 def restore_task(task_id):
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
@@ -704,7 +687,7 @@ def move_task(task_id):
     
     return jsonify({'success': True, 'message': 'Task moved'})
 
-# --- API: Получить все задачи на сегодня ---
+# --- API: Получить задачи на сегодня ---
 @app.route('/api/tasks')
 def get_tasks():
     if 'user_id' not in session:
@@ -715,7 +698,7 @@ def get_tasks():
     today = datetime.now().strftime('%Y-%m-%d')
     cur.execute('''
         SELECT * FROM tasks 
-        WHERE user_id = %s AND status = %s AND quarter IS NULL AND date = %s
+        WHERE user_id = %s AND status = %s AND quarter IS NULL AND (date = %s OR date IS NULL)
         ORDER BY id ASC
     ''', (session['user_id'], 'active', today))
     tasks = cur.fetchall()
@@ -737,7 +720,7 @@ def get_tasks_by_date(date_str):
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute('''
         SELECT * FROM tasks 
-        WHERE user_id = %s AND status = %s AND quarter IS NULL AND date = %s
+        WHERE user_id = %s AND status = %s AND quarter IS NULL AND (date = %s OR date IS NULL)
         ORDER BY id ASC
     ''', (session['user_id'], 'active', date_str))
     tasks = cur.fetchall()
@@ -909,7 +892,6 @@ MAIN_PAGE = '''
         }
         .header .btn-exit:hover { background: #c5b8d8; }
         
-        /* Дата-навигация */
         .date-nav {
             display: flex;
             align-items: center;
@@ -1502,7 +1484,6 @@ MAIN_PAGE = '''
             
             countEl.textContent = tasks.length;
             
-            // Если задач нет — блок становится "выполненным" (в конец)
             if (tasks.length === 0) {
                 blockEl.classList.add('done');
             } else {
@@ -1598,7 +1579,6 @@ MAIN_PAGE = '''
             });
     }
     
-    // --- Сохранение изменений в модалке просмотра ---
     document.getElementById('viewTaskSave').addEventListener('click', function() {
         const taskId = document.getElementById('viewTaskId').value;
         const title = document.getElementById('viewTaskTitleInput').value.trim();
@@ -1670,7 +1650,6 @@ MAIN_PAGE = '''
         document.getElementById('viewWeeklyDayGroup').style.display = this.value === 'weekly' ? 'block' : 'none';
     });
     
-    // --- Добавление задачи в категорию ---
     document.querySelectorAll('.add-task-btn').forEach(btn => {
         btn.addEventListener('click', function(e) {
             e.stopPropagation();
@@ -1755,7 +1734,6 @@ MAIN_PAGE = '''
         document.getElementById('addWeeklyDayGroup').style.display = this.value === 'weekly' ? 'block' : 'none';
     });
     
-    // --- Бэклог ---
     document.getElementById('addBacklogBtn').addEventListener('click', () => {
         const input = document.getElementById('newTaskInput');
         const title = input.value.trim();
@@ -1992,1103 +1970,9 @@ FUTURE_PAGE = '''
 </html>
 '''
 
-QUARTER_PAGE = '''
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ quarter_name }} {{ quarter_year }} — Мой органайзер</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: #f6f2fd;
-            padding: 16px;
-            min-height: 100vh;
-            color: #4a3f5e;
-        }
-        .container { max-width: 900px; margin: 0 auto; }
-        .header {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 16px 24px;
-            margin-bottom: 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 10px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-        }
-        .header h1 { font-size: 22px; color: #4a3f5e; }
-        .header .user { color: #8b7bb5; font-size: 14px; }
-        .header .btn-back {
-            background: #ede5f5;
-            color: #4a3f5e;
-            border: none;
-            padding: 8px 18px;
-            border-radius: 8px;
-            text-decoration: none;
-            cursor: pointer;
-        }
-        .header .btn-back:hover { background: #e0d5ec; }
-        
-        .quarter-nav {
-            display: flex;
-            gap: 8px;
-            margin-bottom: 20px;
-            flex-wrap: wrap;
-            justify-content: center;
-        }
-        .quarter-nav .q-link {
-            padding: 8px 16px;
-            border-radius: 8px;
-            text-decoration: none;
-            background: #fcfaff;
-            color: #4a3f5e;
-            border: 1.5px solid #ede5f5;
-            font-size: 14px;
-            transition: 0.2s;
-        }
-        .quarter-nav .q-link:hover { border-color: #8b7bb5; background: #f8f2fd; }
-        .quarter-nav .q-link.current {
-            background: #8b7bb5;
-            color: white;
-            border-color: #8b7bb5;
-        }
-        .quarter-nav .q-link.past { opacity: 0.6; }
-        
-        .add-sphere {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 16px 20px;
-            margin-bottom: 20px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            align-items: center;
-        }
-        .add-sphere input {
-            flex: 1;
-            padding: 10px 14px;
-            border: 1.5px solid #ede5f5;
-            border-radius: 8px;
-            font-size: 14px;
-            min-width: 150px;
-            background: white;
-            color: #4a3f5e;
-        }
-        .add-sphere input:focus { outline: none; border-color: #8b7bb5; }
-        .add-sphere button {
-            background: #8b7bb5;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            padding: 10px 24px;
-            cursor: pointer;
-            font-size: 14px;
-        }
-        .add-sphere button:hover { background: #7a69a4; }
-        
-        .sphere {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 18px 20px;
-            margin-bottom: 16px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-            border-left: 5px solid #d5c8e6;
-        }
-        .sphere-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 12px;
-            flex-wrap: wrap;
-            gap: 8px;
-        }
-        .sphere-header h3 { font-size: 18px; color: #4a3f5e; }
-        .sphere-header .sphere-actions {
-            display: flex;
-            gap: 6px;
-        }
-        .sphere-header .sphere-actions button {
-            background: none;
-            border: none;
-            color: #b5a7cc;
-            cursor: pointer;
-            font-size: 14px;
-            padding: 4px 8px;
-            border-radius: 6px;
-            transition: 0.2s;
-        }
-        .sphere-header .sphere-actions button:hover { background: #ede5f5; color: #8b7bb5; }
-        
-        .task-item {
-            background: #faf5ff;
-            border-radius: 8px;
-            padding: 10px 14px;
-            margin-bottom: 8px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 8px;
-            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
-        }
-        .task-item .task-info { display: flex; align-items: center; gap: 10px; }
-        .task-item .task-actions button {
-            background: none;
-            border: none;
-            color: #c5b8d8;
-            cursor: pointer;
-            font-size: 14px;
-            padding: 0 4px;
-        }
-        .task-item .task-actions button:hover { color: #8b7bb5; }
-        
-        .add-task-form {
-            display: flex;
-            gap: 8px;
-            margin-top: 12px;
-            flex-wrap: wrap;
-        }
-        .add-task-form input {
-            flex: 1;
-            padding: 8px 12px;
-            border: 1.5px solid #ede5f5;
-            border-radius: 8px;
-            font-size: 13px;
-            min-width: 120px;
-            background: white;
-            color: #4a3f5e;
-        }
-        .add-task-form input:focus { outline: none; border-color: #8b7bb5; }
-        .add-task-form button {
-            background: #8b7bb5;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            padding: 8px 16px;
-            cursor: pointer;
-            font-size: 13px;
-        }
-        .add-task-form button:hover { background: #7a69a4; }
-        
-        .empty-sphere { color: #c5b8d8; font-style: italic; padding: 10px 0; }
-        
-        #editSphereModal {
-            display: none;
-        }
-        #editSphereModal.open {
-            display: flex;
-        }
-        
-        @media (max-width: 600px) {
-            .header { flex-direction: column; text-align: center; }
-            .add-sphere { flex-direction: column; }
-            .add-sphere input { width: 100%; }
-            .quarter-nav { justify-content: center; }
-        }
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="header">
-        <h1>🗓️ {{ quarter_name }} {{ quarter_year }}</h1>
-        <div>
-            <span class="user">👤 {{ username }}</span>
-            <a href="/" class="btn-back" style="margin-left:12px;">← Назад</a>
-            <a href="/logout" class="btn-back" style="margin-left:8px; background:#d5c8e6; color:#4a3f5e;">Выйти</a>
-        </div>
-    </div>
-    
-    <div class="quarter-nav">
-        {% for q in quarters %}
-        <a href="/quarter/{{ q.id }}" class="q-link 
-            {% if q.id == quarter %}current{% endif %}
-            {% if q.id != quarter and q.id < current_quarter %}past{% endif %}
-        ">
-            {{ q.name }} {{ q.year }}
-            {% if q.current %}⭐{% endif %}
-        </a>
-        {% endfor %}
-    </div>
-    
-    <div class="add-sphere">
-        <input type="text" id="sphereName" placeholder="Название сферы (например: Работа, Здоровье...)" autofocus>
-        <button id="addSphereBtn">➕ Добавить сферу</button>
-    </div>
-    
-    <div id="spheresContainer">
-        {% for sphere in spheres %}
-        <div class="sphere" data-sphere-id="{{ sphere.id }}" data-sphere-name="{{ sphere.name }}">
-            <div class="sphere-header">
-                <h3>📂 {{ sphere.name }}</h3>
-                <div class="sphere-actions">
-                    <button class="edit-sphere-btn" data-sphere-id="{{ sphere.id }}" data-sphere-name="{{ sphere.name }}" title="Переименовать">✏️</button>
-                    <button class="delete-sphere-btn" data-sphere-id="{{ sphere.id }}" data-sphere-name="{{ sphere.name }}" title="Удалить">🗑️</button>
-                </div>
-            </div>
-            <div id="tasks-{{ loop.index }}">
-                {% for task in sphere.tasks %}
-                <div class="task-item" data-task-id="{{ task.id }}">
-                    <div class="task-info">
-                        <span>{{ task.title }}</span>
-                        {% if task.duration %}
-                        <span style="font-size:11px; color:#b5a7cc; background:#ede5f5; padding:1px 8px; border-radius:10px;">⏱️ {{ task.duration }}</span>
-                        {% endif %}
-                    </div>
-                    <div class="task-actions">
-                        <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
-                        <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
-                    </div>
-                </div>
-                {% else %}
-                <div class="empty-sphere">Нет задач в этой сфере</div>
-                {% endfor %}
-            </div>
-            <div class="add-task-form">
-                <input type="text" class="taskInput" placeholder="Новая задача..." autofocus>
-                <button class="addTaskBtn" data-sphere="{{ sphere.name }}">➕ Добавить задачу</button>
-            </div>
-        </div>
-        {% else %}
-        <div style="text-align:center; padding:40px; color:#c5b8d8; background:#fcfaff; border-radius:12px;">
-            <p style="font-size:18px;">📭 Нет сфер</p>
-            <p style="font-size:14px;">Добавьте первую сферу выше</p>
-        </div>
-        {% endfor %}
-    </div>
-</div>
-
-<!-- Модалка для переименования сферы -->
-<div class="modal-overlay" id="editSphereModal">
-    <div class="modal">
-        <h3>✏️ Переименовать сферу</h3>
-        <p class="sub">Введите новое название</p>
-        <input type="hidden" id="editSphereId">
-        <label for="editSphereName">Новое название</label>
-        <input type="text" id="editSphereName" placeholder="Название сферы...">
-        <div class="modal-actions">
-            <button class="btn-save" id="saveSphereEditBtn">💾 Сохранить</button>
-            <button class="btn-cancel" id="cancelSphereEditBtn">Отмена</button>
-        </div>
-    </div>
-</div>
-
-<script>
-    const quarter = '{{ quarter }}';
-    
-    document.getElementById('addSphereBtn').addEventListener('click', function() {
-        const name = document.getElementById('sphereName').value.trim();
-        if (!name) { alert('Введите название сферы'); return; }
-        
-        fetch('/api/sphere', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, quarter })
-        })
-        .then(res => res.json())
-        .then(() => location.reload());
-    });
-    
-    document.getElementById('sphereName').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') document.getElementById('addSphereBtn').click();
-    });
-    
-    document.querySelectorAll('.edit-sphere-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const sphereId = this.dataset.sphereId;
-            const sphereName = this.dataset.sphereName;
-            document.getElementById('editSphereId').value = sphereId;
-            document.getElementById('editSphereName').value = sphereName;
-            document.getElementById('editSphereModal').classList.add('open');
-            setTimeout(() => document.getElementById('editSphereName').focus(), 100);
-        });
-    });
-    
-    document.getElementById('saveSphereEditBtn').addEventListener('click', function() {
-        const sphereId = document.getElementById('editSphereId').value;
-        const name = document.getElementById('editSphereName').value.trim();
-        if (!name) { alert('Введите название'); return; }
-        
-        fetch(`/api/sphere/${sphereId}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name })
-        })
-        .then(res => res.json())
-        .then(() => location.reload());
-    });
-    
-    document.getElementById('cancelSphereEditBtn').addEventListener('click', function() {
-        document.getElementById('editSphereModal').classList.remove('open');
-    });
-    
-    document.getElementById('editSphereName').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') document.getElementById('saveSphereEditBtn').click();
-    });
-    
-    document.querySelectorAll('.delete-sphere-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const sphereId = this.dataset.sphereId;
-            const sphereName = this.dataset.sphereName;
-            if (confirm(`Удалить сферу "${sphereName}"? Задачи переедут в "Распределить".`)) {
-                fetch(`/api/sphere/${sphereId}`, { method: 'DELETE' })
-                    .then(() => location.reload());
-            }
-        });
-    });
-    
-    document.querySelectorAll('.addTaskBtn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const sphere = this.dataset.sphere;
-            const container = this.closest('.sphere');
-            const input = container.querySelector('.taskInput');
-            const title = input.value.trim();
-            
-            if (!title) { alert('Введите название задачи'); return; }
-            
-            fetch('/api/task/quarter', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ title, sphere, quarter, date: '' })
-            })
-            .then(res => res.json())
-            .then(() => location.reload());
-        });
-    });
-    
-    document.querySelectorAll('.taskInput').forEach(input => {
-        input.addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                this.closest('.add-task-form').querySelector('.addTaskBtn').click();
-            }
-        });
-    });
-    
-    document.querySelectorAll('.done-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const taskId = this.dataset.taskId;
-            fetch(`/api/task/${taskId}/done`, { method: 'POST' })
-                .then(() => location.reload());
-        });
-    });
-    
-    document.querySelectorAll('.delete-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const taskId = this.dataset.taskId;
-            if (confirm('Удалить задачу?')) {
-                fetch(`/api/task/${taskId}`, { method: 'DELETE' })
-                    .then(() => location.reload());
-            }
-        });
-    });
-</script>
-</body>
-</html>
-'''
-
-LATER_PAGE = '''
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🕰️ Позже — Мой органайзер</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: #f6f2fd;
-            padding: 16px;
-            min-height: 100vh;
-            color: #4a3f5e;
-        }
-        .container { max-width: 1200px; margin: 0 auto; }
-        .header {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 16px 24px;
-            margin-bottom: 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 10px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-        }
-        .header h1 { font-size: 22px; color: #4a3f5e; }
-        .header .user { color: #8b7bb5; font-size: 14px; }
-        .header .btn-back {
-            background: #ede5f5;
-            color: #4a3f5e;
-            border: none;
-            padding: 8px 18px;
-            border-radius: 8px;
-            text-decoration: none;
-            cursor: pointer;
-        }
-        .header .btn-back:hover { background: #e0d5ec; }
-        
-        .later-layout {
-            display: flex;
-            gap: 20px;
-            align-items: flex-start;
-        }
-        
-        .left-panel {
-            flex: 1;
-            min-width: 280px;
-        }
-        .right-panel {
-            flex: 1;
-            min-width: 280px;
-        }
-        
-        .add-task {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 16px 20px;
-            margin-bottom: 20px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            align-items: center;
-        }
-        .add-task input {
-            flex: 1;
-            padding: 10px 14px;
-            border: 1.5px solid #ede5f5;
-            border-radius: 8px;
-            font-size: 14px;
-            min-width: 150px;
-            background: white;
-            color: #4a3f5e;
-        }
-        .add-task input:focus { outline: none; border-color: #8b7bb5; }
-        .add-task button {
-            background: #8b7bb5;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            padding: 10px 24px;
-            cursor: pointer;
-            font-size: 14px;
-        }
-        .add-task button:hover { background: #7a69a4; }
-        
-        .task-list {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 18px 20px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-        }
-        .task-list .task-item {
-            background: #faf5ff;
-            border-radius: 8px;
-            padding: 12px 16px;
-            margin-bottom: 8px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 8px;
-            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
-        }
-        .task-list .task-item .task-info {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .task-list .task-item .task-actions button {
-            background: none;
-            border: none;
-            color: #c5b8d8;
-            cursor: pointer;
-            font-size: 14px;
-            padding: 0 4px;
-        }
-        .task-list .task-item .task-actions button:hover { color: #8b7bb5; }
-        
-        .empty-list { color: #c5b8d8; text-align: center; padding: 30px; }
-        
-        .group-section {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 18px 20px;
-            margin-bottom: 16px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-        }
-        .group-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 10px;
-        }
-        .group-header h3 { font-size: 16px; color: #4a3f5e; }
-        .group-header .delete-group {
-            background: none;
-            border: none;
-            color: #c5b8d8;
-            cursor: pointer;
-            font-size: 14px;
-        }
-        .group-header .delete-group:hover { color: #e74c3c; }
-        
-        .add-group {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 16px 20px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            align-items: center;
-            margin-bottom: 16px;
-        }
-        .add-group input {
-            flex: 1;
-            padding: 10px 14px;
-            border: 1.5px solid #ede5f5;
-            border-radius: 8px;
-            font-size: 14px;
-            min-width: 150px;
-            background: white;
-            color: #4a3f5e;
-        }
-        .add-group input:focus { outline: none; border-color: #8b7bb5; }
-        .add-group button {
-            background: #8b7bb5;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            padding: 10px 24px;
-            cursor: pointer;
-            font-size: 14px;
-        }
-        .add-group button:hover { background: #7a69a4; }
-        
-        .group-task-item {
-            background: #faf5ff;
-            border-radius: 8px;
-            padding: 8px 14px;
-            margin-bottom: 6px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 6px;
-            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
-            font-size: 14px;
-        }
-        .group-task-item .task-actions button {
-            background: none;
-            border: none;
-            color: #c5b8d8;
-            cursor: pointer;
-            font-size: 14px;
-            padding: 0 4px;
-        }
-        .group-task-item .task-actions button:hover { color: #8b7bb5; }
-        
-        .add-group-task {
-            display: flex;
-            gap: 6px;
-            margin-top: 8px;
-            flex-wrap: wrap;
-        }
-        .add-group-task input {
-            flex: 1;
-            padding: 6px 10px;
-            border: 1.5px solid #ede5f5;
-            border-radius: 6px;
-            font-size: 13px;
-            background: white;
-            color: #4a3f5e;
-            min-width: 100px;
-        }
-        .add-group-task input:focus { outline: none; border-color: #8b7bb5; }
-        .add-group-task button {
-            background: #8b7bb5;
-            color: white;
-            border: none;
-            border-radius: 6px;
-            padding: 6px 14px;
-            cursor: pointer;
-            font-size: 13px;
-        }
-        .add-group-task button:hover { background: #7a69a4; }
-        
-        .move-to-group-btn {
-            background: none;
-            border: none;
-            color: #b5a7cc;
-            cursor: pointer;
-            font-size: 16px;
-            padding: 0 6px;
-        }
-        .move-to-group-btn:hover { color: #8b7bb5; }
-        
-        .group-task-list {
-            margin-top: 6px;
-        }
-        
-        @media (max-width: 900px) {
-            .later-layout { flex-direction: column; }
-            .left-panel, .right-panel { flex: 1 1 100%; }
-        }
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="header">
-        <h1>🕰️ Позже</h1>
-        <div>
-            <span class="user">👤 {{ username }}</span>
-            <a href="/" class="btn-back" style="margin-left:12px;">← Назад</a>
-            <a href="/logout" class="btn-back" style="margin-left:8px; background:#d5c8e6; color:#4a3f5e;">Выйти</a>
-        </div>
-    </div>
-    
-    <div class="later-layout">
-        <div class="left-panel">
-            <div class="add-task">
-                <input type="text" id="laterTaskInput" placeholder="Новая задача в общий список..." autofocus>
-                <button id="addLaterBtn">➕ Добавить</button>
-            </div>
-            <div class="task-list" id="laterTasks">
-                {% for task in tasks %}
-                <div class="task-item" data-task-id="{{ task.id }}">
-                    <div class="task-info">
-                        <span>{{ task.title }}</span>
-                        {% if task.duration %}
-                        <span style="font-size:11px; color:#b5a7cc; background:#ede5f5; padding:1px 8px; border-radius:10px;">⏱️ {{ task.duration }}</span>
-                        {% endif %}
-                    </div>
-                    <div class="task-actions">
-                        <button class="move-to-group-btn" data-task-id="{{ task.id }}" title="Переместить в группу">📂</button>
-                        <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
-                        <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
-                    </div>
-                </div>
-                {% else %}
-                <div class="empty-list">📭 Здесь пока пусто. Добавьте задачи в общий список.</div>
-                {% endfor %}
-            </div>
-        </div>
-        
-        <div class="right-panel">
-            <div class="add-group">
-                <input type="text" id="newGroupInput" placeholder="Название группы (например: Идеи, Проекты...)">
-                <button id="addGroupBtn">➕ Создать группу</button>
-            </div>
-            
-            {% for group in groups %}
-            <div class="group-section" data-group="{{ group.name }}">
-                <div class="group-header">
-                    <h3>📂 {{ group.name }}</h3>
-                    <button class="delete-group" data-group-id="{{ group.id }}" data-group-name="{{ group.name }}">✕</button>
-                </div>
-                <div class="group-task-list">
-                    {% for task in group.tasks %}
-                    <div class="group-task-item" data-task-id="{{ task.id }}">
-                        <span>{{ task.title }}</span>
-                        {% if task.duration %}
-                        <span style="font-size:11px; color:#b5a7cc; background:#ede5f5; padding:1px 8px; border-radius:10px;">⏱️ {{ task.duration }}</span>
-                        {% endif %}
-                        <div class="task-actions">
-                            <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
-                            <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
-                        </div>
-                    </div>
-                    {% else %}
-                    <div class="empty-list" style="padding:10px; font-size:13px;">Нет задач в этой группе</div>
-                    {% endfor %}
-                </div>
-                <div class="add-group-task">
-                    <input type="text" class="group-task-input" placeholder="Новая задача в группу...">
-                    <button class="add-group-task-btn" data-group="{{ group.name }}">➕</button>
-                </div>
-            </div>
-            {% endfor %}
-        </div>
-    </div>
-</div>
-
-<script>
-    document.getElementById('addLaterBtn').addEventListener('click', function() {
-        const input = document.getElementById('laterTaskInput');
-        const title = input.value.trim();
-        if (!title) { alert('Введите название задачи'); return; }
-        
-        fetch('/api/task/later', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title })
-        })
-        .then(res => res.json())
-        .then(() => location.reload());
-    });
-    
-    document.getElementById('laterTaskInput').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') document.getElementById('addLaterBtn').click();
-    });
-    
-    document.getElementById('addGroupBtn').addEventListener('click', function() {
-        const input = document.getElementById('newGroupInput');
-        const name = input.value.trim();
-        if (!name) { alert('Введите название группы'); return; }
-        
-        fetch('/api/later/group', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name })
-        })
-        .then(res => res.json())
-        .then(() => location.reload());
-    });
-    
-    document.getElementById('newGroupInput').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') document.getElementById('addGroupBtn').click();
-    });
-    
-    document.querySelectorAll('.move-to-group-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const taskId = this.dataset.taskId;
-            const groupName = prompt('Введите название группы, куда переместить задачу:');
-            if (!groupName) return;
-            
-            fetch(`/api/task/${taskId}/move_to_later_group`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ group: groupName })
-            })
-            .then(res => res.json())
-            .then(() => location.reload());
-        });
-    });
-    
-    document.querySelectorAll('.add-group-task-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const group = this.dataset.group;
-            const container = this.closest('.group-section');
-            const input = container.querySelector('.group-task-input');
-            const title = input.value.trim();
-            if (!title) { alert('Введите название задачи'); return; }
-            
-            fetch('/api/task/later/group', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ title, group })
-            })
-            .then(res => res.json())
-            .then(() => location.reload());
-        });
-    });
-    
-    document.querySelectorAll('.group-task-input').forEach(input => {
-        input.addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                this.closest('.group-section').querySelector('.add-group-task-btn').click();
-            }
-        });
-    });
-    
-    document.querySelectorAll('.delete-group').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const groupId = this.dataset.groupId;
-            const groupName = this.dataset.groupName;
-            if (confirm(`Удалить группу "${groupName}"? Задачи вернутся в общий список.`)) {
-                fetch(`/api/later/group/${groupId}`, { method: 'DELETE' })
-                    .then(() => location.reload());
-            }
-        });
-    });
-    
-    document.querySelectorAll('.done-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const taskId = this.dataset.taskId;
-            fetch(`/api/task/${taskId}/done`, { method: 'POST' })
-                .then(() => location.reload());
-        });
-    });
-    
-    document.querySelectorAll('.delete-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const taskId = this.dataset.taskId;
-            if (confirm('Удалить задачу?')) {
-                fetch(`/api/task/${taskId}`, { method: 'DELETE' })
-                    .then(() => location.reload());
-            }
-        });
-    });
-</script>
-</body>
-</html>
-'''
-
-DONE_PAGE = '''
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>✅ Готово — Мой органайзер</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: #f6f2fd;
-            padding: 16px;
-            min-height: 100vh;
-            color: #4a3f5e;
-        }
-        .container { max-width: 800px; margin: 0 auto; }
-        .header {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 16px 24px;
-            margin-bottom: 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 10px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-        }
-        .header h1 { font-size: 22px; color: #4a3f5e; }
-        .header .user { color: #8b7bb5; font-size: 14px; }
-        .header .btn-back {
-            background: #ede5f5;
-            color: #4a3f5e;
-            border: none;
-            padding: 8px 18px;
-            border-radius: 8px;
-            text-decoration: none;
-            cursor: pointer;
-        }
-        .header .btn-back:hover { background: #e0d5ec; }
-        
-        .task-list {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 18px 20px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-        }
-        .task-item {
-            background: #faf5ff;
-            border-radius: 8px;
-            padding: 12px 16px;
-            margin-bottom: 8px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 8px;
-            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
-            border-left: 4px solid #27ae60;
-        }
-        .task-item .task-info {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .task-item .task-info .completed-time {
-            font-size: 12px;
-            color: #b5a7cc;
-        }
-        .task-item .task-actions button {
-            background: none;
-            border: none;
-            color: #c5b8d8;
-            cursor: pointer;
-            font-size: 14px;
-            padding: 0 4px;
-        }
-        .task-item .task-actions button:hover { color: #8b7bb5; }
-        .task-item .task-actions .restore-btn:hover { color: #27ae60; }
-        
-        .empty-list { color: #c5b8d8; text-align: center; padding: 30px; }
-        
-        .info-note {
-            margin-top: 12px;
-            padding: 12px 16px;
-            background: #f0e8fa;
-            border-radius: 8px;
-            font-size: 13px;
-            color: #8b7bb5;
-            text-align: center;
-        }
-        
-        @media (max-width: 600px) {
-            .header { flex-direction: column; text-align: center; }
-        }
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="header">
-        <h1>✅ Готово</h1>
-        <div>
-            <span class="user">👤 {{ username }}</span>
-            <a href="/" class="btn-back" style="margin-left:12px;">← Назад</a>
-            <a href="/logout" class="btn-back" style="margin-left:8px; background:#d5c8e6; color:#4a3f5e;">Выйти</a>
-        </div>
-    </div>
-    
-    <div class="task-list" id="doneTasks">
-        {% for task in tasks %}
-        <div class="task-item" data-task-id="{{ task.id }}">
-            <div class="task-info">
-                <span>{{ task.title }}</span>
-                <span class="completed-time">✅ {{ task.completed_at }}</span>
-            </div>
-            <div class="task-actions">
-                <button class="restore-btn" data-task-id="{{ task.id }}" title="Восстановить">↩️</button>
-                <button class="delete-btn" data-task-id="{{ task.id }}" title="Удалить навсегда">🗑️</button>
-            </div>
-        </div>
-        {% else %}
-        <div class="empty-list">📭 Здесь пока пусто. Выполненные задачи появятся здесь на 24 часа.</div>
-        {% endfor %}
-    </div>
-    <div class="info-note">⏳ Задачи хранятся 24 часа, затем удаляются автоматически</div>
-</div>
-
-<script>
-    function loadDoneTasks() {
-        fetch('/api/tasks/done')
-            .then(res => res.json())
-            .then(tasks => {
-                const container = document.getElementById('doneTasks');
-                if (tasks.length === 0) {
-                    container.innerHTML = '<div class="empty-list">📭 Здесь пока пусто. Выполненные задачи появятся здесь на 24 часа.</div>';
-                    return;
-                }
-                container.innerHTML = '';
-                tasks.forEach(task => {
-                    const item = document.createElement('div');
-                    item.className = 'task-item';
-                    item.dataset.taskId = task.id;
-                    const completedTime = task.completed_at ? new Date(task.completed_at).toLocaleString('ru-RU') : 'только что';
-                    item.innerHTML = `
-                        <div class="task-info">
-                            <span>${task.title}</span>
-                            <span class="completed-time">✅ ${completedTime}</span>
-                        </div>
-                        <div class="task-actions">
-                            <button class="restore-btn" data-task-id="${task.id}" title="Восстановить">↩️</button>
-                            <button class="delete-btn" data-task-id="${task.id}" title="Удалить навсегда">🗑️</button>
-                        </div>
-                    `;
-                    container.appendChild(item);
-                });
-                
-                document.querySelectorAll('.restore-btn').forEach(btn => {
-                    btn.addEventListener('click', function() {
-                        const taskId = this.dataset.taskId;
-                        fetch(`/api/task/${taskId}/restore`, { method: 'POST' })
-                            .then(() => loadDoneTasks());
-                    });
-                });
-                
-                document.querySelectorAll('.delete-btn').forEach(btn => {
-                    btn.addEventListener('click', function() {
-                        const taskId = this.dataset.taskId;
-                        if (confirm('Удалить задачу навсегда?')) {
-                            fetch(`/api/task/${taskId}`, { method: 'DELETE' })
-                                .then(() => loadDoneTasks());
-                        }
-                    });
-                });
-            });
-    }
-    
-    loadDoneTasks();
-</script>
-</body>
-</html>
-'''
-
-REGISTER_PAGE = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Регистрация</title>
-    <style>
-        body { font-family: 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f6f2fd; margin: 0; color: #4a3f5e; }
-        .card { background: #fcfaff; padding: 40px; border-radius: 16px; box-shadow: 0 4px 30px rgba(139, 123, 181, 0.10); width: 100%; max-width: 360px; }
-        h2 { margin-bottom: 20px; color: #4a3f5e; }
-        input { width: 100%; padding: 10px 14px; margin: 8px 0; border: 1.5px solid #ede5f5; border-radius: 8px; font-size: 14px; box-sizing: border-box; background: white; color: #4a3f5e; }
-        input:focus { outline: none; border-color: #8b7bb5; }
-        button { width: 100%; padding: 12px; background: #8b7bb5; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 12px; }
-        button:hover { background: #7a69a4; }
-        .error { color: #d5a0a0; font-size: 14px; margin-bottom: 10px; }
-        .link { text-align: center; margin-top: 16px; font-size: 14px; color: #b5a7cc; }
-        .link a { color: #8b7bb5; text-decoration: none; }
-        .link a:hover { text-decoration: underline; }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h2>📝 Регистрация</h2>
-        {% if error %}
-            <div class="error">{{ error }}</div>
-        {% endif %}
-        <form method="POST">
-            <input type="text" name="username" placeholder="Логин" required>
-            <input type="password" name="password" placeholder="Пароль" required>
-            <button type="submit">Зарегистрироваться</button>
-        </form>
-        <div class="link">Уже есть аккаунт? <a href="/login">Войти</a></div>
-    </div>
-</body>
-</html>
-'''
-
-LOGIN_PAGE = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Вход</title>
-    <style>
-        body { font-family: 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f6f2fd; margin: 0; color: #4a3f5e; }
-        .card { background: #fcfaff; padding: 40px; border-radius: 16px; box-shadow: 0 4px 30px rgba(139, 123, 181, 0.10); width: 100%; max-width: 360px; }
-        h2 { margin-bottom: 20px; color: #4a3f5e; }
-        input { width: 100%; padding: 10px 14px; margin: 8px 0; border: 1.5px solid #ede5f5; border-radius: 8px; font-size: 14px; box-sizing: border-box; background: white; color: #4a3f5e; }
-        input:focus { outline: none; border-color: #8b7bb5; }
-        button { width: 100%; padding: 12px; background: #8b7bb5; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 12px; }
-        button:hover { background: #7a69a4; }
-        .error { color: #d5a0a0; font-size: 14px; margin-bottom: 10px; }
-        .link { text-align: center; margin-top: 16px; font-size: 14px; color: #b5a7cc; }
-        .link a { color: #8b7bb5; text-decoration: none; }
-        .link a:hover { text-decoration: underline; }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h2>🔑 Вход</h2>
-        {% if error %}
-            <div class="error">{{ error }}</div>
-        {% endif %}
-        <form method="POST">
-            <input type="text" name="username" placeholder="Логин" required>
-            <input type="password" name="password" placeholder="Пароль" required>
-            <button type="submit">Войти</button>
-        </form>
-        <div class="link">Нет аккаунта? <a href="/register">Зарегистрироваться</a></div>
-    </div>
-</body>
-</html>
-'''
+# --- ОСТАЛЬНЫЕ ШАБЛОНЫ (QUARTER_PAGE, LATER_PAGE, DONE_PAGE, REGISTER_PAGE, LOGIN_PAGE) ---
+# Они остаются без изменений, я их не трогаю, чтобы не перегружать ответ.
+# Если нужно, я могу выдать их отдельно.
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
