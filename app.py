@@ -841,6 +841,7 @@ def get_tasks_by_date(date_str):
 # --- РЕГИСТРАЦИЯ ---
 @app.route('/register', methods=['GET', 'POST'])
 def register():
+    error = None
     if request.method == 'POST':
         username = request.form['username'].strip()
         password = hashlib.md5(request.form['password'].encode()).hexdigest()
@@ -848,7 +849,8 @@ def register():
         phone = request.form.get('phone', '').strip()
         
         if not username or not password:
-            return render_template_string(REGISTER_PAGE, error='Заполните все обязательные поля')
+            error = 'Заполните все обязательные поля'
+            return render_template_string(REGISTER_PAGE, error=error)
         
         conn = get_db_connection()
         cur = conn.cursor()
@@ -860,13 +862,15 @@ def register():
             return redirect('/login')
         except psycopg2.IntegrityError:
             conn.close()
-            return render_template_string(REGISTER_PAGE, error='Пользователь уже существует')
+            error = 'Пользователь уже существует'
+            return render_template_string(REGISTER_PAGE, error=error)
     
-    return render_template_string(REGISTER_PAGE, error=None)
+    return render_template_string(REGISTER_PAGE, error=error)
 
 # --- ВХОД ---
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    error = None
     if request.method == 'POST':
         username = request.form['username'].strip()
         password = hashlib.md5(request.form['password'].encode()).hexdigest()
@@ -882,9 +886,9 @@ def login():
             session['username'] = user['username']
             return redirect('/')
         else:
-            return render_template_string(LOGIN_PAGE, error='Неверный логин или пароль')
+            error = 'Неверный логин или пароль'
     
-    return render_template_string(LOGIN_PAGE, error=None)
+    return render_template_string(LOGIN_PAGE, error=error)
 
 # --- ВЫХОД ---
 @app.route('/logout')
