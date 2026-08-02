@@ -173,7 +173,7 @@ def index():
         'waiting': []
     }
     
-    category_order = ['urgent', 'work', 'home', 'personal', 'waiting']
+    category_order = ['urgent', 'work', 'home', 'personal']
     
     for task in tasks:
         cat = task['category'] if task['category'] in categories else 'later'
@@ -911,8 +911,12 @@ MAIN_PAGE = '''
             padding: 18px 14px;
             min-height: 400px;
             box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
         }
         .left-column h2 { font-size: 15px; color: #8b7bb5; margin-bottom: 12px; }
+        
         .backlog-add {
             display: flex;
             gap: 6px;
@@ -965,6 +969,80 @@ MAIN_PAGE = '''
         }
         .backlog-item .move-btn:hover { color: #8b7bb5; }
         .backlog-hint { font-size: 11px; color: #c5b8d8; margin-top: 8px; }
+        
+        /* Блок "Жду ответа" в левой колонке */
+        .waiting-block {
+            background: white;
+            border-radius: 12px;
+            padding: 14px 16px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+            margin-top: 8px;
+        }
+        .waiting-block .block-header {
+            font-size: 14px;
+            font-weight: 600;
+            color: #4a3f5e;
+            margin-bottom: 10px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #8e44ad;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .waiting-block .block-header .count {
+            font-size: 11px;
+            font-weight: 400;
+            color: #8b7bb5;
+            background: #f0e8fa;
+            padding: 2px 10px;
+            border-radius: 12px;
+        }
+        .waiting-task {
+            background: #faf5ff;
+            border-radius: 8px;
+            padding: 8px 12px;
+            margin-bottom: 6px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 13px;
+            border-left: 4px solid #8e44ad;
+        }
+        .waiting-task .task-actions button {
+            background: none;
+            border: none;
+            color: #c5b8d8;
+            cursor: pointer;
+            font-size: 13px;
+            padding: 4px 6px;
+            touch-action: manipulation;
+        }
+        .waiting-task .task-actions button:hover { color: #8b7bb5; }
+        .waiting-block .add-task-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: #f0e8fa;
+            color: #8b7bb5;
+            border: 2px solid #e0d5ec;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 300;
+            margin: 4px auto 0;
+            transition: 0.2s;
+            line-height: 1;
+            touch-action: manipulation;
+        }
+        .waiting-block .add-task-btn:hover { 
+            background: #8b7bb5; 
+            color: white; 
+            border-color: #8b7bb5; 
+            transform: scale(1.08);
+        }
+        .waiting-empty { color: #c5b8d8; font-size: 13px; text-align: center; padding: 12px; }
         
         .center-column {
             flex: 1;
@@ -1071,9 +1149,9 @@ MAIN_PAGE = '''
         }
         .focus-block .empty-block { color: #c5b8d8; font-size: 13px; text-align: center; padding: 16px; }
         
-        .blocks-column {
-            display: flex;
-            flex-direction: column;
+        .block-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
             gap: 14px;
         }
         .block {
@@ -1109,7 +1187,6 @@ MAIN_PAGE = '''
         .block-work .block-header { border-bottom-color: #3498db; }
         .block-home .block-header { border-bottom-color: #2ecc71; }
         .block-personal .block-header { border-bottom-color: #e74c3c; }
-        .block-waiting .block-header { border-bottom-color: #8e44ad; }
         
         .task-card {
             background: #faf5ff;
@@ -1128,17 +1205,9 @@ MAIN_PAGE = '''
             touch-action: none;
             user-select: none;
         }
-        .task-card:active {
-            cursor: grabbing;
-        }
-        .task-card.dragging {
-            opacity: 0.4;
-            transform: scale(0.98);
-        }
-        .task-card.drag-over {
-            border-left-color: #8b7bb5;
-            border-left-width: 6px;
-        }
+        .task-card:active { cursor: grabbing; }
+        .task-card.dragging { opacity: 0.4; transform: scale(0.98); }
+        .task-card.drag-over { border-left-color: #8b7bb5; border-left-width: 6px; }
         .task-card:hover { background: #f5eefa; }
         .task-card .task-info { 
             display: flex; 
@@ -1184,7 +1253,6 @@ MAIN_PAGE = '''
         .task-card.tag-work { border-left-color: #3498db; }
         .task-card.tag-home { border-left-color: #2ecc71; }
         .task-card.tag-personal { border-left-color: #e74c3c; }
-        .task-card.tag-waiting { border-left-color: #8e44ad; }
         
         .empty-block { color: #c5b8d8; font-size: 13px; text-align: center; padding: 16px; }
         .add-task-btn {
@@ -1371,12 +1439,13 @@ MAIN_PAGE = '''
         
         @media (max-width: 768px) {
             body { padding: 10px; }
-            .app-container { flex-direction: column-reverse; }
-            .left-column { flex: 1 1 100%; order: 10; }
+            .app-container { flex-direction: column; }
+            .left-column { flex: 1 1 100%; }
             .right-column { flex: 1 1 100%; flex-direction: row; flex-wrap: wrap; }
             .right-column .sidebar-card { flex: 1; min-width: 120px; }
             .center-column { flex: 1 1 100%; }
             .block { min-height: 140px; }
+            .block-grid { grid-template-columns: 1fr 1fr; }
             .date-nav .date-label { font-size: 14px; min-width: 100px; }
             .header { flex-direction: column; text-align: center; }
             .modal { padding: 18px 16px; }
@@ -1384,6 +1453,7 @@ MAIN_PAGE = '''
             .task-card .task-actions button { padding: 4px 4px; min-width: 28px; min-height: 28px; font-size: 13px; }
         }
         @media (max-width: 480px) {
+            .block-grid { grid-template-columns: 1fr; }
             .date-nav .date-label { font-size: 12px; min-width: 80px; }
             .date-nav .nav-btn { font-size: 16px; }
             .right-column .sidebar-card { min-width: 100px; }
@@ -1396,13 +1466,25 @@ MAIN_PAGE = '''
 
     <!-- Левая колонка -->
     <div class="left-column">
-        <h2>📥 Распределить</h2>
-        <div class="backlog-add">
-            <input type="text" id="newTaskInput" placeholder="Новая задача..." autofocus>
-            <button id="addBacklogBtn">+</button>
+        <div>
+            <h2>📥 Распределить</h2>
+            <div class="backlog-add">
+                <input type="text" id="newTaskInput" placeholder="Новая задача..." autofocus>
+                <button id="addBacklogBtn">+</button>
+            </div>
+            <div id="backlogList"></div>
+            <div class="backlog-hint">⬅️ Нажмите → чтобы распределить</div>
         </div>
-        <div id="backlogList"></div>
-        <div class="backlog-hint">⬅️ Нажмите → чтобы распределить</div>
+
+        <!-- Блок "Жду ответа" в левой колонке -->
+        <div class="waiting-block" id="block-waiting">
+            <div class="block-header">
+                ⏳ Жду ответа
+                <span class="count" id="count-waiting">0</span>
+            </div>
+            <div id="tasks-waiting"></div>
+            <button class="add-task-btn" data-category="waiting" title="Добавить задачу">+</button>
+        </div>
     </div>
 
     <!-- Центр -->
@@ -1436,13 +1518,8 @@ MAIN_PAGE = '''
             <div class="empty-block" id="focusEmpty">Нет задач в фокусе</div>
         </div>
 
-        <!-- Блоки в столбик -->
-        <div class="blocks-column" id="blocksColumn">
-            <div class="block block-waiting" id="block-waiting">
-                <div class="block-header">⏳ Жду ответа <span class="count" id="count-waiting">0</span></div>
-                <div id="tasks-waiting"></div>
-                <button class="add-task-btn" data-category="waiting">+</button>
-            </div>
+        <!-- Блоки 2+2 -->
+        <div class="block-grid" id="blockGrid">
             <div class="block block-urgent" id="block-urgent">
                 <div class="block-header">⚡ До 15 минут <span class="count" id="count-urgent">0</span></div>
                 <div id="tasks-urgent"></div>
@@ -1602,7 +1679,6 @@ MAIN_PAGE = '''
     let moveTaskId = null;
     let currentViewDate = '{{ view_date }}';
     
-    // --- Drag and Drop ---
     let draggedTaskId = null;
     let dragSourceBlock = null;
     
@@ -1619,7 +1695,6 @@ MAIN_PAGE = '''
             card.addEventListener('dragenter', handleDragEnter);
             card.addEventListener('dragleave', handleDragLeave);
             card.addEventListener('drop', handleDrop);
-            // Для мобильных устройств — touch события
             card.addEventListener('touchstart', handleTouchStart, { passive: true });
             card.addEventListener('touchmove', handleTouchMove, { passive: false });
             card.addEventListener('touchend', handleTouchEnd, { passive: true });
@@ -1628,7 +1703,7 @@ MAIN_PAGE = '''
     
     function handleDragStart(e) {
         draggedTaskId = this.dataset.taskId;
-        dragSourceBlock = this.closest('.block');
+        dragSourceBlock = this.closest('.block, .waiting-block');
         this.classList.add('dragging');
         e.dataTransfer.effectAllowed = 'move';
         e.dataTransfer.setData('text/plain', this.dataset.taskId);
@@ -1657,22 +1732,20 @@ MAIN_PAGE = '''
         e.preventDefault();
         this.classList.remove('drag-over');
         const targetCard = this;
-        const targetBlock = this.closest('.block');
+        const targetBlock = this.closest('.block, .waiting-block');
         const sourceBlock = dragSourceBlock;
         
         if (!targetBlock || !sourceBlock || targetBlock === sourceBlock) {
-            // Если перетаскиваем внутри одного блока
             if (sourceBlock && draggedTaskId) {
                 reorderTasks(sourceBlock, draggedTaskId, targetCard);
             }
             return;
         }
-        // Если перетаскиваем между блоками — не разрешаем
-        return;
     }
     
     function reorderTasks(block, taskId, targetElement) {
         const container = block.querySelector('[id^="tasks-"]');
+        if (!container) return;
         const cards = container.querySelectorAll('.task-card');
         let targetIndex = -1;
         let currentIndex = -1;
@@ -1690,19 +1763,18 @@ MAIN_PAGE = '''
             return;
         }
         
-        // Перемещаем DOM элемент
         if (currentIndex < targetIndex) {
             targetElement.parentNode.insertBefore(cards[currentIndex], targetElement.nextSibling);
         } else {
             targetElement.parentNode.insertBefore(cards[currentIndex], targetElement);
         }
         
-        // Обновляем позиции в БД
         updatePositions(block);
     }
     
     function updatePositions(block) {
         const container = block.querySelector('[id^="tasks-"]');
+        if (!container) return;
         const cards = container.querySelectorAll('.task-card');
         const category = block.id.replace('block-', '');
         
@@ -1715,14 +1787,12 @@ MAIN_PAGE = '''
             });
         });
         
-        // Обновляем счетчик в блоке
         const countEl = document.getElementById(`count-${category}`);
         if (countEl) {
             countEl.textContent = cards.length;
         }
     }
     
-    // Touch события для мобильных устройств
     let touchDragData = null;
     
     function handleTouchStart(e) {
@@ -1732,7 +1802,7 @@ MAIN_PAGE = '''
             card: this,
             startX: touch.clientX,
             startY: touch.clientY,
-            block: this.closest('.block')
+            block: this.closest('.block, .waiting-block')
         };
     }
     
@@ -1743,12 +1813,11 @@ MAIN_PAGE = '''
     
     function handleTouchEnd(e) {
         if (!touchDragData) return;
-        // Простое перетаскивание — определяем, куда переместили
         const touch = e.changedTouches[0];
         const element = document.elementFromPoint(touch.clientX, touch.clientY);
         if (element) {
             const targetCard = element.closest('.task-card');
-            const targetBlock = element.closest('.block');
+            const targetBlock = element.closest('.block, .waiting-block');
             if (targetCard && targetCard !== touchDragData.card) {
                 const sourceBlock = touchDragData.block;
                 if (sourceBlock && targetBlock && sourceBlock === targetBlock) {
@@ -1805,6 +1874,14 @@ MAIN_PAGE = '''
                     blockEl.classList.add('done');
                 } else {
                     blockEl.classList.remove('done');
+                }
+            }
+            
+            // Для блока "Фокус" скрываем надпись, если есть задачи
+            if (cat === 'focus') {
+                const emptyEl = document.getElementById('focusEmpty');
+                if (emptyEl) {
+                    emptyEl.style.display = tasks.length === 0 ? 'block' : 'none';
                 }
             }
         }
@@ -2318,7 +2395,6 @@ QUARTER_PAGE = '''
             padding: 16px;
             min-height: 100vh;
             color: #4a3f5e;
-            -webkit-tap-highlight-color: transparent;
         }
         .container { max-width: 900px; margin: 0 auto; }
         .header {
@@ -2343,7 +2419,6 @@ QUARTER_PAGE = '''
             border-radius: 8px;
             text-decoration: none;
             cursor: pointer;
-            touch-action: manipulation;
         }
         .header .btn-back:hover { background: #e0d5ec; }
         
@@ -2363,7 +2438,6 @@ QUARTER_PAGE = '''
             border: 1.5px solid #ede5f5;
             font-size: 14px;
             transition: 0.2s;
-            touch-action: manipulation;
         }
         .quarter-nav .q-link:hover { border-color: #8b7bb5; background: #f8f2fd; }
         .quarter-nav .q-link.current {
@@ -2393,7 +2467,6 @@ QUARTER_PAGE = '''
             min-width: 150px;
             background: white;
             color: #4a3f5e;
-            -webkit-appearance: none;
         }
         .add-sphere input:focus { outline: none; border-color: #8b7bb5; }
         .add-sphere button {
@@ -2404,7 +2477,6 @@ QUARTER_PAGE = '''
             padding: 10px 24px;
             cursor: pointer;
             font-size: 14px;
-            touch-action: manipulation;
         }
         .add-sphere button:hover { background: #7a69a4; }
         
@@ -2438,7 +2510,6 @@ QUARTER_PAGE = '''
             padding: 4px 8px;
             border-radius: 6px;
             transition: 0.2s;
-            touch-action: manipulation;
         }
         .sphere-header .sphere-actions button:hover { background: #ede5f5; color: #8b7bb5; }
         
@@ -2463,7 +2534,6 @@ QUARTER_PAGE = '''
             font-size: 14px;
             padding: 4px 6px;
             border-radius: 6px;
-            touch-action: manipulation;
         }
         .task-item .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
         
@@ -2482,7 +2552,6 @@ QUARTER_PAGE = '''
             min-width: 120px;
             background: white;
             color: #4a3f5e;
-            -webkit-appearance: none;
         }
         .add-task-form input:focus { outline: none; border-color: #8b7bb5; }
         .add-task-form button {
@@ -2493,7 +2562,6 @@ QUARTER_PAGE = '''
             padding: 8px 16px;
             cursor: pointer;
             font-size: 13px;
-            touch-action: manipulation;
         }
         .add-task-form button:hover { background: #7a69a4; }
         
