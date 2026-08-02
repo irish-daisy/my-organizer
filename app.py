@@ -6,6 +6,7 @@ from psycopg2.extras import RealDictCursor
 import hashlib
 from datetime import datetime, timedelta
 import json
+import re
 
 app = Flask(__name__)
 app.secret_key = 'секретный_ключ_для_сессий_12345'
@@ -27,7 +28,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL
+            password TEXT NOT NULL,
+            email TEXT,
+            phone TEXT
         )
     ''')
     
@@ -49,7 +52,7 @@ def init_db():
             sphere_id INTEGER,
             completed_at TIMESTAMP,
             future BOOLEAN DEFAULT FALSE,
-            position INTEGER DEFAULT 0
+            comment TEXT
         )
     ''')
     
@@ -109,24 +112,20 @@ def get_quarter_year(quarter):
         return year - 1
     return year
 
-def move_overdue_tasks_to_backlog(user_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    today = datetime.now().date()
-    today_str = today.strftime('%Y-%m-%d')
-    
-    cur.execute('''
-        UPDATE tasks 
-        SET date = NULL, category = 'later'
-        WHERE user_id = %s AND status = 'active' AND quarter IS NULL 
-        AND date IS NOT NULL AND date::date < %s
-    ''', (user_id, today_str))
-    
-    conn.commit()
-    conn.close()
+def get_weekday_ru(date_str):
+    """Возвращает день недели на русском (пн, вт, ср...)"""
+    if not date_str:
+        return ''
+    try:
+        d = datetime.strptime(date_str, '%Y-%m-%d')
+        weekdays = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
+        return weekdays[d.weekday()]
+    except:
+        return ''
 
 def format_date_ru(date_str):
-    if not date_str:
+    """Форматирует дату в формате '3 августа'"""
+    if not date_str or date_str == '':
         return ''
     months = {
         '01': 'января', '02': 'февраля', '03': 'марта', '04': 'апреля',
@@ -140,6 +139,52 @@ def format_date_ru(date_str):
         return f"{day} {month}"
     return date_str
 
+def format_date_with_weekday(date_str):
+    """Форматирует дату в формате '3 августа, пн'"""
+    if not date_str or date_str == '':
+        return ''
+    weekday = get_weekday_ru(date_str)
+    date_formatted = format_date_ru(date_str)
+    if weekday:
+        return f"{date_formatted}, {weekday}"
+    return date_formatted
+
+def move_overdue_tasks_to_backlog(user_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    today = datetime.now().date()
+    today_str = today.strftime('%Y-%m-%d')
+    
+    cur.execute('''
+        UPDATE tasks 
+        SET date = NULL, category = 'later'
+        WHERE user_id = %s AND status = 'active' AND quarter IS NULL 
+        AND date IS NOT NULL AND date != '' AND date::date < %s
+    ''', (user_id, today_str))
+    
+    conn.commit()
+    conn.close()
+
+def move_tasks_to_next_day(user_id):
+    """Переносит все активные задачи на следующий день"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    today = datetime.now().date()
+    today_str = today.strftime('%Y-%m-%d')
+    tomorrow = today + timedelta(days=1)
+    tomorrow_str = tomorrow.strftime('%Y-%m-%d')
+    
+    # Все активные задачи без привязки к кварталам на сегодня
+    cur.execute('''
+        UPDATE tasks 
+        SET date = %s
+        WHERE user_id = %s AND status = 'active' AND quarter IS NULL 
+        AND date = %s
+    ''', (tomorrow_str, user_id, today_str))
+    
+    conn.commit()
+    conn.close()
+
 # --- ГЛАВНАЯ СТРАНИЦА ---
 @app.route('/')
 def index():
@@ -149,17 +194,19 @@ def index():
     user_id = session['user_id']
     
     move_overdue_tasks_to_backlog(user_id)
+    move_tasks_to_next_day(user_id)
     
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    view_date_str = request.args.get('date', datetime.now().strftime('%Y-%m-%d'))
-    view_date = datetime.strptime(view_date_str, '%Y-%m-%d').date()
+    view_date_str = datetime.now().strftime('%Y-%m-%d')
+    view_date = datetime.now().date()
     
     cur.execute('''
         SELECT * FROM tasks 
-        WHERE user_id = %s AND status = %s AND quarter IS NULL AND (date = %s OR date IS NULL)
-        ORDER BY position ASC, id ASC
+        WHERE user_id = %s AND status = %s AND quarter IS NULL 
+        AND (date = %s OR date IS NULL OR date = '')
+        ORDER BY id ASC
     ''', (user_id, 'active', view_date_str))
     tasks = cur.fetchall()
     conn.close()
@@ -186,12 +233,7 @@ def index():
     is_today = view_date == today
     is_tomorrow = view_date == today + timedelta(days=1)
     
-    if is_today:
-        date_label = view_date.strftime('%d %B')
-    elif is_tomorrow:
-        date_label = view_date.strftime('%d %B')
-    else:
-        date_label = view_date.strftime('%d %B %Y')
+    date_label = format_date_with_weekday(view_date.strftime('%Y-%m-%d'))
     
     return render_template_string(MAIN_PAGE, 
                                    categories=categories,
@@ -203,24 +245,8 @@ def index():
                                    is_today=is_today,
                                    is_tomorrow=is_tomorrow,
                                    prev_date=(view_date - timedelta(days=1)).strftime('%Y-%m-%d'),
-                                   next_date=(view_date + timedelta(days=1)).strftime('%Y-%m-%d'))
-
-# --- API: Обновить позицию задачи ---
-@app.route('/api/task/<int:task_id>/position', methods=['PUT'])
-def update_task_position(task_id):
-    if 'user_id' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    data = request.json
-    position = data.get('position', 0)
-    
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('UPDATE tasks SET position = %s WHERE id = %s AND user_id = %s', (position, task_id, session['user_id']))
-    conn.commit()
-    conn.close()
-    
-    return jsonify({'success': True, 'message': 'Position updated'})
+                                   next_date=(view_date + timedelta(days=1)).strftime('%Y-%m-%d'),
+                                   format_date_with_weekday=format_date_with_weekday)
 
 # --- СТРАНИЦА "БУДУЩИЕ" ---
 @app.route('/future')
@@ -236,7 +262,7 @@ def future_page():
     cur.execute('''
         SELECT * FROM tasks 
         WHERE user_id = %s AND status = %s AND quarter IS NULL 
-        AND date IS NOT NULL AND date::date > %s
+        AND date IS NOT NULL AND date != '' AND date::date > %s
         ORDER BY date ASC
     ''', (user_id, 'active', today))
     tasks = cur.fetchall()
@@ -244,7 +270,7 @@ def future_page():
     
     tasks_by_date = {}
     for task in tasks:
-        if task['date']:
+        if task['date'] and task['date'] != '':
             date_key = task['date']
             if date_key not in tasks_by_date:
                 tasks_by_date[date_key] = []
@@ -255,7 +281,7 @@ def future_page():
     return render_template_string(FUTURE_PAGE, 
                                    tasks_by_date=tasks_by_date,
                                    sorted_dates=sorted_dates,
-                                   format_date_ru=format_date_ru,
+                                   format_date_with_weekday=format_date_with_weekday,
                                    username=session.get('username', 'Пользователь'))
 
 # --- СТРАНИЦА КВАРТАЛОВ (3 МЕСЯЦА) ---
@@ -365,7 +391,7 @@ def done_page():
     return render_template_string(DONE_PAGE, 
                                    tasks_by_date=tasks_by_date,
                                    sorted_dates=sorted_dates,
-                                   format_date_ru=format_date_ru,
+                                   format_date_with_weekday=format_date_with_weekday,
                                    username=session.get('username', 'Пользователь'))
 
 # --- API: Добавить задачу в "Позже" ---
@@ -572,6 +598,7 @@ def add_direct_task():
     duration = data.get('duration', '')
     repeat_type = data.get('repeat_type', 'none')
     repeat_day = data.get('repeat_day')
+    comment = data.get('comment', '')
     
     if not title:
         return jsonify({'error': 'Title is required'}), 400
@@ -579,9 +606,9 @@ def add_direct_task():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute('''
-        INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, category, date, duration, repeat_type, repeat_day, 'active'))
+        INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status, comment)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, category, date, duration, repeat_type, repeat_day, 'active', comment))
     conn.commit()
     conn.close()
     
@@ -623,6 +650,7 @@ def update_task(task_id):
     duration = data.get('duration', '')
     repeat_type = data.get('repeat_type', 'none')
     repeat_day = data.get('repeat_day')
+    comment = data.get('comment', '')
     
     if not title:
         return jsonify({'error': 'Title is required'}), 400
@@ -631,9 +659,9 @@ def update_task(task_id):
     cur = conn.cursor()
     cur.execute('''
         UPDATE tasks SET 
-            title = %s, category = %s, date = %s, duration = %s, repeat_type = %s, repeat_day = %s
+            title = %s, category = %s, date = %s, duration = %s, repeat_type = %s, repeat_day = %s, comment = %s
         WHERE id = %s AND user_id = %s
-    ''', (title, category, date, duration, repeat_type, repeat_day, task_id, session['user_id']))
+    ''', (title, category, date, duration, repeat_type, repeat_day, comment, task_id, session['user_id']))
     conn.commit()
     conn.close()
     
@@ -689,7 +717,7 @@ def done_task(task_id):
     cur.execute('UPDATE tasks SET status = %s, completed_at = %s WHERE id = %s', ('done', datetime.now(), task_id))
     
     if task['repeat_type'] == 'daily':
-        if task['date']:
+        if task['date'] and task['date'] != '':
             try:
                 current_date = datetime.strptime(task['date'], '%Y-%m-%d').date()
                 new_date = current_date + timedelta(days=1)
@@ -699,11 +727,11 @@ def done_task(task_id):
             new_date = datetime.now().date() + timedelta(days=1)
         
         cur.execute('''
-            INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status, quarter, sphere, later_group, sphere_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (task['user_id'], task['title'], task['category'], new_date.strftime('%Y-%m-%d'), task.get('duration', ''), task['repeat_type'], task['repeat_day'], 'active', task.get('quarter'), task.get('sphere'), task.get('later_group'), task.get('sphere_id')))
+            INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status, quarter, sphere, later_group, sphere_id, comment)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ''', (task['user_id'], task['title'], task['category'], new_date.strftime('%Y-%m-%d'), task.get('duration', ''), task['repeat_type'], task['repeat_day'], 'active', task.get('quarter'), task.get('sphere'), task.get('later_group'), task.get('sphere_id'), task.get('comment', '')))
     elif task['repeat_type'] == 'weekly' and task['repeat_day'] is not None:
-        if task['date']:
+        if task['date'] and task['date'] != '':
             try:
                 current_date = datetime.strptime(task['date'], '%Y-%m-%d').date()
             except:
@@ -717,9 +745,9 @@ def done_task(task_id):
         new_date = current_date + timedelta(days=days_ahead)
         
         cur.execute('''
-            INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status, quarter, sphere, later_group, sphere_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (task['user_id'], task['title'], task['category'], new_date.strftime('%Y-%m-%d'), task.get('duration', ''), task['repeat_type'], task['repeat_day'], 'active', task.get('quarter'), task.get('sphere'), task.get('later_group'), task.get('sphere_id')))
+            INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status, quarter, sphere, later_group, sphere_id, comment)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ''', (task['user_id'], task['title'], task['category'], new_date.strftime('%Y-%m-%d'), task.get('duration', ''), task['repeat_type'], task['repeat_day'], 'active', task.get('quarter'), task.get('sphere'), task.get('later_group'), task.get('sphere_id'), task.get('comment', '')))
     
     conn.commit()
     conn.close()
@@ -792,8 +820,9 @@ def get_tasks():
     today = datetime.now().strftime('%Y-%m-%d')
     cur.execute('''
         SELECT * FROM tasks 
-        WHERE user_id = %s AND status = %s AND quarter IS NULL AND (date = %s OR date IS NULL)
-        ORDER BY position ASC, id ASC
+        WHERE user_id = %s AND status = %s AND quarter IS NULL 
+        AND (date = %s OR date IS NULL OR date = '')
+        ORDER BY id ASC
     ''', (session['user_id'], 'active', today))
     tasks = cur.fetchall()
     conn.close()
@@ -814,8 +843,9 @@ def get_tasks_by_date(date_str):
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute('''
         SELECT * FROM tasks 
-        WHERE user_id = %s AND status = %s AND quarter IS NULL AND (date = %s OR date IS NULL)
-        ORDER BY position ASC, id ASC
+        WHERE user_id = %s AND status = %s AND quarter IS NULL 
+        AND (date = %s OR date IS NULL OR date = '')
+        ORDER BY id ASC
     ''', (session['user_id'], 'active', date_str))
     tasks = cur.fetchall()
     conn.close()
@@ -832,14 +862,17 @@ def register():
     if request.method == 'POST':
         username = request.form['username'].strip()
         password = hashlib.md5(request.form['password'].encode()).hexdigest()
+        email = request.form.get('email', '').strip()
+        phone = request.form.get('phone', '').strip()
         
         if not username or not password:
-            return render_template_string(REGISTER_PAGE, error='Заполните все поля')
+            return render_template_string(REGISTER_PAGE, error='Заполните все обязательные поля')
         
         conn = get_db_connection()
         cur = conn.cursor()
         try:
-            cur.execute('INSERT INTO users (username, password) VALUES (%s, %s)', (username, password))
+            cur.execute('INSERT INTO users (username, password, email, phone) VALUES (%s, %s, %s, %s)', 
+                       (username, password, email, phone))
             conn.commit()
             conn.close()
             return redirect('/login')
@@ -970,7 +1003,6 @@ MAIN_PAGE = '''
         .backlog-item .move-btn:hover { color: #8b7bb5; }
         .backlog-hint { font-size: 11px; color: #c5b8d8; margin-top: 8px; }
         
-        /* Блок "Жду ответа" в левой колонке */
         .waiting-block {
             background: white;
             border-radius: 12px;
@@ -1150,6 +1182,11 @@ MAIN_PAGE = '''
         .focus-block .empty-block { color: #c5b8d8; font-size: 13px; text-align: center; padding: 16px; }
         
         .block-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+        .block-row {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 14px;
@@ -1160,9 +1197,12 @@ MAIN_PAGE = '''
             padding: 14px 16px;
             box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
             min-height: 180px;
+            transition: opacity 0.3s, transform 0.3s;
+            order: 1;
         }
-        .block.done {
+        .block.empty {
             opacity: 0.6;
+            order: 999;
         }
         .block .block-header {
             font-size: 14px;
@@ -1199,9 +1239,9 @@ MAIN_PAGE = '''
             flex-wrap: wrap;
             gap: 6px;
             border-left: 4px solid #d5c8e6;
-            cursor: grab;
             transition: 0.2s;
             box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
+            cursor: grab;
             touch-action: none;
             user-select: none;
         }
@@ -1224,6 +1264,14 @@ MAIN_PAGE = '''
             background: #ede5f5; 
             padding: 1px 8px; 
             border-radius: 10px; 
+        }
+        .task-card .task-info .comment-badge {
+            font-size: 11px;
+            color: #8b7bb5;
+            background: #ede5f5;
+            padding: 1px 8px;
+            border-radius: 10px;
+            cursor: help;
         }
         .task-card .task-actions {
             display: flex;
@@ -1367,7 +1415,7 @@ MAIN_PAGE = '''
             background: #fcfaff;
             border-radius: 18px;
             padding: 24px 28px;
-            max-width: 420px;
+            max-width: 460px;
             width: 90%;
             box-shadow: 0 20px 60px rgba(74, 63, 94, 0.15);
             max-height: 90vh;
@@ -1376,7 +1424,7 @@ MAIN_PAGE = '''
         .modal h3 { font-size: 18px; margin-bottom: 4px; color: #4a3f5e; }
         .modal .sub { font-size: 13px; color: #8b7bb5; margin-bottom: 16px; }
         .modal label { font-size: 12px; font-weight: 600; color: #4a3f5e; display: block; margin-top: 12px; margin-bottom: 4px; }
-        .modal input, .modal select {
+        .modal input, .modal select, .modal textarea {
             width: 100%;
             padding: 8px 12px;
             border: 1.5px solid #ede5f5;
@@ -1385,8 +1433,10 @@ MAIN_PAGE = '''
             background: white;
             color: #4a3f5e;
             -webkit-appearance: none;
+            font-family: inherit;
         }
-        .modal input:focus, .modal select:focus { outline: none; border-color: #8b7bb5; }
+        .modal textarea { resize: vertical; min-height: 60px; }
+        .modal input:focus, .modal select:focus, .modal textarea:focus { outline: none; border-color: #8b7bb5; }
         .modal .checkbox-group {
             display: flex;
             align-items: center;
@@ -1403,8 +1453,8 @@ MAIN_PAGE = '''
             border-radius: 8px;
         }
         .modal .repeat-options.visible { display: block; }
-        .modal .modal-actions { display: flex; gap: 10px; margin-top: 18px; }
-        .modal .modal-actions button { flex: 1; padding: 10px; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; touch-action: manipulation; }
+        .modal .modal-actions { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+        .modal .modal-actions button { flex: 1; padding: 10px; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; touch-action: manipulation; min-width: 80px; }
         .modal .btn-save { background: #8b7bb5; color: white; }
         .modal .btn-save:hover { background: #7a69a4; }
         .modal .btn-cancel { background: #ede5f5; color: #4a3f5e; }
@@ -1445,7 +1495,7 @@ MAIN_PAGE = '''
             .right-column .sidebar-card { flex: 1; min-width: 120px; }
             .center-column { flex: 1 1 100%; }
             .block { min-height: 140px; }
-            .block-grid { grid-template-columns: 1fr 1fr; }
+            .block-row { grid-template-columns: 1fr 1fr; }
             .date-nav .date-label { font-size: 14px; min-width: 100px; }
             .header { flex-direction: column; text-align: center; }
             .modal { padding: 18px 16px; }
@@ -1453,7 +1503,7 @@ MAIN_PAGE = '''
             .task-card .task-actions button { padding: 4px 4px; min-width: 28px; min-height: 28px; font-size: 13px; }
         }
         @media (max-width: 480px) {
-            .block-grid { grid-template-columns: 1fr; }
+            .block-row { grid-template-columns: 1fr; }
             .date-nav .date-label { font-size: 12px; min-width: 80px; }
             .date-nav .nav-btn { font-size: 16px; }
             .right-column .sidebar-card { min-width: 100px; }
@@ -1520,25 +1570,29 @@ MAIN_PAGE = '''
 
         <!-- Блоки 2+2 -->
         <div class="block-grid" id="blockGrid">
-            <div class="block block-urgent" id="block-urgent">
-                <div class="block-header">⚡ До 15 минут <span class="count" id="count-urgent">0</span></div>
-                <div id="tasks-urgent"></div>
-                <button class="add-task-btn" data-category="urgent">+</button>
+            <div class="block-row">
+                <div class="block block-urgent" id="block-urgent">
+                    <div class="block-header">⚡ До 15 минут <span class="count" id="count-urgent">0</span></div>
+                    <div id="tasks-urgent"></div>
+                    <button class="add-task-btn" data-category="urgent">+</button>
+                </div>
+                <div class="block block-work" id="block-work">
+                    <div class="block-header">💼 Работа <span class="count" id="count-work">0</span></div>
+                    <div id="tasks-work"></div>
+                    <button class="add-task-btn" data-category="work">+</button>
+                </div>
             </div>
-            <div class="block block-work" id="block-work">
-                <div class="block-header">💼 Работа <span class="count" id="count-work">0</span></div>
-                <div id="tasks-work"></div>
-                <button class="add-task-btn" data-category="work">+</button>
-            </div>
-            <div class="block block-home" id="block-home">
-                <div class="block-header">🏠 Дом <span class="count" id="count-home">0</span></div>
-                <div id="tasks-home"></div>
-                <button class="add-task-btn" data-category="home">+</button>
-            </div>
-            <div class="block block-personal" id="block-personal">
-                <div class="block-header">❤️ Личное <span class="count" id="count-personal">0</span></div>
-                <div id="tasks-personal"></div>
-                <button class="add-task-btn" data-category="personal">+</button>
+            <div class="block-row">
+                <div class="block block-home" id="block-home">
+                    <div class="block-header">🏠 Дом <span class="count" id="count-home">0</span></div>
+                    <div id="tasks-home"></div>
+                    <button class="add-task-btn" data-category="home">+</button>
+                </div>
+                <div class="block block-personal" id="block-personal">
+                    <div class="block-header">❤️ Личное <span class="count" id="count-personal">0</span></div>
+                    <div id="tasks-personal"></div>
+                    <button class="add-task-btn" data-category="personal">+</button>
+                </div>
             </div>
         </div>
     </div>
@@ -1566,6 +1620,8 @@ MAIN_PAGE = '''
         <input type="date" id="addTaskDate" value="{{ view_date }}">
         <label for="addTaskDuration">⏱️ Время выполнения</label>
         <input type="text" id="addTaskDuration" placeholder="1 ч">
+        <label for="addTaskComment">💬 Комментарий</label>
+        <textarea id="addTaskComment" placeholder="Дополнительная информация..."></textarea>
         <div class="checkbox-group">
             <input type="checkbox" id="addTaskRepeat">
             <label for="addTaskRepeat">🔄 Повторяющаяся задача</label>
@@ -1608,6 +1664,8 @@ MAIN_PAGE = '''
         <input type="date" id="viewTaskDate" style="margin-bottom:8px;">
         <label for="viewTaskDuration">⏱️ Время выполнения</label>
         <input type="text" id="viewTaskDuration" placeholder="1 ч" style="margin-bottom:8px;">
+        <label for="viewTaskComment">💬 Комментарий</label>
+        <textarea id="viewTaskComment" placeholder="Дополнительная информация..." style="margin-bottom:8px;"></textarea>
         <label for="viewTaskCategorySelect">📂 Категория</label>
         <select id="viewTaskCategorySelect" style="margin-bottom:8px;">
             <option value="focus">🎯 Фокус</option>
@@ -1678,17 +1736,27 @@ MAIN_PAGE = '''
     let currentViewTaskId = null;
     let moveTaskId = null;
     let currentViewDate = '{{ view_date }}';
-    
     let draggedTaskId = null;
     let dragSourceBlock = null;
     
     document.addEventListener('DOMContentLoaded', function() {
         initDragDrop();
+        updateEmptyBlocks();
     });
     
     function initDragDrop() {
         const taskCards = document.querySelectorAll('.task-card');
         taskCards.forEach(card => {
+            card.removeEventListener('dragstart', handleDragStart);
+            card.removeEventListener('dragend', handleDragEnd);
+            card.removeEventListener('dragover', handleDragOver);
+            card.removeEventListener('dragenter', handleDragEnter);
+            card.removeEventListener('dragleave', handleDragLeave);
+            card.removeEventListener('drop', handleDrop);
+            card.removeEventListener('touchstart', handleTouchStart);
+            card.removeEventListener('touchmove', handleTouchMove);
+            card.removeEventListener('touchend', handleTouchEnd);
+            
             card.addEventListener('dragstart', handleDragStart);
             card.addEventListener('dragend', handleDragEnd);
             card.addEventListener('dragover', handleDragOver);
@@ -1703,7 +1771,7 @@ MAIN_PAGE = '''
     
     function handleDragStart(e) {
         draggedTaskId = this.dataset.taskId;
-        dragSourceBlock = this.closest('.block, .waiting-block');
+        dragSourceBlock = this.closest('.block, .waiting-block, .focus-block');
         this.classList.add('dragging');
         e.dataTransfer.effectAllowed = 'move';
         e.dataTransfer.setData('text/plain', this.dataset.taskId);
@@ -1732,7 +1800,7 @@ MAIN_PAGE = '''
         e.preventDefault();
         this.classList.remove('drag-over');
         const targetCard = this;
-        const targetBlock = this.closest('.block, .waiting-block');
+        const targetBlock = this.closest('.block, .waiting-block, .focus-block');
         const sourceBlock = dragSourceBlock;
         
         if (!targetBlock || !sourceBlock || targetBlock === sourceBlock) {
@@ -1776,21 +1844,42 @@ MAIN_PAGE = '''
         const container = block.querySelector('[id^="tasks-"]');
         if (!container) return;
         const cards = container.querySelectorAll('.task-card');
-        const category = block.id.replace('block-', '');
+        let category = '';
+        
+        // Определяем категорию
+        if (block.id === 'focusBlock') {
+            category = 'focus';
+        } else {
+            const match = block.id.match(/block-(\w+)/);
+            if (match) category = match[1];
+        }
         
         cards.forEach((card, index) => {
-            const taskId = card.dataset.taskId;
-            fetch(`/api/task/${taskId}/position`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ position: index })
-            });
+            // Обновляем позицию через API (если есть)
+            // Пока просто обновляем счетчик
         });
         
         const countEl = document.getElementById(`count-${category}`);
         if (countEl) {
             countEl.textContent = cards.length;
         }
+        
+        updateEmptyBlocks();
+    }
+    
+    function updateEmptyBlocks() {
+        const blocks = document.querySelectorAll('.block');
+        blocks.forEach(block => {
+            const container = block.querySelector('[id^="tasks-"]');
+            if (container) {
+                const tasks = container.querySelectorAll('.task-card');
+                if (tasks.length === 0) {
+                    block.classList.add('empty');
+                } else {
+                    block.classList.remove('empty');
+                }
+            }
+        });
     }
     
     let touchDragData = null;
@@ -1802,7 +1891,7 @@ MAIN_PAGE = '''
             card: this,
             startX: touch.clientX,
             startY: touch.clientY,
-            block: this.closest('.block, .waiting-block')
+            block: this.closest('.block, .waiting-block, .focus-block')
         };
     }
     
@@ -1817,7 +1906,7 @@ MAIN_PAGE = '''
         const element = document.elementFromPoint(touch.clientX, touch.clientY);
         if (element) {
             const targetCard = element.closest('.task-card');
-            const targetBlock = element.closest('.block, .waiting-block');
+            const targetBlock = element.closest('.block, .waiting-block, .focus-block');
             if (targetCard && targetCard !== touchDragData.card) {
                 const sourceBlock = touchDragData.block;
                 if (sourceBlock && targetBlock && sourceBlock === targetBlock) {
@@ -1838,6 +1927,7 @@ MAIN_PAGE = '''
                 });
                 renderTasks(categories);
                 initDragDrop();
+                updateEmptyBlocks();
             });
     }
     
@@ -1869,15 +1959,6 @@ MAIN_PAGE = '''
                 countEl.textContent = tasks.length;
             }
             
-            if (blockEl) {
-                if (tasks.length === 0) {
-                    blockEl.classList.add('done');
-                } else {
-                    blockEl.classList.remove('done');
-                }
-            }
-            
-            // Для блока "Фокус" скрываем надпись, если есть задачи
             if (cat === 'focus') {
                 const emptyEl = document.getElementById('focusEmpty');
                 if (emptyEl) {
@@ -1885,6 +1966,7 @@ MAIN_PAGE = '''
                 }
             }
         }
+        updateEmptyBlocks();
     }
     
     function createTaskCard(task, category) {
@@ -1898,10 +1980,16 @@ MAIN_PAGE = '''
             durationHtml = `<span class="task-duration">⏱️ ${task.duration}</span>`;
         }
         
+        let commentHtml = '';
+        if (task.comment && task.comment.trim() !== '') {
+            commentHtml = `<span class="comment-badge" title="${task.comment.replace(/"/g, '&quot;')}">💬</span>`;
+        }
+        
         div.innerHTML = `
             <div class="task-info" data-task-id="${task.id}">
                 <span>${task.title}</span>
                 ${durationHtml}
+                ${commentHtml}
             </div>
             <div class="task-actions">
                 <span class="drag-handle" title="Перетащить">⠿</span>
@@ -1949,6 +2037,7 @@ MAIN_PAGE = '''
                 document.getElementById('viewTaskTitleInput').value = task.title || '';
                 document.getElementById('viewTaskDate').value = task.date || '';
                 document.getElementById('viewTaskDuration').value = task.duration || '';
+                document.getElementById('viewTaskComment').value = task.comment || '';
                 document.getElementById('viewTaskCategorySelect').value = task.category || 'later';
                 
                 const isRepeating = task.repeat_type && task.repeat_type !== 'none';
@@ -1981,6 +2070,7 @@ MAIN_PAGE = '''
         const title = document.getElementById('viewTaskTitleInput').value.trim();
         const date = document.getElementById('viewTaskDate').value;
         const duration = document.getElementById('viewTaskDuration').value.trim();
+        const comment = document.getElementById('viewTaskComment').value.trim();
         const category = document.getElementById('viewTaskCategorySelect').value;
         const isRepeating = document.getElementById('viewTaskRepeat').checked;
         let repeatType = 'none';
@@ -2002,6 +2092,7 @@ MAIN_PAGE = '''
                 title, 
                 date, 
                 duration, 
+                comment,
                 category, 
                 repeat_type: repeatType, 
                 repeat_day: repeatDay 
@@ -2056,6 +2147,7 @@ MAIN_PAGE = '''
             document.getElementById('addTaskTitle').value = '';
             document.getElementById('addTaskDate').value = currentViewDate;
             document.getElementById('addTaskDuration').value = '';
+            document.getElementById('addTaskComment').value = '';
             document.getElementById('addTaskRepeat').checked = false;
             document.getElementById('addRepeatOptions').classList.remove('visible');
             document.getElementById('addWeeklyDayGroup').style.display = 'none';
@@ -2086,6 +2178,7 @@ MAIN_PAGE = '''
         const title = document.getElementById('addTaskTitle').value.trim();
         const date = document.getElementById('addTaskDate').value;
         const duration = document.getElementById('addTaskDuration').value.trim();
+        const comment = document.getElementById('addTaskComment').value.trim();
         const isRepeating = document.getElementById('addTaskRepeat').checked;
         let repeatType = 'none';
         let repeatDay = null;
@@ -2102,7 +2195,7 @@ MAIN_PAGE = '''
         fetch('/api/task/direct', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title, category, date, duration, repeat_type: repeatType, repeat_day: repeatDay })
+            body: JSON.stringify({ title, category, date, duration, comment, repeat_type: repeatType, repeat_day: repeatDay })
         })
         .then(res => res.json())
         .then(() => {
@@ -2204,6 +2297,7 @@ MAIN_PAGE = '''
                 document.getElementById('moveModal').classList.remove('open');
                 loadTasks();
                 loadBacklog();
+                updateEmptyBlocks();
             });
         });
     });
@@ -2300,6 +2394,14 @@ FUTURE_PAGE = '''
             padding: 1px 8px;
             border-radius: 10px;
         }
+        .task-item .task-info .comment-badge {
+            font-size: 11px;
+            color: #8b7bb5;
+            background: #ede5f5;
+            padding: 1px 8px;
+            border-radius: 10px;
+            cursor: help;
+        }
         .task-item .task-actions button {
             background: none;
             border: none;
@@ -2334,13 +2436,16 @@ FUTURE_PAGE = '''
         {% if sorted_dates %}
             {% for date_key in sorted_dates %}
             <div class="date-group">
-                <div class="date-title">{{ format_date_ru(date_key) }}</div>
+                <div class="date-title">{{ format_date_with_weekday(date_key) }}</div>
                 {% for task in tasks_by_date[date_key] %}
                 <div class="task-item" data-task-id="{{ task.id }}">
                     <div class="task-info">
                         <span>{{ task.title }}</span>
                         {% if task.duration %}
                         <span class="task-duration">⏱️ {{ task.duration }}</span>
+                        {% endif %}
+                        {% if task.comment and task.comment != '' %}
+                        <span class="comment-badge" title="{{ task.comment }}">💬</span>
                         {% endif %}
                     </div>
                     <div class="task-actions">
@@ -2395,6 +2500,7 @@ QUARTER_PAGE = '''
             padding: 16px;
             min-height: 100vh;
             color: #4a3f5e;
+            -webkit-tap-highlight-color: transparent;
         }
         .container { max-width: 900px; margin: 0 auto; }
         .header {
@@ -2419,6 +2525,7 @@ QUARTER_PAGE = '''
             border-radius: 8px;
             text-decoration: none;
             cursor: pointer;
+            touch-action: manipulation;
         }
         .header .btn-back:hover { background: #e0d5ec; }
         
@@ -2438,6 +2545,7 @@ QUARTER_PAGE = '''
             border: 1.5px solid #ede5f5;
             font-size: 14px;
             transition: 0.2s;
+            touch-action: manipulation;
         }
         .quarter-nav .q-link:hover { border-color: #8b7bb5; background: #f8f2fd; }
         .quarter-nav .q-link.current {
@@ -2467,6 +2575,7 @@ QUARTER_PAGE = '''
             min-width: 150px;
             background: white;
             color: #4a3f5e;
+            -webkit-appearance: none;
         }
         .add-sphere input:focus { outline: none; border-color: #8b7bb5; }
         .add-sphere button {
@@ -2477,6 +2586,7 @@ QUARTER_PAGE = '''
             padding: 10px 24px;
             cursor: pointer;
             font-size: 14px;
+            touch-action: manipulation;
         }
         .add-sphere button:hover { background: #7a69a4; }
         
@@ -2510,6 +2620,7 @@ QUARTER_PAGE = '''
             padding: 4px 8px;
             border-radius: 6px;
             transition: 0.2s;
+            touch-action: manipulation;
         }
         .sphere-header .sphere-actions button:hover { background: #ede5f5; color: #8b7bb5; }
         
@@ -2526,6 +2637,14 @@ QUARTER_PAGE = '''
             box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
         }
         .task-item .task-info { display: flex; align-items: center; gap: 10px; }
+        .task-item .task-info .comment-badge {
+            font-size: 11px;
+            color: #8b7bb5;
+            background: #ede5f5;
+            padding: 1px 8px;
+            border-radius: 10px;
+            cursor: help;
+        }
         .task-item .task-actions button {
             background: none;
             border: none;
@@ -2534,6 +2653,7 @@ QUARTER_PAGE = '''
             font-size: 14px;
             padding: 4px 6px;
             border-radius: 6px;
+            touch-action: manipulation;
         }
         .task-item .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
         
@@ -2552,6 +2672,7 @@ QUARTER_PAGE = '''
             min-width: 120px;
             background: white;
             color: #4a3f5e;
+            -webkit-appearance: none;
         }
         .add-task-form input:focus { outline: none; border-color: #8b7bb5; }
         .add-task-form button {
@@ -2562,6 +2683,7 @@ QUARTER_PAGE = '''
             padding: 8px 16px;
             cursor: pointer;
             font-size: 13px;
+            touch-action: manipulation;
         }
         .add-task-form button:hover { background: #7a69a4; }
         
@@ -2620,6 +2742,9 @@ QUARTER_PAGE = '''
                         <span>{{ task.title }}</span>
                         {% if task.duration %}
                         <span style="font-size:11px; color:#b5a7cc; background:#ede5f5; padding:1px 8px; border-radius:10px;">⏱️ {{ task.duration }}</span>
+                        {% endif %}
+                        {% if task.comment and task.comment != '' %}
+                        <span class="comment-badge" title="{{ task.comment }}">💬</span>
                         {% endif %}
                     </div>
                     <div class="task-actions">
@@ -2882,6 +3007,14 @@ LATER_PAGE = '''
             padding: 1px 8px;
             border-radius: 10px;
         }
+        .task-item .task-info .comment-badge {
+            font-size: 11px;
+            color: #8b7bb5;
+            background: #ede5f5;
+            padding: 1px 8px;
+            border-radius: 10px;
+            cursor: help;
+        }
         .task-item .task-actions button {
             background: none;
             border: none;
@@ -3058,6 +3191,9 @@ LATER_PAGE = '''
                         {% if task.duration %}
                         <span class="task-duration">⏱️ {{ task.duration }}</span>
                         {% endif %}
+                        {% if task.comment and task.comment != '' %}
+                        <span class="comment-badge" title="{{ task.comment }}">💬</span>
+                        {% endif %}
                     </div>
                     <div class="task-actions">
                         <button class="move-to-group-btn" data-task-id="{{ task.id }}" title="Переместить в группу">📂</button>
@@ -3089,6 +3225,9 @@ LATER_PAGE = '''
                         <span>{{ task.title }}</span>
                         {% if task.duration %}
                         <span class="task-duration">⏱️ {{ task.duration }}</span>
+                        {% endif %}
+                        {% if task.comment and task.comment != '' %}
+                        <span class="comment-badge" title="{{ task.comment }}">💬</span>
                         {% endif %}
                         <div class="task-actions">
                             <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
@@ -3298,6 +3437,14 @@ DONE_PAGE = '''
             font-size: 12px;
             color: #b5a7cc;
         }
+        .task-item .task-info .comment-badge {
+            font-size: 11px;
+            color: #8b7bb5;
+            background: #ede5f5;
+            padding: 1px 8px;
+            border-radius: 10px;
+            cursor: help;
+        }
         .task-item .task-actions button {
             background: none;
             border: none;
@@ -3343,11 +3490,14 @@ DONE_PAGE = '''
         {% if sorted_dates %}
             {% for date_key in sorted_dates %}
             <div class="date-group">
-                <div class="date-title">{{ format_date_ru(date_key) }}</div>
+                <div class="date-title">{{ format_date_with_weekday(date_key) }}</div>
                 {% for task in tasks_by_date[date_key] %}
                 <div class="task-item" data-task-id="{{ task.id }}">
                     <div class="task-info">
                         <span>{{ task.title }}</span>
+                        {% if task.comment and task.comment != '' %}
+                        <span class="comment-badge" title="{{ task.comment }}">💬</span>
+                        {% endif %}
                         <span class="completed-time">✅ {{ task.completed_at }}</span>
                     </div>
                     <div class="task-actions">
@@ -3449,7 +3599,7 @@ REGISTER_PAGE = '''
     <title>Регистрация</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f6f2fd; margin: 0; color: #4a3f5e; }
-        .card { background: #fcfaff; padding: 40px; border-radius: 16px; box-shadow: 0 4px 30px rgba(139, 123, 181, 0.10); width: 100%; max-width: 360px; }
+        .card { background: #fcfaff; padding: 40px; border-radius: 16px; box-shadow: 0 4px 30px rgba(139, 123, 181, 0.10); width: 100%; max-width: 400px; }
         h2 { margin-bottom: 20px; color: #4a3f5e; }
         input { width: 100%; padding: 10px 14px; margin: 8px 0; border: 1.5px solid #ede5f5; border-radius: 8px; font-size: 14px; box-sizing: border-box; background: white; color: #4a3f5e; -webkit-appearance: none; }
         input:focus { outline: none; border-color: #8b7bb5; }
@@ -3459,6 +3609,7 @@ REGISTER_PAGE = '''
         .link { text-align: center; margin-top: 16px; font-size: 14px; color: #b5a7cc; }
         .link a { color: #8b7bb5; text-decoration: none; }
         .link a:hover { text-decoration: underline; }
+        .optional { font-size: 12px; color: #b5a7cc; font-weight: 400; }
     </style>
 </head>
 <body>
@@ -3470,6 +3621,8 @@ REGISTER_PAGE = '''
         <form method="POST">
             <input type="text" name="username" placeholder="Логин" required>
             <input type="password" name="password" placeholder="Пароль" required>
+            <input type="email" name="email" placeholder="Email (необязательно)">
+            <input type="text" name="phone" placeholder="Телефон (необязательно)">
             <button type="submit">Зарегистрироваться</button>
         </form>
         <div class="link">Уже есть аккаунт? <a href="/login">Войти</a></div>
