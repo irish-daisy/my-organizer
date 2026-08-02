@@ -48,7 +48,8 @@ def init_db():
             later_group TEXT,
             sphere_id INTEGER,
             completed_at TIMESTAMP,
-            future BOOLEAN DEFAULT FALSE
+            future BOOLEAN DEFAULT FALSE,
+            position INTEGER DEFAULT 0
         )
     ''')
     
@@ -125,7 +126,6 @@ def move_overdue_tasks_to_backlog(user_id):
     conn.close()
 
 def format_date_ru(date_str):
-    """Форматирует дату в формате '31 июля'"""
     if not date_str:
         return ''
     months = {
@@ -159,7 +159,7 @@ def index():
     cur.execute('''
         SELECT * FROM tasks 
         WHERE user_id = %s AND status = %s AND quarter IS NULL AND (date = %s OR date IS NULL)
-        ORDER BY id ASC
+        ORDER BY position ASC, id ASC
     ''', (user_id, 'active', view_date_str))
     tasks = cur.fetchall()
     conn.close()
@@ -187,9 +187,9 @@ def index():
     is_tomorrow = view_date == today + timedelta(days=1)
     
     if is_today:
-        date_label = f"{view_date.strftime('%d %B')} сегодня"
+        date_label = view_date.strftime('%d %B')
     elif is_tomorrow:
-        date_label = f"{view_date.strftime('%d %B')} завтра"
+        date_label = view_date.strftime('%d %B')
     else:
         date_label = view_date.strftime('%d %B %Y')
     
@@ -204,6 +204,23 @@ def index():
                                    is_tomorrow=is_tomorrow,
                                    prev_date=(view_date - timedelta(days=1)).strftime('%Y-%m-%d'),
                                    next_date=(view_date + timedelta(days=1)).strftime('%Y-%m-%d'))
+
+# --- API: Обновить позицию задачи ---
+@app.route('/api/task/<int:task_id>/position', methods=['PUT'])
+def update_task_position(task_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.json
+    position = data.get('position', 0)
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('UPDATE tasks SET position = %s WHERE id = %s AND user_id = %s', (position, task_id, session['user_id']))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': 'Position updated'})
 
 # --- СТРАНИЦА "БУДУЩИЕ" ---
 @app.route('/future')
@@ -225,7 +242,6 @@ def future_page():
     tasks = cur.fetchall()
     conn.close()
     
-    # Группировка по датам
     tasks_by_date = {}
     for task in tasks:
         if task['date']:
@@ -777,7 +793,7 @@ def get_tasks():
     cur.execute('''
         SELECT * FROM tasks 
         WHERE user_id = %s AND status = %s AND quarter IS NULL AND (date = %s OR date IS NULL)
-        ORDER BY id ASC
+        ORDER BY position ASC, id ASC
     ''', (session['user_id'], 'active', today))
     tasks = cur.fetchall()
     conn.close()
@@ -799,7 +815,7 @@ def get_tasks_by_date(date_str):
     cur.execute('''
         SELECT * FROM tasks 
         WHERE user_id = %s AND status = %s AND quarter IS NULL AND (date = %s OR date IS NULL)
-        ORDER BY id ASC
+        ORDER BY position ASC, id ASC
     ''', (session['user_id'], 'active', date_str))
     tasks = cur.fetchall()
     conn.close()
@@ -868,7 +884,7 @@ MAIN_PAGE = '''
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <title>Мой органайзер</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -878,6 +894,7 @@ MAIN_PAGE = '''
             padding: 16px;
             min-height: 100vh;
             color: #4a3f5e;
+            -webkit-tap-highlight-color: transparent;
         }
         .app-container {
             display: flex;
@@ -911,6 +928,7 @@ MAIN_PAGE = '''
             min-width: 100px;
             background: white;
             color: #4a3f5e;
+            -webkit-appearance: none;
         }
         .backlog-add input:focus { outline: none; border-color: #8b7bb5; }
         .backlog-add button {
@@ -920,6 +938,8 @@ MAIN_PAGE = '''
             border-radius: 8px;
             padding: 8px 14px;
             cursor: pointer;
+            font-size: 13px;
+            touch-action: manipulation;
         }
         .backlog-add button:hover { background: #7a69a4; }
         .backlog-item {
@@ -941,11 +961,15 @@ MAIN_PAGE = '''
             cursor: pointer;
             font-size: 16px;
             padding: 4px 8px;
+            touch-action: manipulation;
         }
         .backlog-item .move-btn:hover { color: #8b7bb5; }
         .backlog-hint { font-size: 11px; color: #c5b8d8; margin-top: 8px; }
         
-        .center-column { flex: 1; min-width: 280px; }
+        .center-column {
+            flex: 1;
+            min-width: 280px;
+        }
         .header {
             background: #fcfaff;
             border-radius: 12px;
@@ -967,6 +991,7 @@ MAIN_PAGE = '''
             padding: 6px 14px;
             border-radius: 8px;
             cursor: pointer;
+            touch-action: manipulation;
         }
         .header .btn-exit:hover { background: #c5b8d8; }
         
@@ -990,13 +1015,14 @@ MAIN_PAGE = '''
             padding: 4px 8px;
             border-radius: 8px;
             transition: 0.2s;
+            touch-action: manipulation;
         }
         .date-nav .nav-btn:hover { background: #ede5f5; }
         .date-nav .date-label {
             font-size: 16px;
             font-weight: 600;
             color: #4a3f5e;
-            min-width: 180px;
+            min-width: 140px;
             text-align: center;
         }
         .date-nav .date-label .today-badge {
@@ -1045,18 +1071,20 @@ MAIN_PAGE = '''
         }
         .focus-block .empty-block { color: #c5b8d8; font-size: 13px; text-align: center; padding: 16px; }
         
-        .block-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+        .blocks-column {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
         .block {
             background: #fcfaff;
             border-radius: 12px;
             padding: 14px 16px;
             box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
             min-height: 180px;
-            transition: opacity 0.3s, transform 0.3s;
         }
         .block.done {
             opacity: 0.6;
-            order: 999;
         }
         .block .block-header {
             font-size: 14px;
@@ -1094,9 +1122,22 @@ MAIN_PAGE = '''
             flex-wrap: wrap;
             gap: 6px;
             border-left: 4px solid #d5c8e6;
-            cursor: default;
+            cursor: grab;
             transition: 0.2s;
             box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
+            touch-action: none;
+            user-select: none;
+        }
+        .task-card:active {
+            cursor: grabbing;
+        }
+        .task-card.dragging {
+            opacity: 0.4;
+            transform: scale(0.98);
+        }
+        .task-card.drag-over {
+            border-left-color: #8b7bb5;
+            border-left-width: 6px;
         }
         .task-card:hover { background: #f5eefa; }
         .task-card .task-info { 
@@ -1106,6 +1147,7 @@ MAIN_PAGE = '''
             flex-wrap: wrap; 
             cursor: pointer;
             flex: 1;
+            touch-action: manipulation;
         }
         .task-card .task-info .task-duration { 
             font-size: 11px; 
@@ -1114,15 +1156,29 @@ MAIN_PAGE = '''
             padding: 1px 8px; 
             border-radius: 10px; 
         }
+        .task-card .task-actions {
+            display: flex;
+            gap: 4px;
+        }
         .task-card .task-actions button {
             background: none;
             border: none;
             color: #c5b8d8;
             cursor: pointer;
             font-size: 14px;
-            padding: 0 4px;
+            padding: 4px 6px;
+            border-radius: 6px;
+            touch-action: manipulation;
+            min-width: 32px;
+            min-height: 32px;
         }
-        .task-card .task-actions button:hover { color: #8b7bb5; }
+        .task-card .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
+        .task-card .task-actions .drag-handle {
+            color: #d5c8e6;
+            cursor: grab;
+            font-size: 16px;
+        }
+        .task-card .task-actions .drag-handle:hover { color: #8b7bb5; background: none; }
         .task-card.tag-focus { border-left-color: #8b7bb5; }
         .task-card.tag-urgent { border-left-color: #e67e22; }
         .task-card.tag-work { border-left-color: #3498db; }
@@ -1147,6 +1203,7 @@ MAIN_PAGE = '''
             margin: 6px auto 0;
             transition: 0.2s;
             line-height: 1;
+            touch-action: manipulation;
         }
         .add-task-btn:hover { 
             background: #8b7bb5; 
@@ -1175,6 +1232,7 @@ MAIN_PAGE = '''
             cursor: pointer;
             text-decoration: none;
             display: inline-block;
+            touch-action: manipulation;
         }
         .sidebar-card .big-btn:hover { background: #7a69a4; }
         .sidebar-card .big-btn-secondary {
@@ -1190,6 +1248,7 @@ MAIN_PAGE = '''
             text-decoration: none;
             display: inline-block;
             margin-top: 8px;
+            touch-action: manipulation;
         }
         .sidebar-card .big-btn-secondary:hover { background: #c5b8d8; }
         .sidebar-card .big-btn-done {
@@ -1205,6 +1264,7 @@ MAIN_PAGE = '''
             text-decoration: none;
             display: inline-block;
             margin-top: 8px;
+            touch-action: manipulation;
         }
         .sidebar-card .big-btn-done:hover { background: #2ecc71; }
         .sidebar-card .big-btn-future {
@@ -1220,6 +1280,7 @@ MAIN_PAGE = '''
             text-decoration: none;
             display: inline-block;
             margin-top: 8px;
+            touch-action: manipulation;
         }
         .sidebar-card .big-btn-future:hover { background: #7d3c98; }
         
@@ -1255,6 +1316,7 @@ MAIN_PAGE = '''
             font-size: 14px;
             background: white;
             color: #4a3f5e;
+            -webkit-appearance: none;
         }
         .modal input:focus, .modal select:focus { outline: none; border-color: #8b7bb5; }
         .modal .checkbox-group {
@@ -1274,7 +1336,7 @@ MAIN_PAGE = '''
         }
         .modal .repeat-options.visible { display: block; }
         .modal .modal-actions { display: flex; gap: 10px; margin-top: 18px; }
-        .modal .modal-actions button { flex: 1; padding: 10px; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; }
+        .modal .modal-actions button { flex: 1; padding: 10px; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; touch-action: manipulation; }
         .modal .btn-save { background: #8b7bb5; color: white; }
         .modal .btn-save:hover { background: #7a69a4; }
         .modal .btn-cancel { background: #ede5f5; color: #4a3f5e; }
@@ -1297,6 +1359,7 @@ MAIN_PAGE = '''
             font-size: 14px;
             transition: 0.2s;
             color: #4a3f5e;
+            touch-action: manipulation;
         }
         .move-options button:hover { border-color: #8b7bb5; background: #f8f2fd; }
         .move-options button .cat-icon { display: block; font-size: 20px; }
@@ -1306,17 +1369,25 @@ MAIN_PAGE = '''
         .task-detail .detail-row:last-child { border-bottom: none; }
         .task-detail .detail-label { color: #8b7bb5; }
         
-        @media (max-width: 1024px) {
-            .left-column { flex: 1 1 100%; }
-            .right-column { flex: 1 1 100%; flex-direction: row; }
-            .right-column .sidebar-card { flex: 1; }
-            .block-grid { grid-template-columns: 1fr 1fr; }
-        }
-        @media (max-width: 600px) {
-            .block-grid { grid-template-columns: 1fr; }
+        @media (max-width: 768px) {
+            body { padding: 10px; }
+            .app-container { flex-direction: column-reverse; }
+            .left-column { flex: 1 1 100%; order: 10; }
+            .right-column { flex: 1 1 100%; flex-direction: row; flex-wrap: wrap; }
+            .right-column .sidebar-card { flex: 1; min-width: 120px; }
+            .center-column { flex: 1 1 100%; }
+            .block { min-height: 140px; }
+            .date-nav .date-label { font-size: 14px; min-width: 100px; }
             .header { flex-direction: column; text-align: center; }
-            .date-nav { flex-wrap: wrap; }
-            .date-nav .date-label { min-width: auto; font-size: 14px; }
+            .modal { padding: 18px 16px; }
+            .task-card { padding: 8px 10px; }
+            .task-card .task-actions button { padding: 4px 4px; min-width: 28px; min-height: 28px; font-size: 13px; }
+        }
+        @media (max-width: 480px) {
+            .date-nav .date-label { font-size: 12px; min-width: 80px; }
+            .date-nav .nav-btn { font-size: 16px; }
+            .right-column .sidebar-card { min-width: 100px; }
+            .right-column .sidebar-card .big-btn { font-size: 13px; padding: 10px; }
         }
     </style>
 </head>
@@ -1365,8 +1436,13 @@ MAIN_PAGE = '''
             <div class="empty-block" id="focusEmpty">Нет задач в фокусе</div>
         </div>
 
-        <!-- Блоки (2+2) -->
-        <div class="block-grid" id="blockGrid">
+        <!-- Блоки в столбик -->
+        <div class="blocks-column" id="blocksColumn">
+            <div class="block block-waiting" id="block-waiting">
+                <div class="block-header">⏳ Жду ответа <span class="count" id="count-waiting">0</span></div>
+                <div id="tasks-waiting"></div>
+                <button class="add-task-btn" data-category="waiting">+</button>
+            </div>
             <div class="block block-urgent" id="block-urgent">
                 <div class="block-header">⚡ До 15 минут <span class="count" id="count-urgent">0</span></div>
                 <div id="tasks-urgent"></div>
@@ -1386,11 +1462,6 @@ MAIN_PAGE = '''
                 <div class="block-header">❤️ Личное <span class="count" id="count-personal">0</span></div>
                 <div id="tasks-personal"></div>
                 <button class="add-task-btn" data-category="personal">+</button>
-            </div>
-            <div class="block block-waiting" id="block-waiting">
-                <div class="block-header">⏳ Жду ответа <span class="count" id="count-waiting">0</span></div>
-                <div id="tasks-waiting"></div>
-                <button class="add-task-btn" data-category="waiting">+</button>
             </div>
         </div>
     </div>
@@ -1531,6 +1602,163 @@ MAIN_PAGE = '''
     let moveTaskId = null;
     let currentViewDate = '{{ view_date }}';
     
+    // --- Drag and Drop ---
+    let draggedTaskId = null;
+    let dragSourceBlock = null;
+    
+    document.addEventListener('DOMContentLoaded', function() {
+        initDragDrop();
+    });
+    
+    function initDragDrop() {
+        const taskCards = document.querySelectorAll('.task-card');
+        taskCards.forEach(card => {
+            card.addEventListener('dragstart', handleDragStart);
+            card.addEventListener('dragend', handleDragEnd);
+            card.addEventListener('dragover', handleDragOver);
+            card.addEventListener('dragenter', handleDragEnter);
+            card.addEventListener('dragleave', handleDragLeave);
+            card.addEventListener('drop', handleDrop);
+            // Для мобильных устройств — touch события
+            card.addEventListener('touchstart', handleTouchStart, { passive: true });
+            card.addEventListener('touchmove', handleTouchMove, { passive: false });
+            card.addEventListener('touchend', handleTouchEnd, { passive: true });
+        });
+    }
+    
+    function handleDragStart(e) {
+        draggedTaskId = this.dataset.taskId;
+        dragSourceBlock = this.closest('.block');
+        this.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', this.dataset.taskId);
+    }
+    
+    function handleDragEnd(e) {
+        this.classList.remove('dragging');
+        document.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+    }
+    
+    function handleDragOver(e) {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+    }
+    
+    function handleDragEnter(e) {
+        e.preventDefault();
+        this.classList.add('drag-over');
+    }
+    
+    function handleDragLeave(e) {
+        this.classList.remove('drag-over');
+    }
+    
+    function handleDrop(e) {
+        e.preventDefault();
+        this.classList.remove('drag-over');
+        const targetCard = this;
+        const targetBlock = this.closest('.block');
+        const sourceBlock = dragSourceBlock;
+        
+        if (!targetBlock || !sourceBlock || targetBlock === sourceBlock) {
+            // Если перетаскиваем внутри одного блока
+            if (sourceBlock && draggedTaskId) {
+                reorderTasks(sourceBlock, draggedTaskId, targetCard);
+            }
+            return;
+        }
+        // Если перетаскиваем между блоками — не разрешаем
+        return;
+    }
+    
+    function reorderTasks(block, taskId, targetElement) {
+        const container = block.querySelector('[id^="tasks-"]');
+        const cards = container.querySelectorAll('.task-card');
+        let targetIndex = -1;
+        let currentIndex = -1;
+        
+        cards.forEach((card, index) => {
+            if (card.dataset.taskId === taskId) {
+                currentIndex = index;
+            }
+            if (card === targetElement) {
+                targetIndex = index;
+            }
+        });
+        
+        if (currentIndex === -1 || targetIndex === -1 || currentIndex === targetIndex) {
+            return;
+        }
+        
+        // Перемещаем DOM элемент
+        if (currentIndex < targetIndex) {
+            targetElement.parentNode.insertBefore(cards[currentIndex], targetElement.nextSibling);
+        } else {
+            targetElement.parentNode.insertBefore(cards[currentIndex], targetElement);
+        }
+        
+        // Обновляем позиции в БД
+        updatePositions(block);
+    }
+    
+    function updatePositions(block) {
+        const container = block.querySelector('[id^="tasks-"]');
+        const cards = container.querySelectorAll('.task-card');
+        const category = block.id.replace('block-', '');
+        
+        cards.forEach((card, index) => {
+            const taskId = card.dataset.taskId;
+            fetch(`/api/task/${taskId}/position`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ position: index })
+            });
+        });
+        
+        // Обновляем счетчик в блоке
+        const countEl = document.getElementById(`count-${category}`);
+        if (countEl) {
+            countEl.textContent = cards.length;
+        }
+    }
+    
+    // Touch события для мобильных устройств
+    let touchDragData = null;
+    
+    function handleTouchStart(e) {
+        const touch = e.touches[0];
+        touchDragData = {
+            taskId: this.dataset.taskId,
+            card: this,
+            startX: touch.clientX,
+            startY: touch.clientY,
+            block: this.closest('.block')
+        };
+    }
+    
+    function handleTouchMove(e) {
+        if (!touchDragData) return;
+        e.preventDefault();
+    }
+    
+    function handleTouchEnd(e) {
+        if (!touchDragData) return;
+        // Простое перетаскивание — определяем, куда переместили
+        const touch = e.changedTouches[0];
+        const element = document.elementFromPoint(touch.clientX, touch.clientY);
+        if (element) {
+            const targetCard = element.closest('.task-card');
+            const targetBlock = element.closest('.block');
+            if (targetCard && targetCard !== touchDragData.card) {
+                const sourceBlock = touchDragData.block;
+                if (sourceBlock && targetBlock && sourceBlock === targetBlock) {
+                    reorderTasks(sourceBlock, touchDragData.taskId, targetCard);
+                }
+            }
+        }
+        touchDragData = null;
+    }
+    
     function loadTasks() {
         fetch(`/api/tasks/date/${currentViewDate}`)
             .then(res => res.json())
@@ -1540,6 +1768,7 @@ MAIN_PAGE = '''
                     if (categories[t.category]) categories[t.category].push(t);
                 });
                 renderTasks(categories);
+                initDragDrop();
             });
     }
     
@@ -1559,19 +1788,16 @@ MAIN_PAGE = '''
             const countEl = document.getElementById(data.count);
             const blockEl = document.getElementById(data.block);
             
+            if (!container) continue;
+            
             container.innerHTML = '';
             tasks.forEach(task => {
                 const card = createTaskCard(task, cat);
                 container.appendChild(card);
             });
             
-            countEl.textContent = tasks.length;
-            
-            if (cat === 'focus') {
-                const emptyEl = document.getElementById('focusEmpty');
-                if (emptyEl) {
-                    emptyEl.style.display = tasks.length === 0 ? 'block' : 'none';
-                }
+            if (countEl) {
+                countEl.textContent = tasks.length;
             }
             
             if (blockEl) {
@@ -1588,6 +1814,7 @@ MAIN_PAGE = '''
         const div = document.createElement('div');
         div.className = `task-card tag-${category}`;
         div.dataset.taskId = task.id;
+        div.draggable = true;
         
         let durationHtml = '';
         if (task.duration) {
@@ -1600,6 +1827,7 @@ MAIN_PAGE = '''
                 ${durationHtml}
             </div>
             <div class="task-actions">
+                <span class="drag-handle" title="Перетащить">⠿</span>
                 <button class="done-btn" title="Выполнено" data-task-id="${task.id}">✅</button>
                 <button class="move-to-focus-btn" title="В фокус" data-task-id="${task.id}" style="display:${task.category !== 'focus' ? 'inline' : 'none'}">⭐</button>
             </div>
@@ -1929,6 +2157,7 @@ FUTURE_PAGE = '''
             padding: 16px;
             min-height: 100vh;
             color: #4a3f5e;
+            -webkit-tap-highlight-color: transparent;
         }
         .container { max-width: 800px; margin: 0 auto; }
         .header {
@@ -1953,6 +2182,7 @@ FUTURE_PAGE = '''
             border-radius: 8px;
             text-decoration: none;
             cursor: pointer;
+            touch-action: manipulation;
         }
         .header .btn-back:hover { background: #e0d5ec; }
         
@@ -1999,9 +2229,11 @@ FUTURE_PAGE = '''
             color: #c5b8d8;
             cursor: pointer;
             font-size: 14px;
-            padding: 0 4px;
+            padding: 4px 6px;
+            border-radius: 6px;
+            touch-action: manipulation;
         }
-        .task-item .task-actions button:hover { color: #8b7bb5; }
+        .task-item .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
         
         .empty-list { color: #c5b8d8; text-align: center; padding: 30px; }
         
@@ -2086,6 +2318,7 @@ QUARTER_PAGE = '''
             padding: 16px;
             min-height: 100vh;
             color: #4a3f5e;
+            -webkit-tap-highlight-color: transparent;
         }
         .container { max-width: 900px; margin: 0 auto; }
         .header {
@@ -2110,6 +2343,7 @@ QUARTER_PAGE = '''
             border-radius: 8px;
             text-decoration: none;
             cursor: pointer;
+            touch-action: manipulation;
         }
         .header .btn-back:hover { background: #e0d5ec; }
         
@@ -2129,6 +2363,7 @@ QUARTER_PAGE = '''
             border: 1.5px solid #ede5f5;
             font-size: 14px;
             transition: 0.2s;
+            touch-action: manipulation;
         }
         .quarter-nav .q-link:hover { border-color: #8b7bb5; background: #f8f2fd; }
         .quarter-nav .q-link.current {
@@ -2158,6 +2393,7 @@ QUARTER_PAGE = '''
             min-width: 150px;
             background: white;
             color: #4a3f5e;
+            -webkit-appearance: none;
         }
         .add-sphere input:focus { outline: none; border-color: #8b7bb5; }
         .add-sphere button {
@@ -2168,6 +2404,7 @@ QUARTER_PAGE = '''
             padding: 10px 24px;
             cursor: pointer;
             font-size: 14px;
+            touch-action: manipulation;
         }
         .add-sphere button:hover { background: #7a69a4; }
         
@@ -2201,6 +2438,7 @@ QUARTER_PAGE = '''
             padding: 4px 8px;
             border-radius: 6px;
             transition: 0.2s;
+            touch-action: manipulation;
         }
         .sphere-header .sphere-actions button:hover { background: #ede5f5; color: #8b7bb5; }
         
@@ -2223,9 +2461,11 @@ QUARTER_PAGE = '''
             color: #c5b8d8;
             cursor: pointer;
             font-size: 14px;
-            padding: 0 4px;
+            padding: 4px 6px;
+            border-radius: 6px;
+            touch-action: manipulation;
         }
-        .task-item .task-actions button:hover { color: #8b7bb5; }
+        .task-item .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
         
         .add-task-form {
             display: flex;
@@ -2242,6 +2482,7 @@ QUARTER_PAGE = '''
             min-width: 120px;
             background: white;
             color: #4a3f5e;
+            -webkit-appearance: none;
         }
         .add-task-form input:focus { outline: none; border-color: #8b7bb5; }
         .add-task-form button {
@@ -2252,6 +2493,7 @@ QUARTER_PAGE = '''
             padding: 8px 16px;
             cursor: pointer;
             font-size: 13px;
+            touch-action: manipulation;
         }
         .add-task-form button:hover { background: #7a69a4; }
         
@@ -2463,6 +2705,7 @@ LATER_PAGE = '''
             padding: 16px;
             min-height: 100vh;
             color: #4a3f5e;
+            -webkit-tap-highlight-color: transparent;
         }
         .container { max-width: 1200px; margin: 0 auto; }
         .header {
@@ -2487,6 +2730,7 @@ LATER_PAGE = '''
             border-radius: 8px;
             text-decoration: none;
             cursor: pointer;
+            touch-action: manipulation;
         }
         .header .btn-back:hover { background: #e0d5ec; }
         
@@ -2525,6 +2769,7 @@ LATER_PAGE = '''
             min-width: 150px;
             background: white;
             color: #4a3f5e;
+            -webkit-appearance: none;
         }
         .add-task input:focus { outline: none; border-color: #8b7bb5; }
         .add-task button {
@@ -2535,6 +2780,7 @@ LATER_PAGE = '''
             padding: 10px 24px;
             cursor: pointer;
             font-size: 14px;
+            touch-action: manipulation;
         }
         .add-task button:hover { background: #7a69a4; }
         
@@ -2574,9 +2820,11 @@ LATER_PAGE = '''
             color: #c5b8d8;
             cursor: pointer;
             font-size: 14px;
-            padding: 0 4px;
+            padding: 4px 6px;
+            border-radius: 6px;
+            touch-action: manipulation;
         }
-        .task-item .task-actions button:hover { color: #8b7bb5; }
+        .task-item .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
         
         .empty-list { color: #c5b8d8; text-align: center; padding: 30px; }
         
@@ -2600,8 +2848,11 @@ LATER_PAGE = '''
             color: #c5b8d8;
             cursor: pointer;
             font-size: 14px;
+            padding: 4px 8px;
+            border-radius: 6px;
+            touch-action: manipulation;
         }
-        .group-header .delete-group:hover { color: #e74c3c; }
+        .group-header .delete-group:hover { background: #ede5f5; color: #e74c3c; }
         
         .add-group {
             background: #fcfaff;
@@ -2623,6 +2874,7 @@ LATER_PAGE = '''
             min-width: 150px;
             background: white;
             color: #4a3f5e;
+            -webkit-appearance: none;
         }
         .add-group input:focus { outline: none; border-color: #8b7bb5; }
         .add-group button {
@@ -2633,6 +2885,7 @@ LATER_PAGE = '''
             padding: 10px 24px;
             cursor: pointer;
             font-size: 14px;
+            touch-action: manipulation;
         }
         .add-group button:hover { background: #7a69a4; }
         
@@ -2655,9 +2908,11 @@ LATER_PAGE = '''
             color: #c5b8d8;
             cursor: pointer;
             font-size: 14px;
-            padding: 0 4px;
+            padding: 4px 6px;
+            border-radius: 6px;
+            touch-action: manipulation;
         }
-        .group-task-item .task-actions button:hover { color: #8b7bb5; }
+        .group-task-item .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
         
         .add-group-task {
             display: flex;
@@ -2674,6 +2929,7 @@ LATER_PAGE = '''
             background: white;
             color: #4a3f5e;
             min-width: 100px;
+            -webkit-appearance: none;
         }
         .add-group-task input:focus { outline: none; border-color: #8b7bb5; }
         .add-group-task button {
@@ -2684,6 +2940,7 @@ LATER_PAGE = '''
             padding: 6px 14px;
             cursor: pointer;
             font-size: 13px;
+            touch-action: manipulation;
         }
         .add-group-task button:hover { background: #7a69a4; }
         
@@ -2693,7 +2950,8 @@ LATER_PAGE = '''
             color: #b5a7cc;
             cursor: pointer;
             font-size: 16px;
-            padding: 0 6px;
+            padding: 4px 8px;
+            touch-action: manipulation;
         }
         .move-to-group-btn:hover { color: #8b7bb5; }
         
@@ -2910,6 +3168,7 @@ DONE_PAGE = '''
             padding: 16px;
             min-height: 100vh;
             color: #4a3f5e;
+            -webkit-tap-highlight-color: transparent;
         }
         .container { max-width: 800px; margin: 0 auto; }
         .header {
@@ -2934,6 +3193,7 @@ DONE_PAGE = '''
             border-radius: 8px;
             text-decoration: none;
             cursor: pointer;
+            touch-action: manipulation;
         }
         .header .btn-back:hover { background: #e0d5ec; }
         
@@ -2976,9 +3236,11 @@ DONE_PAGE = '''
             color: #c5b8d8;
             cursor: pointer;
             font-size: 14px;
-            padding: 0 4px;
+            padding: 4px 6px;
+            border-radius: 6px;
+            touch-action: manipulation;
         }
-        .task-item .task-actions button:hover { color: #8b7bb5; }
+        .task-item .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
         .task-item .task-actions .restore-btn:hover { color: #27ae60; }
         
         .empty-list { color: #c5b8d8; text-align: center; padding: 30px; }
@@ -3061,8 +3323,7 @@ DONE_PAGE = '''
                 sortedDates.forEach(dateKey => {
                     const dateGroup = document.createElement('div');
                     dateGroup.className = 'date-group';
-                    const formattedDate = dateKey.split('-').reverse().join('.');
-                    dateGroup.innerHTML = `<div class="date-title">${formattedDate}</div>`;
+                    dateGroup.innerHTML = `<div class="date-title">${dateKey}</div>`;
                     
                     tasksByDate[dateKey].forEach(task => {
                         const item = document.createElement('div');
@@ -3122,9 +3383,9 @@ REGISTER_PAGE = '''
         body { font-family: 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f6f2fd; margin: 0; color: #4a3f5e; }
         .card { background: #fcfaff; padding: 40px; border-radius: 16px; box-shadow: 0 4px 30px rgba(139, 123, 181, 0.10); width: 100%; max-width: 360px; }
         h2 { margin-bottom: 20px; color: #4a3f5e; }
-        input { width: 100%; padding: 10px 14px; margin: 8px 0; border: 1.5px solid #ede5f5; border-radius: 8px; font-size: 14px; box-sizing: border-box; background: white; color: #4a3f5e; }
+        input { width: 100%; padding: 10px 14px; margin: 8px 0; border: 1.5px solid #ede5f5; border-radius: 8px; font-size: 14px; box-sizing: border-box; background: white; color: #4a3f5e; -webkit-appearance: none; }
         input:focus { outline: none; border-color: #8b7bb5; }
-        button { width: 100%; padding: 12px; background: #8b7bb5; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 12px; }
+        button { width: 100%; padding: 12px; background: #8b7bb5; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 12px; touch-action: manipulation; }
         button:hover { background: #7a69a4; }
         .error { color: #d5a0a0; font-size: 14px; margin-bottom: 10px; }
         .link { text-align: center; margin-top: 16px; font-size: 14px; color: #b5a7cc; }
@@ -3160,9 +3421,9 @@ LOGIN_PAGE = '''
         body { font-family: 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f6f2fd; margin: 0; color: #4a3f5e; }
         .card { background: #fcfaff; padding: 40px; border-radius: 16px; box-shadow: 0 4px 30px rgba(139, 123, 181, 0.10); width: 100%; max-width: 360px; }
         h2 { margin-bottom: 20px; color: #4a3f5e; }
-        input { width: 100%; padding: 10px 14px; margin: 8px 0; border: 1.5px solid #ede5f5; border-radius: 8px; font-size: 14px; box-sizing: border-box; background: white; color: #4a3f5e; }
+        input { width: 100%; padding: 10px 14px; margin: 8px 0; border: 1.5px solid #ede5f5; border-radius: 8px; font-size: 14px; box-sizing: border-box; background: white; color: #4a3f5e; -webkit-appearance: none; }
         input:focus { outline: none; border-color: #8b7bb5; }
-        button { width: 100%; padding: 12px; background: #8b7bb5; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 12px; }
+        button { width: 100%; padding: 12px; background: #8b7bb5; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 12px; touch-action: manipulation; }
         button:hover { background: #7a69a4; }
         .error { color: #d5a0a0; font-size: 14px; margin-bottom: 10px; }
         .link { text-align: center; margin-top: 16px; font-size: 14px; color: #b5a7cc; }
