@@ -113,7 +113,6 @@ def get_quarter_year(quarter):
     return year
 
 def get_weekday_ru(date_str):
-    """Возвращает день недели на русском (пн, вт, ср...)"""
     if not date_str:
         return ''
     try:
@@ -124,7 +123,6 @@ def get_weekday_ru(date_str):
         return ''
 
 def format_date_ru(date_str):
-    """Форматирует дату в формате '3 августа'"""
     if not date_str or date_str == '':
         return ''
     months = {
@@ -140,7 +138,6 @@ def format_date_ru(date_str):
     return date_str
 
 def format_date_with_weekday(date_str):
-    """Форматирует дату в формате '3 августа, пн'"""
     if not date_str or date_str == '':
         return ''
     weekday = get_weekday_ru(date_str)
@@ -151,17 +148,14 @@ def format_date_with_weekday(date_str):
 
 def move_overdue_tasks_to_backlog(user_id):
     """
-    Переносит просроченные задачи на сегодня, СОХРАНЯЯ их категорию.
-    Задачи с датой < сегодня переносятся на сегодня.
-    Категория (urgent, work, home, personal, waiting) НЕ МЕНЯЕТСЯ.
+    ПЕРЕНАПРАВЛЕНО: переносит просроченные задачи на сегодня,
+    СОХРАНЯЯ их категорию (не сбрасывает в 'later').
     """
     conn = get_db_connection()
     cur = conn.cursor()
     today = datetime.now().date()
     today_str = today.strftime('%Y-%m-%d')
     
-    # Переносим ТОЛЬКО просроченные задачи (дата < сегодня)
-    # и сохраняем их категорию (не сбрасываем в 'later')
     cur.execute('''
         UPDATE tasks 
         SET date = %s
@@ -172,8 +166,7 @@ def move_overdue_tasks_to_backlog(user_id):
     conn.commit()
     conn.close()
 
-# Функция move_tasks_to_next_day полностью удалена
-# Задачи на сегодня НЕ ПЕРЕНОСЯТСЯ на завтра автоматически
+# Функция move_tasks_to_next_day УДАЛЕНА - задачи НЕ переносятся на завтра автоматически
 
 # --- ГЛАВНАЯ СТРАНИЦА ---
 @app.route('/')
@@ -183,7 +176,6 @@ def index():
     
     user_id = session['user_id']
     
-    # Переносим просроченные задачи на сегодня (сохраняя категории)
     move_overdue_tasks_to_backlog(user_id)
     
     conn = get_db_connection()
@@ -274,7 +266,7 @@ def future_page():
                                    format_date_with_weekday=format_date_with_weekday,
                                    username=session.get('username', 'Пользователь'))
 
-# --- СТРАНИЦА КВАРТАЛОВ (3 МЕСЯЦА) ---
+# --- СТРАНИЦА КВАРТАЛОВ ---
 @app.route('/quarter/<quarter>')
 def quarter_page(quarter):
     if 'user_id' not in session:
@@ -901,8 +893,2736 @@ def logout():
     return redirect('/login')
 
 # ====== HTML ШАБЛОНЫ ======
-# (ВСЕ ШАБЛОНЫ ИЗ ВАШЕГО ФАЙЛА - MAIN_PAGE, FUTURE_PAGE, QUARTER_PAGE, LATER_PAGE, DONE_PAGE, REGISTER_PAGE, LOGIN_PAGE)
-# Я не включаю их сюда повторно, чтобы не занимать место, но они должны быть здесь
+
+LOGIN_PAGE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Вход</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f6f2fd; margin: 0; color: #4a3f5e; }
+        .card { background: #fcfaff; padding: 40px; border-radius: 16px; box-shadow: 0 4px 30px rgba(139, 123, 181, 0.10); width: 100%; max-width: 360px; }
+        h2 { margin-bottom: 20px; color: #4a3f5e; }
+        input { width: 100%; padding: 10px 14px; margin: 8px 0; border: 1.5px solid #ede5f5; border-radius: 8px; font-size: 14px; box-sizing: border-box; background: white; color: #4a3f5e; -webkit-appearance: none; }
+        input:focus { outline: none; border-color: #8b7bb5; }
+        button { width: 100%; padding: 12px; background: #8b7bb5; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 12px; touch-action: manipulation; }
+        button:hover { background: #7a69a4; }
+        .error { color: #d5a0a0; font-size: 14px; margin-bottom: 10px; }
+        .link { text-align: center; margin-top: 16px; font-size: 14px; color: #b5a7cc; }
+        .link a { color: #8b7bb5; text-decoration: none; }
+        .link a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>🔑 Вход</h2>
+        {% if error %}
+            <div class="error">{{ error }}</div>
+        {% endif %}
+        <form method="POST">
+            <input type="text" name="username" placeholder="Логин" required>
+            <input type="password" name="password" placeholder="Пароль" required>
+            <button type="submit">Войти</button>
+        </form>
+        <div class="link">Нет аккаунта? <a href="/register">Зарегистрироваться</a></div>
+    </div>
+</body>
+</html>
+'''
+
+REGISTER_PAGE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Регистрация</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f6f2fd; margin: 0; color: #4a3f5e; }
+        .card { background: #fcfaff; padding: 40px; border-radius: 16px; box-shadow: 0 4px 30px rgba(139, 123, 181, 0.10); width: 100%; max-width: 400px; }
+        h2 { margin-bottom: 20px; color: #4a3f5e; }
+        input { width: 100%; padding: 10px 14px; margin: 8px 0; border: 1.5px solid #ede5f5; border-radius: 8px; font-size: 14px; box-sizing: border-box; background: white; color: #4a3f5e; -webkit-appearance: none; }
+        input:focus { outline: none; border-color: #8b7bb5; }
+        button { width: 100%; padding: 12px; background: #8b7bb5; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 12px; touch-action: manipulation; }
+        button:hover { background: #7a69a4; }
+        .error { color: #d5a0a0; font-size: 14px; margin-bottom: 10px; }
+        .link { text-align: center; margin-top: 16px; font-size: 14px; color: #b5a7cc; }
+        .link a { color: #8b7bb5; text-decoration: none; }
+        .link a:hover { text-decoration: underline; }
+        .optional { font-size: 12px; color: #b5a7cc; font-weight: 400; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>📝 Регистрация</h2>
+        {% if error %}
+            <div class="error">{{ error }}</div>
+        {% endif %}
+        <form method="POST">
+            <input type="text" name="username" placeholder="Логин" required>
+            <input type="password" name="password" placeholder="Пароль" required>
+            <input type="email" name="email" placeholder="Email (необязательно)">
+            <input type="text" name="phone" placeholder="Телефон (необязательно)">
+            <button type="submit">Зарегистрироваться</button>
+        </form>
+        <div class="link">Уже есть аккаунт? <a href="/login">Войти</a></div>
+    </div>
+</body>
+</html>
+'''
+
+MAIN_PAGE = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Мой органайзер</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f6f2fd;
+            padding: 16px;
+            min-height: 100vh;
+            color: #4a3f5e;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .app-container {
+            display: flex;
+            gap: 16px;
+            max-width: 1400px;
+            margin: 0 auto;
+            align-items: flex-start;
+            flex-wrap: wrap;
+        }
+        .left-column {
+            flex: 0 0 240px;
+            background: #fcfaff;
+            border-radius: 14px;
+            padding: 18px 14px;
+            min-height: 400px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        .left-column h2 { font-size: 15px; color: #8b7bb5; margin-bottom: 12px; }
+        
+        .backlog-add {
+            display: flex;
+            gap: 6px;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+        }
+        .backlog-add input {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1.5px solid #ede5f5;
+            border-radius: 8px;
+            font-size: 13px;
+            min-width: 100px;
+            background: white;
+            color: #4a3f5e;
+            -webkit-appearance: none;
+        }
+        .backlog-add input:focus { outline: none; border-color: #8b7bb5; }
+        .backlog-add button {
+            background: #8b7bb5;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 8px 14px;
+            cursor: pointer;
+            font-size: 13px;
+            touch-action: manipulation;
+        }
+        .backlog-add button:hover { background: #7a69a4; }
+        .backlog-item {
+            background: white;
+            border-radius: 8px;
+            padding: 10px 12px;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 14px;
+            border-left: 4px solid #d5c8e6;
+            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.06);
+        }
+        .backlog-item .move-btn {
+            background: none;
+            border: none;
+            color: #b5a7cc;
+            cursor: pointer;
+            font-size: 16px;
+            padding: 4px 8px;
+            touch-action: manipulation;
+        }
+        .backlog-item .move-btn:hover { color: #8b7bb5; }
+        .backlog-hint { font-size: 11px; color: #c5b8d8; margin-top: 8px; }
+        
+        .waiting-block {
+            background: white;
+            border-radius: 12px;
+            padding: 14px 16px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+            margin-top: 8px;
+        }
+        .waiting-block .block-header {
+            font-size: 14px;
+            font-weight: 600;
+            color: #4a3f5e;
+            margin-bottom: 10px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #8e44ad;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .waiting-block .block-header .count {
+            font-size: 11px;
+            font-weight: 400;
+            color: #8b7bb5;
+            background: #f0e8fa;
+            padding: 2px 10px;
+            border-radius: 12px;
+        }
+        .waiting-task {
+            background: #faf5ff;
+            border-radius: 8px;
+            padding: 8px 12px;
+            margin-bottom: 6px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 13px;
+            border-left: 4px solid #8e44ad;
+        }
+        .waiting-task .task-actions button {
+            background: none;
+            border: none;
+            color: #c5b8d8;
+            cursor: pointer;
+            font-size: 13px;
+            padding: 4px 6px;
+            touch-action: manipulation;
+        }
+        .waiting-task .task-actions button:hover { color: #8b7bb5; }
+        .waiting-block .add-task-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: #f0e8fa;
+            color: #8b7bb5;
+            border: 2px solid #e0d5ec;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 300;
+            margin: 4px auto 0;
+            transition: 0.2s;
+            line-height: 1;
+            touch-action: manipulation;
+        }
+        .waiting-block .add-task-btn:hover { 
+            background: #8b7bb5; 
+            color: white; 
+            border-color: #8b7bb5; 
+            transform: scale(1.08);
+        }
+        .waiting-empty { color: #c5b8d8; font-size: 13px; text-align: center; padding: 12px; }
+        
+        .center-column {
+            flex: 1;
+            min-width: 280px;
+        }
+        .header {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 12px 20px;
+            margin-bottom: 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        }
+        .header h1 { font-size: 20px; color: #4a3f5e; }
+        .header .user { color: #8b7bb5; font-size: 14px; }
+        .header .btn-exit {
+            background: #d5c8e6;
+            color: #4a3f5e;
+            border: none;
+            padding: 6px 14px;
+            border-radius: 8px;
+            cursor: pointer;
+            touch-action: manipulation;
+        }
+        .header .btn-exit:hover { background: #c5b8d8; }
+        
+        .date-nav {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 16px;
+            margin-bottom: 16px;
+            background: #fcfaff;
+            padding: 10px 20px;
+            border-radius: 12px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        }
+        .date-nav .nav-btn {
+            background: none;
+            border: none;
+            font-size: 20px;
+            color: #8b7bb5;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 8px;
+            transition: 0.2s;
+            touch-action: manipulation;
+        }
+        .date-nav .nav-btn:hover { background: #ede5f5; }
+        .date-nav .date-label {
+            font-size: 16px;
+            font-weight: 600;
+            color: #4a3f5e;
+            min-width: 140px;
+            text-align: center;
+        }
+        .date-nav .date-label .today-badge {
+            font-weight: 400;
+            font-size: 13px;
+            color: #27ae60;
+            background: #e8f5e9;
+            padding: 2px 10px;
+            border-radius: 12px;
+            margin-left: 6px;
+        }
+        .date-nav .date-label .tomorrow-badge {
+            font-weight: 400;
+            font-size: 13px;
+            color: #e67e22;
+            background: #fef5e7;
+            padding: 2px 10px;
+            border-radius: 12px;
+            margin-left: 6px;
+        }
+        
+        .focus-block {
+            background: #fcfaff;
+            border-radius: 14px;
+            padding: 18px 20px;
+            margin-bottom: 20px;
+            border: 2px solid #d5c8e6;
+            box-shadow: 0 2px 12px rgba(139, 123, 181, 0.06);
+        }
+        .focus-block .block-header {
+            font-size: 18px;
+            font-weight: 700;
+            color: #4a3f5e;
+            margin-bottom: 12px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .focus-block .block-header .count {
+            font-size: 13px;
+            font-weight: 400;
+            color: #8b7bb5;
+            background: #f0e8fa;
+            padding: 2px 14px;
+            border-radius: 20px;
+        }
+        .focus-block .empty-block { color: #c5b8d8; font-size: 13px; text-align: center; padding: 16px; }
+        
+        .block-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+        .block-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+        }
+        .block {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 14px 16px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+            min-height: 180px;
+            transition: opacity 0.3s, transform 0.3s;
+            order: 1;
+        }
+        .block.empty {
+            opacity: 0.6;
+            order: 999;
+        }
+        .block .block-header {
+            font-size: 14px;
+            font-weight: 600;
+            color: #4a3f5e;
+            margin-bottom: 10px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #ede5f5;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .block .block-header .count {
+            font-size: 11px;
+            font-weight: 400;
+            color: #8b7bb5;
+            background: #f0e8fa;
+            padding: 2px 10px;
+            border-radius: 12px;
+        }
+        .block-urgent .block-header { border-bottom-color: #e67e22; }
+        .block-work .block-header { border-bottom-color: #3498db; }
+        .block-home .block-header { border-bottom-color: #2ecc71; }
+        .block-personal .block-header { border-bottom-color: #e74c3c; }
+        
+        .task-card {
+            background: #faf5ff;
+            border-radius: 10px;
+            padding: 10px 14px;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 6px;
+            border-left: 4px solid #d5c8e6;
+            transition: 0.2s;
+            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
+            cursor: grab;
+            touch-action: none;
+            user-select: none;
+        }
+        .task-card:active { cursor: grabbing; }
+        .task-card.dragging { opacity: 0.4; transform: scale(0.98); }
+        .task-card.drag-over { border-left-color: #8b7bb5; border-left-width: 6px; }
+        .task-card:hover { background: #f5eefa; }
+        .task-card .task-info { 
+            display: flex; 
+            align-items: center; 
+            gap: 10px; 
+            flex-wrap: wrap; 
+            cursor: pointer;
+            flex: 1;
+            touch-action: manipulation;
+        }
+        .task-card .task-info .task-duration { 
+            font-size: 11px; 
+            color: #b5a7cc; 
+            background: #ede5f5; 
+            padding: 1px 8px; 
+            border-radius: 10px; 
+        }
+        .task-card .task-info .comment-badge {
+            font-size: 11px;
+            color: #8b7bb5;
+            background: #ede5f5;
+            padding: 1px 8px;
+            border-radius: 10px;
+            cursor: help;
+        }
+        .task-card .task-actions {
+            display: flex;
+            gap: 4px;
+        }
+        .task-card .task-actions button {
+            background: none;
+            border: none;
+            color: #c5b8d8;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 4px 6px;
+            border-radius: 6px;
+            touch-action: manipulation;
+            min-width: 32px;
+            min-height: 32px;
+        }
+        .task-card .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
+        .task-card .task-actions .drag-handle {
+            color: #d5c8e6;
+            cursor: grab;
+            font-size: 16px;
+        }
+        .task-card .task-actions .drag-handle:hover { color: #8b7bb5; background: none; }
+        .task-card.tag-focus { border-left-color: #8b7bb5; }
+        .task-card.tag-urgent { border-left-color: #e67e22; }
+        .task-card.tag-work { border-left-color: #3498db; }
+        .task-card.tag-home { border-left-color: #2ecc71; }
+        .task-card.tag-personal { border-left-color: #e74c3c; }
+        
+        .empty-block { color: #c5b8d8; font-size: 13px; text-align: center; padding: 16px; }
+        .add-task-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background: #f0e8fa;
+            color: #8b7bb5;
+            border: 2px solid #e0d5ec;
+            cursor: pointer;
+            font-size: 18px;
+            font-weight: 300;
+            margin: 6px auto 0;
+            transition: 0.2s;
+            line-height: 1;
+            touch-action: manipulation;
+        }
+        .add-task-btn:hover { 
+            background: #8b7bb5; 
+            color: white; 
+            border-color: #8b7bb5; 
+            transform: scale(1.08);
+        }
+        
+        .right-column { flex: 0 0 160px; display: flex; flex-direction: column; gap: 12px; }
+        .sidebar-card {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 14px;
+            text-align: center;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        }
+        .sidebar-card .big-btn {
+            background: #8b7bb5;
+            color: white;
+            border: none;
+            border-radius: 10px;
+            padding: 12px;
+            font-size: 15px;
+            font-weight: 600;
+            width: 100%;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            touch-action: manipulation;
+        }
+        .sidebar-card .big-btn:hover { background: #7a69a4; }
+        .sidebar-card .big-btn-secondary {
+            background: #d5c8e6;
+            color: #4a3f5e;
+            border: none;
+            border-radius: 10px;
+            padding: 12px;
+            font-size: 15px;
+            font-weight: 600;
+            width: 100%;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            margin-top: 8px;
+            touch-action: manipulation;
+        }
+        .sidebar-card .big-btn-secondary:hover { background: #c5b8d8; }
+        .sidebar-card .big-btn-done {
+            background: #27ae60;
+            color: white;
+            border: none;
+            border-radius: 10px;
+            padding: 12px;
+            font-size: 15px;
+            font-weight: 600;
+            width: 100%;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            margin-top: 8px;
+            touch-action: manipulation;
+        }
+        .sidebar-card .big-btn-done:hover { background: #2ecc71; }
+        .sidebar-card .big-btn-future {
+            background: #8e44ad;
+            color: white;
+            border: none;
+            border-radius: 10px;
+            padding: 12px;
+            font-size: 15px;
+            font-weight: 600;
+            width: 100%;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            margin-top: 8px;
+            touch-action: manipulation;
+        }
+        .sidebar-card .big-btn-future:hover { background: #7d3c98; }
+        
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(74, 63, 94, 0.3);
+            backdrop-filter: blur(4px);
+            z-index: 999;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal-overlay.open { display: flex; }
+        .modal {
+            background: #fcfaff;
+            border-radius: 18px;
+            padding: 24px 28px;
+            max-width: 460px;
+            width: 90%;
+            box-shadow: 0 20px 60px rgba(74, 63, 94, 0.15);
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+        .modal h3 { font-size: 18px; margin-bottom: 4px; color: #4a3f5e; }
+        .modal .sub { font-size: 13px; color: #8b7bb5; margin-bottom: 16px; }
+        .modal label { font-size: 12px; font-weight: 600; color: #4a3f5e; display: block; margin-top: 12px; margin-bottom: 4px; }
+        .modal input, .modal select, .modal textarea {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1.5px solid #ede5f5;
+            border-radius: 8px;
+            font-size: 14px;
+            background: white;
+            color: #4a3f5e;
+            -webkit-appearance: none;
+            font-family: inherit;
+        }
+        .modal textarea { resize: vertical; min-height: 60px; }
+        .modal input:focus, .modal select:focus, .modal textarea:focus { outline: none; border-color: #8b7bb5; }
+        .modal .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .modal .checkbox-group input[type="checkbox"] { width: 18px; height: 18px; accent-color: #8b7bb5; }
+        .modal .checkbox-group label { margin: 0; font-weight: 400; font-size: 14px; }
+        .modal .repeat-options {
+            display: none;
+            margin-top: 8px;
+            padding: 12px;
+            background: #f8f2fd;
+            border-radius: 8px;
+        }
+        .modal .repeat-options.visible { display: block; }
+        .modal .modal-actions { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+        .modal .modal-actions button { flex: 1; padding: 10px; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; touch-action: manipulation; min-width: 80px; }
+        .modal .btn-save { background: #8b7bb5; color: white; }
+        .modal .btn-save:hover { background: #7a69a4; }
+        .modal .btn-cancel { background: #ede5f5; color: #4a3f5e; }
+        .modal .btn-cancel:hover { background: #e0d5ec; }
+        .modal .btn-delete { background: #e74c3c; color: white; }
+        .modal .btn-delete:hover { background: #c0392b; }
+        
+        .move-options {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .move-options button {
+            padding: 10px;
+            border: 1.5px solid #ede5f5;
+            border-radius: 8px;
+            background: white;
+            cursor: pointer;
+            font-size: 14px;
+            transition: 0.2s;
+            color: #4a3f5e;
+            touch-action: manipulation;
+        }
+        .move-options button:hover { border-color: #8b7bb5; background: #f8f2fd; }
+        .move-options button .cat-icon { display: block; font-size: 20px; }
+        
+        .task-detail { margin: 12px 0; padding: 10px; background: #f8f2fd; border-radius: 8px; }
+        .task-detail .detail-row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 14px; border-bottom: 1px solid #ede5f5; }
+        .task-detail .detail-row:last-child { border-bottom: none; }
+        .task-detail .detail-label { color: #8b7bb5; }
+        
+        @media (max-width: 768px) {
+            body { padding: 10px; }
+            .app-container { flex-direction: column; }
+            .left-column { flex: 1 1 100%; }
+            .right-column { flex: 1 1 100%; flex-direction: row; flex-wrap: wrap; }
+            .right-column .sidebar-card { flex: 1; min-width: 120px; }
+            .center-column { flex: 1 1 100%; }
+            .block { min-height: 140px; }
+            .block-row { grid-template-columns: 1fr 1fr; }
+            .date-nav .date-label { font-size: 14px; min-width: 100px; }
+            .header { flex-direction: column; text-align: center; }
+            .modal { padding: 18px 16px; }
+            .task-card { padding: 8px 10px; }
+            .task-card .task-actions button { padding: 4px 4px; min-width: 28px; min-height: 28px; font-size: 13px; }
+        }
+        @media (max-width: 480px) {
+            .block-row { grid-template-columns: 1fr; }
+            .date-nav .date-label { font-size: 12px; min-width: 80px; }
+            .date-nav .nav-btn { font-size: 16px; }
+            .right-column .sidebar-card { min-width: 100px; }
+            .right-column .sidebar-card .big-btn { font-size: 13px; padding: 10px; }
+        }
+    </style>
+</head>
+<body>
+<div class="app-container">
+
+    <div class="left-column">
+        <div>
+            <h2>📥 Распределить</h2>
+            <div class="backlog-add">
+                <input type="text" id="newTaskInput" placeholder="Новая задача..." autofocus>
+                <button id="addBacklogBtn">+</button>
+            </div>
+            <div id="backlogList"></div>
+            <div class="backlog-hint">⬅️ Нажмите → чтобы распределить</div>
+        </div>
+
+        <div class="waiting-block" id="block-waiting">
+            <div class="block-header">
+                ⏳ Жду ответа
+                <span class="count" id="count-waiting">0</span>
+            </div>
+            <div id="tasks-waiting"></div>
+            <button class="add-task-btn" data-category="waiting" title="Добавить задачу">+</button>
+        </div>
+    </div>
+
+    <div class="center-column">
+        <div class="header">
+            <h1>📋 Мои задачи</h1>
+            <div>
+                <span class="user">👤 {{ username }}</span>
+                <a href="/logout" class="btn-exit" style="text-decoration:none; display:inline-block; margin-left:10px;">Выйти</a>
+            </div>
+        </div>
+
+        <div class="date-nav">
+            <a href="/?date={{ prev_date }}" class="nav-btn">◀</a>
+            <span class="date-label">
+                {{ date_label }}
+                {% if is_today %}<span class="today-badge">сегодня</span>{% endif %}
+                {% if is_tomorrow %}<span class="tomorrow-badge">завтра</span>{% endif %}
+            </span>
+            <a href="/?date={{ next_date }}" class="nav-btn">▶</a>
+        </div>
+
+        <div class="focus-block" id="focusBlock">
+            <div class="block-header">
+                🎯 Фокус
+                <span class="count" id="focusCount">0</span>
+            </div>
+            <div id="focusTasks"></div>
+            <div class="empty-block" id="focusEmpty">Нет задач в фокусе</div>
+        </div>
+
+        <div class="block-grid" id="blockGrid">
+            <div class="block-row">
+                <div class="block block-urgent" id="block-urgent">
+                    <div class="block-header">⚡ До 15 минут <span class="count" id="count-urgent">0</span></div>
+                    <div id="tasks-urgent"></div>
+                    <button class="add-task-btn" data-category="urgent">+</button>
+                </div>
+                <div class="block block-work" id="block-work">
+                    <div class="block-header">💼 Работа <span class="count" id="count-work">0</span></div>
+                    <div id="tasks-work"></div>
+                    <button class="add-task-btn" data-category="work">+</button>
+                </div>
+            </div>
+            <div class="block-row">
+                <div class="block block-home" id="block-home">
+                    <div class="block-header">🏠 Дом <span class="count" id="count-home">0</span></div>
+                    <div id="tasks-home"></div>
+                    <button class="add-task-btn" data-category="home">+</button>
+                </div>
+                <div class="block block-personal" id="block-personal">
+                    <div class="block-header">❤️ Личное <span class="count" id="count-personal">0</span></div>
+                    <div id="tasks-personal"></div>
+                    <button class="add-task-btn" data-category="personal">+</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="right-column">
+        <div class="sidebar-card">
+            <a href="/quarter/{{ current_quarter }}" class="big-btn">🗓️ 3 месяца</a>
+            <a href="/future" class="big-btn-future">📅 Будущие</a>
+            <a href="/later" class="big-btn-secondary">🕰️ Позже</a>
+            <a href="/done" class="big-btn-done">✅ Готово</a>
+        </div>
+    </div>
+</div>
+
+<div class="modal-overlay" id="addTaskModal">
+    <div class="modal">
+        <h3>➕ Новая задача</h3>
+        <p class="sub" id="addTaskModalSub">Добавьте задачу в категорию</p>
+        <input type="hidden" id="addTaskCategory">
+        <label for="addTaskTitle">Название задачи</label>
+        <input type="text" id="addTaskTitle" placeholder="Что нужно сделать?" autofocus>
+        <label for="addTaskDate">📅 Дата выполнения</label>
+        <input type="date" id="addTaskDate" value="{{ view_date }}">
+        <label for="addTaskDuration">⏱️ Время выполнения</label>
+        <input type="text" id="addTaskDuration" placeholder="1 ч">
+        <label for="addTaskComment">💬 Комментарий</label>
+        <textarea id="addTaskComment" placeholder="Дополнительная информация..."></textarea>
+        <div class="checkbox-group">
+            <input type="checkbox" id="addTaskRepeat">
+            <label for="addTaskRepeat">🔄 Повторяющаяся задача</label>
+        </div>
+        <div class="repeat-options" id="addRepeatOptions">
+            <label for="addRepeatType">Тип повторения</label>
+            <select id="addRepeatType">
+                <option value="daily">📆 Ежедневно</option>
+                <option value="weekly">📅 Еженедельно</option>
+            </select>
+            <div id="addWeeklyDayGroup" style="margin-top:8px; display:none;">
+                <label for="addRepeatDay">День недели</label>
+                <select id="addRepeatDay">
+                    <option value="0">Воскресенье</option>
+                    <option value="1">Понедельник</option>
+                    <option value="2">Вторник</option>
+                    <option value="3">Среда</option>
+                    <option value="4">Четверг</option>
+                    <option value="5">Пятница</option>
+                    <option value="6">Суббота</option>
+                </select>
+            </div>
+        </div>
+        <div class="modal-actions">
+            <button class="btn-save" id="saveAddTaskBtn">💾 Сохранить</button>
+            <button class="btn-cancel" id="cancelAddTaskBtn">Отмена</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal-overlay" id="viewTaskModal">
+    <div class="modal">
+        <h3 id="viewTaskTitle">📌 Задача</h3>
+        <p class="sub" id="viewTaskCategory"></p>
+        <input type="hidden" id="viewTaskId">
+        <label for="viewTaskTitleInput">Название задачи</label>
+        <input type="text" id="viewTaskTitleInput" style="margin-bottom:8px;">
+        <label for="viewTaskDate">📅 Дата выполнения</label>
+        <input type="date" id="viewTaskDate" style="margin-bottom:8px;">
+        <label for="viewTaskDuration">⏱️ Время выполнения</label>
+        <input type="text" id="viewTaskDuration" placeholder="1 ч" style="margin-bottom:8px;">
+        <label for="viewTaskComment">💬 Комментарий</label>
+        <textarea id="viewTaskComment" placeholder="Дополнительная информация..." style="margin-bottom:8px;"></textarea>
+        <label for="viewTaskCategorySelect">📂 Категория</label>
+        <select id="viewTaskCategorySelect" style="margin-bottom:8px;">
+            <option value="focus">🎯 Фокус</option>
+            <option value="urgent">⚡ До 15 минут</option>
+            <option value="work">💼 Работа</option>
+            <option value="home">🏠 Дом</option>
+            <option value="personal">❤️ Личное</option>
+            <option value="waiting">⏳ Жду ответа</option>
+            <option value="later">🕰️ Позже</option>
+        </select>
+        <div class="checkbox-group" style="margin-top:4px;">
+            <input type="checkbox" id="viewTaskRepeat">
+            <label for="viewTaskRepeat">🔄 Повторяющаяся задача</label>
+        </div>
+        <div class="repeat-options" id="viewRepeatOptions">
+            <label for="viewRepeatType">Тип повторения</label>
+            <select id="viewRepeatType">
+                <option value="daily">📆 Ежедневно</option>
+                <option value="weekly">📅 Еженедельно</option>
+            </select>
+            <div id="viewWeeklyDayGroup" style="margin-top:8px; display:none;">
+                <label for="viewRepeatDay">День недели</label>
+                <select id="viewRepeatDay">
+                    <option value="0">Воскресенье</option>
+                    <option value="1">Понедельник</option>
+                    <option value="2">Вторник</option>
+                    <option value="3">Среда</option>
+                    <option value="4">Четверг</option>
+                    <option value="5">Пятница</option>
+                    <option value="6">Суббота</option>
+                </select>
+            </div>
+        </div>
+        <div class="task-detail" style="margin-top:12px;" id="viewTaskDetails">
+            <div class="detail-row"><span class="detail-label">📁 Группа</span><span id="viewTaskGroup">—</span></div>
+            <div class="detail-row"><span class="detail-label">🗓️ Квартал</span><span id="viewTaskQuarter">—</span></div>
+        </div>
+        <div class="modal-actions">
+            <button class="btn-save" id="viewTaskSave">💾 Сохранить изменения</button>
+            <button class="btn-delete" id="viewTaskDelete">🗑️ Удалить</button>
+            <button class="btn-cancel" id="cancelViewBtn">Закрыть</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal-overlay" id="moveModal">
+    <div class="modal">
+        <h3>➡️ Переместить задачу</h3>
+        <p class="sub" id="moveTaskTitle">Выберите категорию</p>
+        <input type="hidden" id="moveTaskId">
+        <div class="move-options">
+            <button class="move-cat-btn" data-category="focus"><span class="cat-icon">🎯</span> Фокус</button>
+            <button class="move-cat-btn" data-category="urgent"><span class="cat-icon">⚡</span> До 15 мин</button>
+            <button class="move-cat-btn" data-category="work"><span class="cat-icon">💼</span> Работа</button>
+            <button class="move-cat-btn" data-category="home"><span class="cat-icon">🏠</span> Дом</button>
+            <button class="move-cat-btn" data-category="personal"><span class="cat-icon">❤️</span> Личное</button>
+            <button class="move-cat-btn" data-category="waiting"><span class="cat-icon">⏳</span> Жду ответа</button>
+            <button class="move-cat-btn" data-category="later" style="grid-column: span 2;"><span class="cat-icon">🕰️</span> Позже</button>
+        </div>
+        <div class="modal-actions">
+            <button class="btn-cancel" id="cancelMoveBtn">Отмена</button>
+        </div>
+    </div>
+</div>
+
+<script>
+    let currentViewTaskId = null;
+    let moveTaskId = null;
+    let currentViewDate = '{{ view_date }}';
+    let draggedTaskId = null;
+    let dragSourceBlock = null;
+    
+    document.addEventListener('DOMContentLoaded', function() {
+        initDragDrop();
+        updateEmptyBlocks();
+    });
+    
+    function initDragDrop() {
+        const taskCards = document.querySelectorAll('.task-card');
+        taskCards.forEach(card => {
+            card.removeEventListener('dragstart', handleDragStart);
+            card.removeEventListener('dragend', handleDragEnd);
+            card.removeEventListener('dragover', handleDragOver);
+            card.removeEventListener('dragenter', handleDragEnter);
+            card.removeEventListener('dragleave', handleDragLeave);
+            card.removeEventListener('drop', handleDrop);
+            card.removeEventListener('touchstart', handleTouchStart);
+            card.removeEventListener('touchmove', handleTouchMove);
+            card.removeEventListener('touchend', handleTouchEnd);
+            
+            card.addEventListener('dragstart', handleDragStart);
+            card.addEventListener('dragend', handleDragEnd);
+            card.addEventListener('dragover', handleDragOver);
+            card.addEventListener('dragenter', handleDragEnter);
+            card.addEventListener('dragleave', handleDragLeave);
+            card.addEventListener('drop', handleDrop);
+            card.addEventListener('touchstart', handleTouchStart, { passive: true });
+            card.addEventListener('touchmove', handleTouchMove, { passive: false });
+            card.addEventListener('touchend', handleTouchEnd, { passive: true });
+        });
+    }
+    
+    function handleDragStart(e) {
+        draggedTaskId = this.dataset.taskId;
+        dragSourceBlock = this.closest('.block, .waiting-block, .focus-block');
+        this.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', this.dataset.taskId);
+    }
+    
+    function handleDragEnd(e) {
+        this.classList.remove('dragging');
+        document.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+    }
+    
+    function handleDragOver(e) {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+    }
+    
+    function handleDragEnter(e) {
+        e.preventDefault();
+        this.classList.add('drag-over');
+    }
+    
+    function handleDragLeave(e) {
+        this.classList.remove('drag-over');
+    }
+    
+    function handleDrop(e) {
+        e.preventDefault();
+        this.classList.remove('drag-over');
+        const targetCard = this;
+        const targetBlock = this.closest('.block, .waiting-block, .focus-block');
+        const sourceBlock = dragSourceBlock;
+        
+        if (!targetBlock || !sourceBlock || targetBlock === sourceBlock) {
+            if (sourceBlock && draggedTaskId) {
+                reorderTasks(sourceBlock, draggedTaskId, targetCard);
+            }
+            return;
+        }
+    }
+    
+    function reorderTasks(block, taskId, targetElement) {
+        const container = block.querySelector('[id^="tasks-"]');
+        if (!container) return;
+        const cards = container.querySelectorAll('.task-card');
+        let targetIndex = -1;
+        let currentIndex = -1;
+        
+        cards.forEach((card, index) => {
+            if (card.dataset.taskId === taskId) {
+                currentIndex = index;
+            }
+            if (card === targetElement) {
+                targetIndex = index;
+            }
+        });
+        
+        if (currentIndex === -1 || targetIndex === -1 || currentIndex === targetIndex) {
+            return;
+        }
+        
+        if (currentIndex < targetIndex) {
+            targetElement.parentNode.insertBefore(cards[currentIndex], targetElement.nextSibling);
+        } else {
+            targetElement.parentNode.insertBefore(cards[currentIndex], targetElement);
+        }
+        
+        updatePositions(block);
+    }
+    
+    function updatePositions(block) {
+        const container = block.querySelector('[id^="tasks-"]');
+        if (!container) return;
+        const cards = container.querySelectorAll('.task-card');
+        let category = '';
+        
+        if (block.id === 'focusBlock') {
+            category = 'focus';
+        } else {
+            const match = block.id.match(/block-(\w+)/);
+            if (match) category = match[1];
+        }
+        
+        cards.forEach((card, index) => {
+            // Обновляем позицию через API (если есть)
+            // Пока просто обновляем счетчик
+        });
+        
+        const countEl = document.getElementById(`count-${category}`);
+        if (countEl) {
+            countEl.textContent = cards.length;
+        }
+        
+        updateEmptyBlocks();
+    }
+    
+    function updateEmptyBlocks() {
+        const blocks = document.querySelectorAll('.block');
+        blocks.forEach(block => {
+            const container = block.querySelector('[id^="tasks-"]');
+            if (container) {
+                const tasks = container.querySelectorAll('.task-card');
+                if (tasks.length === 0) {
+                    block.classList.add('empty');
+                } else {
+                    block.classList.remove('empty');
+                }
+            }
+        });
+    }
+    
+    let touchDragData = null;
+    
+    function handleTouchStart(e) {
+        const touch = e.touches[0];
+        touchDragData = {
+            taskId: this.dataset.taskId,
+            card: this,
+            startX: touch.clientX,
+            startY: touch.clientY,
+            block: this.closest('.block, .waiting-block, .focus-block')
+        };
+    }
+    
+    function handleTouchMove(e) {
+        if (!touchDragData) return;
+        e.preventDefault();
+    }
+    
+    function handleTouchEnd(e) {
+        if (!touchDragData) return;
+        const touch = e.changedTouches[0];
+        const element = document.elementFromPoint(touch.clientX, touch.clientY);
+        if (element) {
+            const targetCard = element.closest('.task-card');
+            const targetBlock = element.closest('.block, .waiting-block, .focus-block');
+            if (targetCard && targetCard !== touchDragData.card) {
+                const sourceBlock = touchDragData.block;
+                if (sourceBlock && targetBlock && sourceBlock === targetBlock) {
+                    reorderTasks(sourceBlock, touchDragData.taskId, targetCard);
+                }
+            }
+        }
+        touchDragData = null;
+    }
+    
+    function loadTasks() {
+        fetch(`/api/tasks/date/${currentViewDate}`)
+            .then(res => res.json())
+            .then(tasks => {
+                const categories = { focus: [], urgent: [], work: [], home: [], personal: [], waiting: [] };
+                tasks.forEach(t => {
+                    if (categories[t.category]) categories[t.category].push(t);
+                });
+                renderTasks(categories);
+                initDragDrop();
+                updateEmptyBlocks();
+            });
+    }
+    
+    function renderTasks(categories) {
+        const containerMap = {
+            focus: { tasks: 'focusTasks', count: 'focusCount', empty: 'focusEmpty' },
+            urgent: { tasks: 'tasks-urgent', count: 'count-urgent', block: 'block-urgent' },
+            work: { tasks: 'tasks-work', count: 'count-work', block: 'block-work' },
+            home: { tasks: 'tasks-home', count: 'count-home', block: 'block-home' },
+            personal: { tasks: 'tasks-personal', count: 'count-personal', block: 'block-personal' },
+            waiting: { tasks: 'tasks-waiting', count: 'count-waiting', block: 'block-waiting' }
+        };
+        
+        for (const [cat, data] of Object.entries(containerMap)) {
+            const tasks = categories[cat] || [];
+            const container = document.getElementById(data.tasks);
+            const countEl = document.getElementById(data.count);
+            const blockEl = document.getElementById(data.block);
+            
+            if (!container) continue;
+            
+            container.innerHTML = '';
+            tasks.forEach(task => {
+                const card = createTaskCard(task, cat);
+                container.appendChild(card);
+            });
+            
+            if (countEl) {
+                countEl.textContent = tasks.length;
+            }
+            
+            if (cat === 'focus') {
+                const emptyEl = document.getElementById('focusEmpty');
+                if (emptyEl) {
+                    emptyEl.style.display = tasks.length === 0 ? 'block' : 'none';
+                }
+            }
+        }
+        updateEmptyBlocks();
+    }
+    
+    function createTaskCard(task, category) {
+        const div = document.createElement('div');
+        div.className = `task-card tag-${category}`;
+        div.dataset.taskId = task.id;
+        div.draggable = true;
+        
+        let durationHtml = '';
+        if (task.duration) {
+            durationHtml = `<span class="task-duration">⏱️ ${task.duration}</span>`;
+        }
+        
+        let commentHtml = '';
+        if (task.comment && task.comment.trim() !== '') {
+            commentHtml = `<span class="comment-badge" title="${task.comment.replace(/"/g, '&quot;')}">💬</span>`;
+        }
+        
+        div.innerHTML = `
+            <div class="task-info" data-task-id="${task.id}">
+                <span>${task.title}</span>
+                ${durationHtml}
+                ${commentHtml}
+            </div>
+            <div class="task-actions">
+                <span class="drag-handle" title="Перетащить">⠿</span>
+                <button class="done-btn" title="Выполнено" data-task-id="${task.id}">✅</button>
+                <button class="move-to-focus-btn" title="В фокус" data-task-id="${task.id}" style="display:${task.category !== 'focus' ? 'inline' : 'none'}">⭐</button>
+            </div>
+        `;
+        
+        div.querySelector('.task-info').addEventListener('click', function(e) {
+            e.stopPropagation();
+            const taskId = this.dataset.taskId;
+            viewTask(taskId);
+        });
+        
+        div.querySelector('.done-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            fetch(`/api/task/${task.id}/done`, { method: 'POST' })
+                .then(() => { loadTasks(); loadBacklog(); });
+        });
+        
+        const focusBtn = div.querySelector('.move-to-focus-btn');
+        if (focusBtn) {
+            focusBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                const taskId = this.dataset.taskId;
+                fetch(`/api/task/${taskId}/move`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ category: 'focus' })
+                })
+                .then(() => { loadTasks(); loadBacklog(); });
+            });
+        }
+        
+        return div;
+    }
+    
+    function viewTask(taskId) {
+        fetch(`/api/task/${taskId}`)
+            .then(res => res.json())
+            .then(task => {
+                currentViewTaskId = task.id;
+                document.getElementById('viewTaskId').value = task.id;
+                document.getElementById('viewTaskTitle').textContent = `📌 ${task.title}`;
+                document.getElementById('viewTaskTitleInput').value = task.title || '';
+                document.getElementById('viewTaskDate').value = task.date || '';
+                document.getElementById('viewTaskDuration').value = task.duration || '';
+                document.getElementById('viewTaskComment').value = task.comment || '';
+                document.getElementById('viewTaskCategorySelect').value = task.category || 'later';
+                
+                const isRepeating = task.repeat_type && task.repeat_type !== 'none';
+                document.getElementById('viewTaskRepeat').checked = isRepeating;
+                
+                const repeatOptions = document.getElementById('viewRepeatOptions');
+                if (isRepeating) {
+                    repeatOptions.classList.add('visible');
+                    document.getElementById('viewRepeatType').value = task.repeat_type || 'daily';
+                    if (task.repeat_type === 'weekly') {
+                        document.getElementById('viewWeeklyDayGroup').style.display = 'block';
+                        document.getElementById('viewRepeatDay').value = task.repeat_day || 0;
+                    } else {
+                        document.getElementById('viewWeeklyDayGroup').style.display = 'none';
+                    }
+                } else {
+                    repeatOptions.classList.remove('visible');
+                    document.getElementById('viewWeeklyDayGroup').style.display = 'none';
+                }
+                
+                document.getElementById('viewTaskGroup').textContent = task.later_group || '—';
+                document.getElementById('viewTaskQuarter').textContent = task.quarter || '—';
+                
+                document.getElementById('viewTaskModal').classList.add('open');
+            });
+    }
+    
+    document.getElementById('viewTaskSave').addEventListener('click', function() {
+        const taskId = document.getElementById('viewTaskId').value;
+        const title = document.getElementById('viewTaskTitleInput').value.trim();
+        const date = document.getElementById('viewTaskDate').value;
+        const duration = document.getElementById('viewTaskDuration').value.trim();
+        const comment = document.getElementById('viewTaskComment').value.trim();
+        const category = document.getElementById('viewTaskCategorySelect').value;
+        const isRepeating = document.getElementById('viewTaskRepeat').checked;
+        let repeatType = 'none';
+        let repeatDay = null;
+        
+        if (!title) { alert('Введите название'); return; }
+        
+        if (isRepeating) {
+            repeatType = document.getElementById('viewRepeatType').value;
+            if (repeatType === 'weekly') {
+                repeatDay = parseInt(document.getElementById('viewRepeatDay').value);
+            }
+        }
+        
+        fetch(`/api/task/${taskId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                title, 
+                date, 
+                duration, 
+                comment,
+                category, 
+                repeat_type: repeatType, 
+                repeat_day: repeatDay 
+            })
+        })
+        .then(res => res.json())
+        .then(() => {
+            document.getElementById('viewTaskModal').classList.remove('open');
+            loadTasks();
+            loadBacklog();
+        });
+    });
+    
+    document.getElementById('viewTaskDelete').addEventListener('click', function() {
+        if (currentViewTaskId && confirm('Удалить задачу навсегда?')) {
+            fetch(`/api/task/${currentViewTaskId}`, { method: 'DELETE' })
+                .then(() => {
+                    document.getElementById('viewTaskModal').classList.remove('open');
+                    loadTasks();
+                    loadBacklog();
+                });
+        }
+    });
+    
+    document.getElementById('cancelViewBtn').addEventListener('click', function() {
+        document.getElementById('viewTaskModal').classList.remove('open');
+    });
+    
+    document.getElementById('viewTaskRepeat').addEventListener('change', function() {
+        const options = document.getElementById('viewRepeatOptions');
+        if (this.checked) {
+            options.classList.add('visible');
+            if (document.getElementById('viewRepeatType').value === 'weekly') {
+                document.getElementById('viewWeeklyDayGroup').style.display = 'block';
+            }
+        } else {
+            options.classList.remove('visible');
+            document.getElementById('viewWeeklyDayGroup').style.display = 'none';
+        }
+    });
+    
+    document.getElementById('viewRepeatType').addEventListener('change', function() {
+        document.getElementById('viewWeeklyDayGroup').style.display = this.value === 'weekly' ? 'block' : 'none';
+    });
+    
+    document.querySelectorAll('.add-task-btn').forEach(btn => {
+        btn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            const category = this.dataset.category;
+            document.getElementById('addTaskCategory').value = category;
+            document.getElementById('addTaskModalSub').textContent = `Добавьте задачу в категорию: ${getCategoryName(category)}`;
+            document.getElementById('addTaskTitle').value = '';
+            document.getElementById('addTaskDate').value = currentViewDate;
+            document.getElementById('addTaskDuration').value = '';
+            document.getElementById('addTaskComment').value = '';
+            document.getElementById('addTaskRepeat').checked = false;
+            document.getElementById('addRepeatOptions').classList.remove('visible');
+            document.getElementById('addWeeklyDayGroup').style.display = 'none';
+            document.getElementById('addTaskModal').classList.add('open');
+            setTimeout(() => document.getElementById('addTaskTitle').focus(), 100);
+        });
+    });
+    
+    function getCategoryName(cat) {
+        const names = {
+            'focus': '🎯 Фокус',
+            'urgent': '⚡ До 15 минут',
+            'work': '💼 Работа',
+            'home': '🏠 Дом',
+            'personal': '❤️ Личное',
+            'waiting': '⏳ Жду ответа',
+            'later': '🕰️ Позже'
+        };
+        return names[cat] || cat;
+    }
+    
+    document.getElementById('cancelAddTaskBtn').addEventListener('click', () => {
+        document.getElementById('addTaskModal').classList.remove('open');
+    });
+    
+    document.getElementById('saveAddTaskBtn').addEventListener('click', () => {
+        const category = document.getElementById('addTaskCategory').value;
+        const title = document.getElementById('addTaskTitle').value.trim();
+        const date = document.getElementById('addTaskDate').value;
+        const duration = document.getElementById('addTaskDuration').value.trim();
+        const comment = document.getElementById('addTaskComment').value.trim();
+        const isRepeating = document.getElementById('addTaskRepeat').checked;
+        let repeatType = 'none';
+        let repeatDay = null;
+        
+        if (!title) { alert('Введите название'); return; }
+        
+        if (isRepeating) {
+            repeatType = document.getElementById('addRepeatType').value;
+            if (repeatType === 'weekly') {
+                repeatDay = parseInt(document.getElementById('addRepeatDay').value);
+            }
+        }
+        
+        fetch('/api/task/direct', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title, category, date, duration, comment, repeat_type: repeatType, repeat_day: repeatDay })
+        })
+        .then(res => res.json())
+        .then(() => {
+            document.getElementById('addTaskModal').classList.remove('open');
+            loadTasks();
+            loadBacklog();
+        });
+    });
+    
+    document.getElementById('addTaskTitle').addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') document.getElementById('saveAddTaskBtn').click();
+    });
+    
+    document.getElementById('addTaskRepeat').addEventListener('change', function() {
+        const options = document.getElementById('addRepeatOptions');
+        if (this.checked) {
+            options.classList.add('visible');
+            if (document.getElementById('addRepeatType').value === 'weekly') {
+                document.getElementById('addWeeklyDayGroup').style.display = 'block';
+            }
+        } else {
+            options.classList.remove('visible');
+            document.getElementById('addWeeklyDayGroup').style.display = 'none';
+        }
+    });
+    
+    document.getElementById('addRepeatType').addEventListener('change', function() {
+        document.getElementById('addWeeklyDayGroup').style.display = this.value === 'weekly' ? 'block' : 'none';
+    });
+    
+    document.getElementById('addBacklogBtn').addEventListener('click', () => {
+        const input = document.getElementById('newTaskInput');
+        const title = input.value.trim();
+        if (!title) return;
+        
+        fetch('/api/task', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title })
+        })
+        .then(res => res.json())
+        .then(() => {
+            input.value = '';
+            loadTasks();
+            loadBacklog();
+        });
+    });
+    
+    document.getElementById('newTaskInput').addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') {
+            document.getElementById('addBacklogBtn').click();
+        }
+    });
+    
+    function loadBacklog() {
+        fetch('/api/tasks')
+            .then(res => res.json())
+            .then(tasks => {
+                const backlogTasks = tasks.filter(t => t.category === 'later');
+                const container = document.getElementById('backlogList');
+                container.innerHTML = '';
+                backlogTasks.forEach(task => {
+                    const item = document.createElement('div');
+                    item.className = 'backlog-item';
+                    item.innerHTML = `
+                        <span>${task.title}</span>
+                        <button class="move-btn" data-task-id="${task.id}" title="Переместить">→</button>
+                    `;
+                    container.appendChild(item);
+                });
+                
+                document.querySelectorAll('.move-btn').forEach(btn => {
+                    btn.addEventListener('click', function(e) {
+                        e.stopPropagation();
+                        const taskId = this.dataset.taskId;
+                        const task = backlogTasks.find(t => t.id == taskId);
+                        if (task) {
+                            document.getElementById('moveTaskId').value = taskId;
+                            document.getElementById('moveTaskTitle').textContent = `"${task.title}" → куда?`;
+                            document.getElementById('moveModal').classList.add('open');
+                        }
+                    });
+                });
+            });
+    }
+    
+    document.querySelectorAll('.move-cat-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const taskId = document.getElementById('moveTaskId').value;
+            const category = this.dataset.category;
+            
+            fetch(`/api/task/${taskId}/move`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ category })
+            })
+            .then(res => res.json())
+            .then(() => {
+                document.getElementById('moveModal').classList.remove('open');
+                loadTasks();
+                loadBacklog();
+                updateEmptyBlocks();
+            });
+        });
+    });
+    
+    document.getElementById('cancelMoveBtn').addEventListener('click', () => {
+        document.getElementById('moveModal').classList.remove('open');
+    });
+    
+    loadTasks();
+    loadBacklog();
+</script>
+</body>
+</html>
+'''
+
+FUTURE_PAGE = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>📅 Будущие — Мой органайзер</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f6f2fd;
+            padding: 16px;
+            min-height: 100vh;
+            color: #4a3f5e;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .container { max-width: 800px; margin: 0 auto; }
+        .header {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 16px 24px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        }
+        .header h1 { font-size: 22px; color: #4a3f5e; }
+        .header .user { color: #8b7bb5; font-size: 14px; }
+        .header .btn-back {
+            background: #ede5f5;
+            color: #4a3f5e;
+            border: none;
+            padding: 8px 18px;
+            border-radius: 8px;
+            text-decoration: none;
+            cursor: pointer;
+            touch-action: manipulation;
+        }
+        .header .btn-back:hover { background: #e0d5ec; }
+        
+        .date-group {
+            margin-bottom: 20px;
+        }
+        .date-group .date-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #4a3f5e;
+            margin-bottom: 10px;
+            padding-bottom: 6px;
+            border-bottom: 2px solid #ede5f5;
+        }
+        .task-item {
+            background: #faf5ff;
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
+            border-left: 4px solid #8e44ad;
+        }
+        .task-item .task-info {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .task-item .task-info .task-duration {
+            font-size: 11px;
+            color: #b5a7cc;
+            background: #ede5f5;
+            padding: 1px 8px;
+            border-radius: 10px;
+        }
+        .task-item .task-info .comment-badge {
+            font-size: 11px;
+            color: #8b7bb5;
+            background: #ede5f5;
+            padding: 1px 8px;
+            border-radius: 10px;
+            cursor: help;
+        }
+        .task-item .task-actions button {
+            background: none;
+            border: none;
+            color: #c5b8d8;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 4px 6px;
+            border-radius: 6px;
+            touch-action: manipulation;
+        }
+        .task-item .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
+        
+        .empty-list { color: #c5b8d8; text-align: center; padding: 30px; }
+        
+        @media (max-width: 600px) {
+            .header { flex-direction: column; text-align: center; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>📅 Будущие</h1>
+        <div>
+            <span class="user">👤 {{ username }}</span>
+            <a href="/" class="btn-back" style="margin-left:12px;">← Назад</a>
+            <a href="/logout" class="btn-back" style="margin-left:8px; background:#d5c8e6; color:#4a3f5e;">Выйти</a>
+        </div>
+    </div>
+    
+    <div id="futureContainer">
+        {% if sorted_dates %}
+            {% for date_key in sorted_dates %}
+            <div class="date-group">
+                <div class="date-title">{{ format_date_with_weekday(date_key) }}</div>
+                {% for task in tasks_by_date[date_key] %}
+                <div class="task-item" data-task-id="{{ task.id }}">
+                    <div class="task-info">
+                        <span>{{ task.title }}</span>
+                        {% if task.duration %}
+                        <span class="task-duration">⏱️ {{ task.duration }}</span>
+                        {% endif %}
+                        {% if task.comment and task.comment != '' %}
+                        <span class="comment-badge" title="{{ task.comment }}">💬</span>
+                        {% endif %}
+                    </div>
+                    <div class="task-actions">
+                        <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
+                        <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+            {% endfor %}
+        {% else %}
+            <div class="empty-list">📭 Нет задач на будущие даты</div>
+        {% endif %}
+    </div>
+</div>
+
+<script>
+    document.querySelectorAll('.done-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const taskId = this.dataset.taskId;
+            fetch(`/api/task/${taskId}/done`, { method: 'POST' })
+                .then(() => location.reload());
+        });
+    });
+    
+    document.querySelectorAll('.delete-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const taskId = this.dataset.taskId;
+            if (confirm('Удалить задачу?')) {
+                fetch(`/api/task/${taskId}`, { method: 'DELETE' })
+                    .then(() => location.reload());
+            }
+        });
+    });
+</script>
+</body>
+</html>
+'''
+
+QUARTER_PAGE = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ quarter_name }} {{ quarter_year }} — Мой органайзер</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f6f2fd;
+            padding: 16px;
+            min-height: 100vh;
+            color: #4a3f5e;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .container { max-width: 900px; margin: 0 auto; }
+        .header {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 16px 24px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        }
+        .header h1 { font-size: 22px; color: #4a3f5e; }
+        .header .user { color: #8b7bb5; font-size: 14px; }
+        .header .btn-back {
+            background: #ede5f5;
+            color: #4a3f5e;
+            border: none;
+            padding: 8px 18px;
+            border-radius: 8px;
+            text-decoration: none;
+            cursor: pointer;
+            touch-action: manipulation;
+        }
+        .header .btn-back:hover { background: #e0d5ec; }
+        
+        .quarter-nav {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .quarter-nav .q-link {
+            padding: 8px 16px;
+            border-radius: 8px;
+            text-decoration: none;
+            background: #fcfaff;
+            color: #4a3f5e;
+            border: 1.5px solid #ede5f5;
+            font-size: 14px;
+            transition: 0.2s;
+            touch-action: manipulation;
+        }
+        .quarter-nav .q-link:hover { border-color: #8b7bb5; background: #f8f2fd; }
+        .quarter-nav .q-link.current {
+            background: #8b7bb5;
+            color: white;
+            border-color: #8b7bb5;
+        }
+        .quarter-nav .q-link.past { opacity: 0.6; }
+        
+        .add-sphere {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 16px 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .add-sphere input {
+            flex: 1;
+            padding: 10px 14px;
+            border: 1.5px solid #ede5f5;
+            border-radius: 8px;
+            font-size: 14px;
+            min-width: 150px;
+            background: white;
+            color: #4a3f5e;
+            -webkit-appearance: none;
+        }
+        .add-sphere input:focus { outline: none; border-color: #8b7bb5; }
+        .add-sphere button {
+            background: #8b7bb5;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 24px;
+            cursor: pointer;
+            font-size: 14px;
+            touch-action: manipulation;
+        }
+        .add-sphere button:hover { background: #7a69a4; }
+        
+        .sphere {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 18px 20px;
+            margin-bottom: 16px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+            border-left: 5px solid #d5c8e6;
+        }
+        .sphere-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .sphere-header h3 { font-size: 18px; color: #4a3f5e; }
+        .sphere-header .sphere-actions {
+            display: flex;
+            gap: 6px;
+        }
+        .sphere-header .sphere-actions button {
+            background: none;
+            border: none;
+            color: #b5a7cc;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 4px 8px;
+            border-radius: 6px;
+            transition: 0.2s;
+            touch-action: manipulation;
+        }
+        .sphere-header .sphere-actions button:hover { background: #ede5f5; color: #8b7bb5; }
+        
+        .task-item {
+            background: #faf5ff;
+            border-radius: 8px;
+            padding: 10px 14px;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
+        }
+        .task-item .task-info { display: flex; align-items: center; gap: 10px; }
+        .task-item .task-info .comment-badge {
+            font-size: 11px;
+            color: #8b7bb5;
+            background: #ede5f5;
+            padding: 1px 8px;
+            border-radius: 10px;
+            cursor: help;
+        }
+        .task-item .task-actions button {
+            background: none;
+            border: none;
+            color: #c5b8d8;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 4px 6px;
+            border-radius: 6px;
+            touch-action: manipulation;
+        }
+        .task-item .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
+        
+        .add-task-form {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+            flex-wrap: wrap;
+        }
+        .add-task-form input {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1.5px solid #ede5f5;
+            border-radius: 8px;
+            font-size: 13px;
+            min-width: 120px;
+            background: white;
+            color: #4a3f5e;
+            -webkit-appearance: none;
+        }
+        .add-task-form input:focus { outline: none; border-color: #8b7bb5; }
+        .add-task-form button {
+            background: #8b7bb5;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 8px 16px;
+            cursor: pointer;
+            font-size: 13px;
+            touch-action: manipulation;
+        }
+        .add-task-form button:hover { background: #7a69a4; }
+        
+        .empty-sphere { color: #c5b8d8; font-style: italic; padding: 10px 0; }
+        
+        @media (max-width: 600px) {
+            .header { flex-direction: column; text-align: center; }
+            .add-sphere { flex-direction: column; }
+            .add-sphere input { width: 100%; }
+            .quarter-nav { justify-content: center; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>🗓️ {{ quarter_name }} {{ quarter_year }}</h1>
+        <div>
+            <span class="user">👤 {{ username }}</span>
+            <a href="/" class="btn-back" style="margin-left:12px;">← Назад</a>
+            <a href="/logout" class="btn-back" style="margin-left:8px; background:#d5c8e6; color:#4a3f5e;">Выйти</a>
+        </div>
+    </div>
+    
+    <div class="quarter-nav">
+        {% for q in quarters %}
+        <a href="/quarter/{{ q.id }}" class="q-link 
+            {% if q.id == quarter %}current{% endif %}
+            {% if q.id != quarter and q.id < current_quarter %}past{% endif %}
+        ">
+            {{ q.name }} {{ q.year }}
+            {% if q.current %}⭐{% endif %}
+        </a>
+        {% endfor %}
+    </div>
+    
+    <div class="add-sphere">
+        <input type="text" id="sphereName" placeholder="Название сферы (например: Работа, Здоровье...)" autofocus>
+        <button id="addSphereBtn">➕ Добавить сферу</button>
+    </div>
+    
+    <div id="spheresContainer">
+        {% for sphere in spheres %}
+        <div class="sphere" data-sphere-id="{{ sphere.id }}" data-sphere-name="{{ sphere.name }}">
+            <div class="sphere-header">
+                <h3>📂 {{ sphere.name }}</h3>
+                <div class="sphere-actions">
+                    <button class="edit-sphere-btn" data-sphere-id="{{ sphere.id }}" data-sphere-name="{{ sphere.name }}" title="Переименовать">✏️</button>
+                    <button class="delete-sphere-btn" data-sphere-id="{{ sphere.id }}" data-sphere-name="{{ sphere.name }}" title="Удалить">🗑️</button>
+                </div>
+            </div>
+            <div id="tasks-{{ loop.index }}">
+                {% for task in sphere.tasks %}
+                <div class="task-item" data-task-id="{{ task.id }}">
+                    <div class="task-info">
+                        <span>{{ task.title }}</span>
+                        {% if task.duration %}
+                        <span style="font-size:11px; color:#b5a7cc; background:#ede5f5; padding:1px 8px; border-radius:10px;">⏱️ {{ task.duration }}</span>
+                        {% endif %}
+                        {% if task.comment and task.comment != '' %}
+                        <span class="comment-badge" title="{{ task.comment }}">💬</span>
+                        {% endif %}
+                    </div>
+                    <div class="task-actions">
+                        <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
+                        <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
+                    </div>
+                </div>
+                {% else %}
+                <div class="empty-sphere">Нет задач в этой сфере</div>
+                {% endfor %}
+            </div>
+            <div class="add-task-form">
+                <input type="text" class="taskInput" placeholder="Новая задача..." autofocus>
+                <button class="addTaskBtn" data-sphere="{{ sphere.name }}">➕ Добавить задачу</button>
+            </div>
+        </div>
+        {% else %}
+        <div style="text-align:center; padding:40px; color:#c5b8d8; background:#fcfaff; border-radius:12px;">
+            <p style="font-size:18px;">📭 Нет сфер</p>
+            <p style="font-size:14px;">Добавьте первую сферу выше</p>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+
+<script>
+    const quarter = '{{ quarter }}';
+    
+    document.getElementById('addSphereBtn').addEventListener('click', function() {
+        const name = document.getElementById('sphereName').value.trim();
+        if (!name) { alert('Введите название сферы'); return; }
+        
+        fetch('/api/sphere', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, quarter })
+        })
+        .then(res => res.json())
+        .then(() => location.reload());
+    });
+    
+    document.getElementById('sphereName').addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') document.getElementById('addSphereBtn').click();
+    });
+    
+    document.querySelectorAll('.edit-sphere-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const sphereId = this.dataset.sphereId;
+            const sphereName = this.dataset.sphereName;
+            const newName = prompt('Введите новое название сферы:', sphereName);
+            if (newName && newName.trim()) {
+                fetch(`/api/sphere/${sphereId}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: newName.trim() })
+                })
+                .then(res => res.json())
+                .then(() => location.reload());
+            }
+        });
+    });
+    
+    document.querySelectorAll('.delete-sphere-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const sphereId = this.dataset.sphereId;
+            const sphereName = this.dataset.sphereName;
+            if (confirm(`Удалить сферу "${sphereName}"? Задачи переедут в "Распределить".`)) {
+                fetch(`/api/sphere/${sphereId}`, { method: 'DELETE' })
+                    .then(() => location.reload());
+            }
+        });
+    });
+    
+    document.querySelectorAll('.addTaskBtn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const sphere = this.dataset.sphere;
+            const container = this.closest('.sphere');
+            const input = container.querySelector('.taskInput');
+            const title = input.value.trim();
+            
+            if (!title) { alert('Введите название задачи'); return; }
+            
+            fetch('/api/task/quarter', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title, sphere, quarter, date: '' })
+            })
+            .then(res => res.json())
+            .then(() => location.reload());
+        });
+    });
+    
+    document.querySelectorAll('.taskInput').forEach(input => {
+        input.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                this.closest('.add-task-form').querySelector('.addTaskBtn').click();
+            }
+        });
+    });
+    
+    document.querySelectorAll('.done-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const taskId = this.dataset.taskId;
+            fetch(`/api/task/${taskId}/done`, { method: 'POST' })
+                .then(() => location.reload());
+        });
+    });
+    
+    document.querySelectorAll('.delete-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const taskId = this.dataset.taskId;
+            if (confirm('Удалить задачу?')) {
+                fetch(`/api/task/${taskId}`, { method: 'DELETE' })
+                    .then(() => location.reload());
+            }
+        });
+    });
+</script>
+</body>
+</html>
+'''
+
+LATER_PAGE = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🕰️ Позже — Мой органайзер</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f6f2fd;
+            padding: 16px;
+            min-height: 100vh;
+            color: #4a3f5e;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .header {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 16px 24px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        }
+        .header h1 { font-size: 22px; color: #4a3f5e; }
+        .header .user { color: #8b7bb5; font-size: 14px; }
+        .header .btn-back {
+            background: #ede5f5;
+            color: #4a3f5e;
+            border: none;
+            padding: 8px 18px;
+            border-radius: 8px;
+            text-decoration: none;
+            cursor: pointer;
+            touch-action: manipulation;
+        }
+        .header .btn-back:hover { background: #e0d5ec; }
+        
+        .later-layout {
+            display: flex;
+            gap: 20px;
+            align-items: flex-start;
+        }
+        
+        .left-panel {
+            flex: 1;
+            min-width: 280px;
+        }
+        .right-panel {
+            flex: 1;
+            min-width: 280px;
+        }
+        
+        .add-task {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 16px 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .add-task input {
+            flex: 1;
+            padding: 10px 14px;
+            border: 1.5px solid #ede5f5;
+            border-radius: 8px;
+            font-size: 14px;
+            min-width: 150px;
+            background: white;
+            color: #4a3f5e;
+            -webkit-appearance: none;
+        }
+        .add-task input:focus { outline: none; border-color: #8b7bb5; }
+        .add-task button {
+            background: #8b7bb5;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 24px;
+            cursor: pointer;
+            font-size: 14px;
+            touch-action: manipulation;
+        }
+        .add-task button:hover { background: #7a69a4; }
+        
+        .task-list {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 18px 20px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        }
+        .task-item {
+            background: #faf5ff;
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
+        }
+        .task-item .task-info {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .task-item .task-info .task-duration {
+            font-size: 11px;
+            color: #b5a7cc;
+            background: #ede5f5;
+            padding: 1px 8px;
+            border-radius: 10px;
+        }
+        .task-item .task-info .comment-badge {
+            font-size: 11px;
+            color: #8b7bb5;
+            background: #ede5f5;
+            padding: 1px 8px;
+            border-radius: 10px;
+            cursor: help;
+        }
+        .task-item .task-actions button {
+            background: none;
+            border: none;
+            color: #c5b8d8;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 4px 6px;
+            border-radius: 6px;
+            touch-action: manipulation;
+        }
+        .task-item .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
+        
+        .empty-list { color: #c5b8d8; text-align: center; padding: 30px; }
+        
+        .group-section {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 18px 20px;
+            margin-bottom: 16px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        }
+        .group-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .group-header h3 { font-size: 16px; color: #4a3f5e; }
+        .group-header .delete-group {
+            background: none;
+            border: none;
+            color: #c5b8d8;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 4px 8px;
+            border-radius: 6px;
+            touch-action: manipulation;
+        }
+        .group-header .delete-group:hover { background: #ede5f5; color: #e74c3c; }
+        
+        .add-group {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 16px 20px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        .add-group input {
+            flex: 1;
+            padding: 10px 14px;
+            border: 1.5px solid #ede5f5;
+            border-radius: 8px;
+            font-size: 14px;
+            min-width: 150px;
+            background: white;
+            color: #4a3f5e;
+            -webkit-appearance: none;
+        }
+        .add-group input:focus { outline: none; border-color: #8b7bb5; }
+        .add-group button {
+            background: #8b7bb5;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 24px;
+            cursor: pointer;
+            font-size: 14px;
+            touch-action: manipulation;
+        }
+        .add-group button:hover { background: #7a69a4; }
+        
+        .group-task-item {
+            background: #faf5ff;
+            border-radius: 8px;
+            padding: 8px 14px;
+            margin-bottom: 6px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 6px;
+            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
+            font-size: 14px;
+        }
+        .group-task-item .task-actions button {
+            background: none;
+            border: none;
+            color: #c5b8d8;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 4px 6px;
+            border-radius: 6px;
+            touch-action: manipulation;
+        }
+        .group-task-item .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
+        
+        .add-group-task {
+            display: flex;
+            gap: 6px;
+            margin-top: 8px;
+            flex-wrap: wrap;
+        }
+        .add-group-task input {
+            flex: 1;
+            padding: 6px 10px;
+            border: 1.5px solid #ede5f5;
+            border-radius: 6px;
+            font-size: 13px;
+            background: white;
+            color: #4a3f5e;
+            min-width: 100px;
+            -webkit-appearance: none;
+        }
+        .add-group-task input:focus { outline: none; border-color: #8b7bb5; }
+        .add-group-task button {
+            background: #8b7bb5;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            padding: 6px 14px;
+            cursor: pointer;
+            font-size: 13px;
+            touch-action: manipulation;
+        }
+        .add-group-task button:hover { background: #7a69a4; }
+        
+        .move-to-group-btn {
+            background: none;
+            border: none;
+            color: #b5a7cc;
+            cursor: pointer;
+            font-size: 16px;
+            padding: 4px 8px;
+            touch-action: manipulation;
+        }
+        .move-to-group-btn:hover { color: #8b7bb5; }
+        
+        .group-task-list {
+            margin-top: 6px;
+        }
+        
+        @media (max-width: 900px) {
+            .later-layout { flex-direction: column; }
+            .left-panel, .right-panel { flex: 1 1 100%; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>🕰️ Позже</h1>
+        <div>
+            <span class="user">👤 {{ username }}</span>
+            <a href="/" class="btn-back" style="margin-left:12px;">← Назад</a>
+            <a href="/logout" class="btn-back" style="margin-left:8px; background:#d5c8e6; color:#4a3f5e;">Выйти</a>
+        </div>
+    </div>
+    
+    <div class="later-layout">
+        <div class="left-panel">
+            <div class="add-task">
+                <input type="text" id="laterTaskInput" placeholder="Новая задача в общий список..." autofocus>
+                <button id="addLaterBtn">➕ Добавить</button>
+            </div>
+            <div class="task-list" id="laterTasks">
+                {% for task in tasks %}
+                <div class="task-item" data-task-id="{{ task.id }}">
+                    <div class="task-info">
+                        <span>{{ task.title }}</span>
+                        {% if task.duration %}
+                        <span class="task-duration">⏱️ {{ task.duration }}</span>
+                        {% endif %}
+                        {% if task.comment and task.comment != '' %}
+                        <span class="comment-badge" title="{{ task.comment }}">💬</span>
+                        {% endif %}
+                    </div>
+                    <div class="task-actions">
+                        <button class="move-to-group-btn" data-task-id="{{ task.id }}" title="Переместить в группу">📂</button>
+                        <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
+                        <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
+                    </div>
+                </div>
+                {% else %}
+                <div class="empty-list">📭 Здесь пока пусто. Добавьте задачи в общий список.</div>
+                {% endfor %}
+            </div>
+        </div>
+        
+        <div class="right-panel">
+            <div class="add-group">
+                <input type="text" id="newGroupInput" placeholder="Название группы (например: Идеи, Проекты...)">
+                <button id="addGroupBtn">➕ Создать группу</button>
+            </div>
+            
+            {% for group in groups %}
+            <div class="group-section" data-group="{{ group.name }}">
+                <div class="group-header">
+                    <h3>📂 {{ group.name }}</h3>
+                    <button class="delete-group" data-group-id="{{ group.id }}" data-group-name="{{ group.name }}">✕</button>
+                </div>
+                <div class="group-task-list">
+                    {% for task in group.tasks %}
+                    <div class="group-task-item" data-task-id="{{ task.id }}">
+                        <span>{{ task.title }}</span>
+                        {% if task.duration %}
+                        <span class="task-duration">⏱️ {{ task.duration }}</span>
+                        {% endif %}
+                        {% if task.comment and task.comment != '' %}
+                        <span class="comment-badge" title="{{ task.comment }}">💬</span>
+                        {% endif %}
+                        <div class="task-actions">
+                            <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
+                            <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
+                        </div>
+                    </div>
+                    {% else %}
+                    <div class="empty-list" style="padding:10px; font-size:13px;">Нет задач в этой группе</div>
+                    {% endfor %}
+                </div>
+                <div class="add-group-task">
+                    <input type="text" class="group-task-input" placeholder="Новая задача в группу...">
+                    <button class="add-group-task-btn" data-group="{{ group.name }}">➕</button>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+
+<script>
+    document.getElementById('addLaterBtn').addEventListener('click', function() {
+        const input = document.getElementById('laterTaskInput');
+        const title = input.value.trim();
+        if (!title) { alert('Введите название задачи'); return; }
+        
+        fetch('/api/task/later', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title })
+        })
+        .then(res => res.json())
+        .then(() => location.reload());
+    });
+    
+    document.getElementById('laterTaskInput').addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') document.getElementById('addLaterBtn').click();
+    });
+    
+    document.getElementById('addGroupBtn').addEventListener('click', function() {
+        const input = document.getElementById('newGroupInput');
+        const name = input.value.trim();
+        if (!name) { alert('Введите название группы'); return; }
+        
+        fetch('/api/later/group', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name })
+        })
+        .then(res => res.json())
+        .then(() => location.reload());
+    });
+    
+    document.getElementById('newGroupInput').addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') document.getElementById('addGroupBtn').click();
+    });
+    
+    document.querySelectorAll('.move-to-group-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const taskId = this.dataset.taskId;
+            const groupName = prompt('Введите название группы, куда переместить задачу:');
+            if (!groupName) return;
+            
+            fetch(`/api/task/${taskId}/move_to_later_group`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ group: groupName })
+            })
+            .then(res => res.json())
+            .then(() => location.reload());
+        });
+    });
+    
+    document.querySelectorAll('.add-group-task-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const group = this.dataset.group;
+            const container = this.closest('.group-section');
+            const input = container.querySelector('.group-task-input');
+            const title = input.value.trim();
+            if (!title) { alert('Введите название задачи'); return; }
+            
+            fetch('/api/task/later/group', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title, group })
+            })
+            .then(res => res.json())
+            .then(() => location.reload());
+        });
+    });
+    
+    document.querySelectorAll('.group-task-input').forEach(input => {
+        input.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                this.closest('.group-section').querySelector('.add-group-task-btn').click();
+            }
+        });
+    });
+    
+    document.querySelectorAll('.delete-group').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const groupId = this.dataset.groupId;
+            const groupName = this.dataset.groupName;
+            if (confirm(`Удалить группу "${groupName}"? Задачи вернутся в общий список.`)) {
+                fetch(`/api/later/group/${groupId}`, { method: 'DELETE' })
+                    .then(() => location.reload());
+            }
+        });
+    });
+    
+    document.querySelectorAll('.done-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const taskId = this.dataset.taskId;
+            fetch(`/api/task/${taskId}/done`, { method: 'POST' })
+                .then(() => location.reload());
+        });
+    });
+    
+    document.querySelectorAll('.delete-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const taskId = this.dataset.taskId;
+            if (confirm('Удалить задачу?')) {
+                fetch(`/api/task/${taskId}`, { method: 'DELETE' })
+                    .then(() => location.reload());
+            }
+        });
+    });
+</script>
+</body>
+</html>
+'''
+
+DONE_PAGE = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>✅ Готово — Мой органайзер</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f6f2fd;
+            padding: 16px;
+            min-height: 100vh;
+            color: #4a3f5e;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .container { max-width: 800px; margin: 0 auto; }
+        .header {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 16px 24px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        }
+        .header h1 { font-size: 22px; color: #4a3f5e; }
+        .header .user { color: #8b7bb5; font-size: 14px; }
+        .header .btn-back {
+            background: #ede5f5;
+            color: #4a3f5e;
+            border: none;
+            padding: 8px 18px;
+            border-radius: 8px;
+            text-decoration: none;
+            cursor: pointer;
+            touch-action: manipulation;
+        }
+        .header .btn-back:hover { background: #e0d5ec; }
+        
+        .date-group {
+            margin-bottom: 24px;
+        }
+        .date-group .date-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #4a3f5e;
+            margin-bottom: 10px;
+            padding-bottom: 6px;
+            border-bottom: 2px solid #ede5f5;
+        }
+        .task-item {
+            background: #faf5ff;
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
+            border-left: 4px solid #27ae60;
+        }
+        .task-item .task-info {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .task-item .task-info .completed-time {
+            font-size: 12px;
+            color: #b5a7cc;
+        }
+        .task-item .task-info .comment-badge {
+            font-size: 11px;
+            color: #8b7bb5;
+            background: #ede5f5;
+            padding: 1px 8px;
+            border-radius: 10px;
+            cursor: help;
+        }
+        .task-item .task-actions button {
+            background: none;
+            border: none;
+            color: #c5b8d8;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 4px 6px;
+            border-radius: 6px;
+            touch-action: manipulation;
+        }
+        .task-item .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
+        .task-item .task-actions .restore-btn:hover { color: #27ae60; }
+        
+        .empty-list { color: #c5b8d8; text-align: center; padding: 30px; }
+        
+        .info-note {
+            margin-top: 12px;
+            padding: 12px 16px;
+            background: #f0e8fa;
+            border-radius: 8px;
+            font-size: 13px;
+            color: #8b7bb5;
+            text-align: center;
+        }
+        
+        @media (max-width: 600px) {
+            .header { flex-direction: column; text-align: center; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>✅ Готово</h1>
+        <div>
+            <span class="user">👤 {{ username }}</span>
+            <a href="/" class="btn-back" style="margin-left:12px;">← Назад</a>
+            <a href="/logout" class="btn-back" style="margin-left:8px; background:#d5c8e6; color:#4a3f5e;">Выйти</a>
+        </div>
+    </div>
+    
+    <div id="doneContainer">
+        {% if sorted_dates %}
+            {% for date_key in sorted_dates %}
+            <div class="date-group">
+                <div class="date-title">{{ format_date_with_weekday(date_key) }}</div>
+                {% for task in tasks_by_date[date_key] %}
+                <div class="task-item" data-task-id="{{ task.id }}">
+                    <div class="task-info">
+                        <span>{{ task.title }}</span>
+                        {% if task.comment and task.comment != '' %}
+                        <span class="comment-badge" title="{{ task.comment }}">💬</span>
+                        {% endif %}
+                        <span class="completed-time">✅ {{ task.completed_at }}</span>
+                    </div>
+                    <div class="task-actions">
+                        <button class="restore-btn" data-task-id="{{ task.id }}" title="Восстановить">↩️</button>
+                        <button class="delete-btn" data-task-id="{{ task.id }}" title="Удалить навсегда">🗑️</button>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+            {% endfor %}
+        {% else %}
+            <div class="empty-list">📭 Здесь пока пусто. Выполненные задачи появятся здесь на 36 часов.</div>
+        {% endif %}
+    </div>
+    <div class="info-note">⏳ Задачи хранятся 36 часов, затем удаляются автоматически</div>
+</div>
+
+<script>
+    function loadDoneTasks() {
+        fetch('/api/tasks/done')
+            .then(res => res.json())
+            .then(tasks => {
+                const container = document.getElementById('doneContainer');
+                if (tasks.length === 0) {
+                    container.innerHTML = '<div class="empty-list">📭 Здесь пока пусто. Выполненные задачи появятся здесь на 36 часов.</div>';
+                    return;
+                }
+                
+                const tasksByDate = {};
+                tasks.forEach(task => {
+                    if (task.completed_at) {
+                        const dateKey = new Date(task.completed_at).toISOString().split('T')[0];
+                        if (!tasksByDate[dateKey]) tasksByDate[dateKey] = [];
+                        tasksByDate[dateKey].push(task);
+                    }
+                });
+                
+                const sortedDates = Object.keys(tasksByDate).sort((a, b) => b.localeCompare(a));
+                
+                container.innerHTML = '';
+                sortedDates.forEach(dateKey => {
+                    const dateGroup = document.createElement('div');
+                    dateGroup.className = 'date-group';
+                    dateGroup.innerHTML = `<div class="date-title">${dateKey}</div>`;
+                    
+                    tasksByDate[dateKey].forEach(task => {
+                        const item = document.createElement('div');
+                        item.className = 'task-item';
+                        item.dataset.taskId = task.id;
+                        const completedTime = task.completed_at ? new Date(task.completed_at).toLocaleString('ru-RU') : 'только что';
+                        item.innerHTML = `
+                            <div class="task-info">
+                                <span>${task.title}</span>
+                                <span class="completed-time">✅ ${completedTime}</span>
+                            </div>
+                            <div class="task-actions">
+                                <button class="restore-btn" data-task-id="${task.id}" title="Восстановить">↩️</button>
+                                <button class="delete-btn" data-task-id="${task.id}" title="Удалить навсегда">🗑️</button>
+                            </div>
+                        `;
+                        dateGroup.appendChild(item);
+                    });
+                    
+                    container.appendChild(dateGroup);
+                });
+                
+                document.querySelectorAll('.restore-btn').forEach(btn => {
+                    btn.addEventListener('click', function() {
+                        const taskId = this.dataset.taskId;
+                        fetch(`/api/task/${taskId}/restore`, { method: 'POST' })
+                            .then(() => loadDoneTasks());
+                    });
+                });
+                
+                document.querySelectorAll('.delete-btn').forEach(btn => {
+                    btn.addEventListener('click', function() {
+                        const taskId = this.dataset.taskId;
+                        if (confirm('Удалить задачу навсегда?')) {
+                            fetch(`/api/task/${taskId}`, { method: 'DELETE' })
+                                .then(() => loadDoneTasks());
+                        }
+                    });
+                });
+            });
+    }
+    
+    loadDoneTasks();
+</script>
+</body>
+</html>
+'''
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
