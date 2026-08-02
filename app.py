@@ -19,7 +19,7 @@ def get_db_connection():
     conn = psycopg2.connect(database_url)
     return conn
 
-# --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ---
+# --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ (ДОБАВЛЕНА КОЛОНКА comment) ---
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
@@ -148,7 +148,7 @@ def format_date_with_weekday(date_str):
 
 def move_overdue_tasks_to_backlog(user_id):
     """
-    ПЕРЕНАПРАВЛЕНО: переносит просроченные задачи на сегодня,
+    ИСПРАВЛЕНО: переносит просроченные задачи на сегодня,
     СОХРАНЯЯ их категорию (не сбрасывает в 'later').
     """
     conn = get_db_connection()
@@ -156,6 +156,8 @@ def move_overdue_tasks_to_backlog(user_id):
     today = datetime.now().date()
     today_str = today.strftime('%Y-%m-%d')
     
+    # Переносим ТОЛЬКО просроченные задачи (дата < сегодня)
+    # Сохраняем категорию (не сбрасываем в 'later')
     cur.execute('''
         UPDATE tasks 
         SET date = %s
@@ -166,9 +168,9 @@ def move_overdue_tasks_to_backlog(user_id):
     conn.commit()
     conn.close()
 
-# Функция move_tasks_to_next_day УДАЛЕНА - задачи НЕ переносятся на завтра автоматически
+# Функция move_tasks_to_next_day УДАЛЕНА - перенос происходит через done_task для daily задач
 
-# --- ГЛАВНАЯ СТРАНИЦА (ИСПРАВЛЕНА - работает переключение дат) ---
+# --- ГЛАВНАЯ СТРАНИЦА (С ПЕРЕКЛЮЧЕНИЕМ ДАТ) ---
 @app.route('/')
 def index():
     if 'user_id' not in session:
@@ -176,6 +178,7 @@ def index():
     
     user_id = session['user_id']
     
+    # Переносим просроченные задачи на сегодня (сохраняя категории)
     move_overdue_tasks_to_backlog(user_id)
     
     conn = get_db_connection()
@@ -620,7 +623,7 @@ def add_task():
     
     return jsonify({'success': True, 'message': 'Task added'})
 
-# --- API: Обновление задачи ---
+# --- API: Обновление задачи (ИСПРАВЛЕНО - comment теперь существует) ---
 @app.route('/api/task/<int:task_id>', methods=['PUT'])
 def update_task(task_id):
     if 'user_id' not in session:
@@ -681,7 +684,7 @@ def get_task(task_id):
     
     return jsonify(dict(task))
 
-# --- API: Выполнение задачи ---
+# --- API: Выполнение задачи (ИСПРАВЛЕНО - daily задачи переносятся, а не дублируются) ---
 @app.route('/api/task/<int:task_id>/done', methods=['POST'])
 def done_task(task_id):
     if 'user_id' not in session:
@@ -697,9 +700,13 @@ def done_task(task_id):
         conn.close()
         return jsonify({'error': 'Task not found'}), 404
     
-    cur.execute('UPDATE tasks SET status = %s, completed_at = %s WHERE id = %s', ('done', datetime.now(), task_id))
+    # Если задача НЕ повторяющаяся - просто отмечаем как выполненную
+    if task['repeat_type'] == 'none':
+        cur.execute('UPDATE tasks SET status = %s, completed_at = %s WHERE id = %s', ('done', datetime.now(), task_id))
     
-    if task['repeat_type'] == 'daily':
+    # Если задача ЕЖЕДНЕВНАЯ - переносим на завтра, а не создаем новую
+    elif task['repeat_type'] == 'daily':
+        # Вычисляем следующую дату
         if task['date'] and task['date'] != '':
             try:
                 current_date = datetime.strptime(task['date'], '%Y-%m-%d').date()
@@ -709,10 +716,16 @@ def done_task(task_id):
         else:
             new_date = datetime.now().date() + timedelta(days=1)
         
+        # Обновляем существующую задачу: переносим на следующий день, оставляем active
         cur.execute('''
-            INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status, quarter, sphere, later_group, sphere_id, comment)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (task['user_id'], task['title'], task['category'], new_date.strftime('%Y-%m-%d'), task.get('duration', ''), task['repeat_type'], task['repeat_day'], 'active', task.get('quarter'), task.get('sphere'), task.get('later_group'), task.get('sphere_id'), task.get('comment', '')))
+            UPDATE tasks SET 
+                date = %s,
+                status = 'active',
+                completed_at = NULL
+            WHERE id = %s
+        ''', (new_date.strftime('%Y-%m-%d'), task_id))
+    
+    # Если задача ЕЖЕНЕДЕЛЬНАЯ - переносим на следующую неделю
     elif task['repeat_type'] == 'weekly' and task['repeat_day'] is not None:
         if task['date'] and task['date'] != '':
             try:
@@ -727,10 +740,14 @@ def done_task(task_id):
             days_ahead += 7
         new_date = current_date + timedelta(days=days_ahead)
         
+        # Обновляем существующую задачу
         cur.execute('''
-            INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status, quarter, sphere, later_group, sphere_id, comment)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (task['user_id'], task['title'], task['category'], new_date.strftime('%Y-%m-%d'), task.get('duration', ''), task['repeat_type'], task['repeat_day'], 'active', task.get('quarter'), task.get('sphere'), task.get('later_group'), task.get('sphere_id'), task.get('comment', '')))
+            UPDATE tasks SET 
+                date = %s,
+                status = 'active',
+                completed_at = NULL
+            WHERE id = %s
+        ''', (new_date.strftime('%Y-%m-%d'), task_id))
     
     conn.commit()
     conn.close()
