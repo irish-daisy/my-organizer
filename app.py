@@ -168,7 +168,7 @@ def move_overdue_tasks_to_backlog(user_id):
 
 # Функция move_tasks_to_next_day УДАЛЕНА - задачи НЕ переносятся на завтра автоматически
 
-# --- ГЛАВНАЯ СТРАНИЦА ---
+# --- ГЛАВНАЯ СТРАНИЦА (ИСПРАВЛЕНА - работает переключение дат) ---
 @app.route('/')
 def index():
     if 'user_id' not in session:
@@ -181,8 +181,9 @@ def index():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    view_date_str = datetime.now().strftime('%Y-%m-%d')
-    view_date = datetime.now().date()
+    # Берем дату из URL или сегодня
+    view_date_str = request.args.get('date', datetime.now().strftime('%Y-%m-%d'))
+    view_date = datetime.strptime(view_date_str, '%Y-%m-%d').date()
     
     cur.execute('''
         SELECT * FROM tasks 
@@ -215,7 +216,7 @@ def index():
     is_today = view_date == today
     is_tomorrow = view_date == today + timedelta(days=1)
     
-    date_label = format_date_with_weekday(view_date.strftime('%Y-%m-%d'))
+    date_label = format_date_with_weekday(view_date_str)
     
     return render_template_string(MAIN_PAGE, 
                                    categories=categories,
@@ -1191,6 +1192,7 @@ MAIN_PAGE = '''
             border-radius: 8px;
             transition: 0.2s;
             touch-action: manipulation;
+            text-decoration: none;
         }
         .date-nav .nav-btn:hover { background: #ede5f5; }
         .date-nav .date-label {
@@ -2358,6 +2360,17 @@ MAIN_PAGE = '''
     
     document.getElementById('cancelMoveBtn').addEventListener('click', () => {
         document.getElementById('moveModal').classList.remove('open');
+    });
+    
+    // Обработка кликов по кнопкам навигации для переключения дат
+    document.querySelectorAll('.nav-btn').forEach(btn => {
+        btn.addEventListener('click', function(e) {
+            e.preventDefault();
+            const url = this.getAttribute('href');
+            if (url) {
+                window.location.href = url;
+            }
+        });
     });
     
     loadTasks();
