@@ -19,7 +19,7 @@ def get_db_connection():
     conn = psycopg2.connect(database_url)
     return conn
 
-# --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ (ДОБАВЛЕНА КОЛОНКА comment) ---
+# --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ (ДОБАВЛЕНЫ comment И default_category) ---
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
@@ -40,6 +40,7 @@ def init_db():
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             title TEXT NOT NULL,
             category TEXT DEFAULT 'later',
+            default_category TEXT DEFAULT 'personal',
             date TEXT,
             duration TEXT,
             repeat_type TEXT DEFAULT 'none',
@@ -148,15 +149,15 @@ def format_date_with_weekday(date_str):
 
 def move_overdue_tasks_to_backlog(user_id):
     """
-    ИСПРАВЛЕНО: переносит просроченные задачи на сегодня,
-    СОХРАНЯЯ их категорию (не сбрасывает в 'later').
+    Переносит ВСЕ невыполненные просроченные задачи на сегодня.
+    Сохраняет категорию. Работает и для одноразовых, и для ежедневных задач.
     """
     conn = get_db_connection()
     cur = conn.cursor()
     today = datetime.now().date()
     today_str = today.strftime('%Y-%m-%d')
     
-    # Переносим ТОЛЬКО просроченные задачи (дата < сегодня)
+    # Переносим ВСЕ просроченные задачи (date < сегодня) на сегодня
     # Сохраняем категорию (не сбрасываем в 'later')
     cur.execute('''
         UPDATE tasks 
@@ -167,8 +168,6 @@ def move_overdue_tasks_to_backlog(user_id):
     
     conn.commit()
     conn.close()
-
-# Функция move_tasks_to_next_day УДАЛЕНА - перенос происходит через done_task для daily задач
 
 # --- ГЛАВНАЯ СТРАНИЦА (С ПЕРЕКЛЮЧЕНИЕМ ДАТ) ---
 @app.route('/')
@@ -345,7 +344,7 @@ def later_page():
                                    groups=groups,
                                    username=session.get('username', 'Пользователь'))
 
-# --- СТРАНИЦА "ГОТОВО" ---
+# --- СТРАНИЦА "ГОТОВО" (ИСПРАВЛЕНА) ---
 @app.route('/done')
 def done_page():
     if 'user_id' not in session:
@@ -395,9 +394,9 @@ def add_later_task():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute('''
-        INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, 'later', '', '', 'none', None, 'active'))
+        INSERT INTO tasks (user_id, title, category, default_category, date, duration, repeat_type, repeat_day, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, 'later', 'later', '', '', 'none', None, 'active'))
     conn.commit()
     conn.close()
     
@@ -439,9 +438,9 @@ def add_task_to_later_group():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute('''
-        INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status, later_group)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, 'later', '', '', 'none', None, 'active', group))
+        INSERT INTO tasks (user_id, title, category, default_category, date, duration, repeat_type, repeat_day, status, later_group)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, 'later', 'later', '', '', 'none', None, 'active', group))
     conn.commit()
     conn.close()
     
@@ -563,15 +562,15 @@ def add_quarter_task():
     sphere_id = sphere_result[0] if sphere_result else None
     
     cur.execute('''
-        INSERT INTO tasks (user_id, title, category, date, duration, status, quarter, sphere, sphere_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, 'later', '', '', 'active', quarter, sphere, sphere_id))
+        INSERT INTO tasks (user_id, title, category, default_category, date, duration, status, quarter, sphere, sphere_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, 'later', 'later', '', '', 'active', quarter, sphere, sphere_id))
     conn.commit()
     conn.close()
     
     return jsonify({'success': True, 'message': 'Task added to quarter'})
 
-# --- API: Добавить задачу напрямую в категорию ---
+# --- API: Добавить задачу напрямую в категорию (С ОБНОВЛЕНИЕМ default_category) ---
 @app.route('/api/task/direct', methods=['POST'])
 def add_direct_task():
     if 'user_id' not in session:
@@ -592,9 +591,9 @@ def add_direct_task():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute('''
-        INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status, comment)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, category, date, duration, repeat_type, repeat_day, 'active', comment))
+        INSERT INTO tasks (user_id, title, category, default_category, date, duration, repeat_type, repeat_day, status, comment)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, category, category, date, duration, repeat_type, repeat_day, 'active', comment))
     conn.commit()
     conn.close()
     
@@ -615,15 +614,15 @@ def add_task():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute('''
-        INSERT INTO tasks (user_id, title, category, date, duration, repeat_type, repeat_day, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, 'later', '', '', 'none', None, 'active'))
+        INSERT INTO tasks (user_id, title, category, default_category, date, duration, repeat_type, repeat_day, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, 'later', 'later', '', '', 'none', None, 'active'))
     conn.commit()
     conn.close()
     
     return jsonify({'success': True, 'message': 'Task added'})
 
-# --- API: Обновление задачи (ИСПРАВЛЕНО - comment теперь существует) ---
+# --- API: Обновление задачи ---
 @app.route('/api/task/<int:task_id>', methods=['PUT'])
 def update_task(task_id):
     if 'user_id' not in session:
@@ -643,11 +642,26 @@ def update_task(task_id):
     
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('''
-        UPDATE tasks SET 
-            title = %s, category = %s, date = %s, duration = %s, repeat_type = %s, repeat_day = %s, comment = %s
-        WHERE id = %s AND user_id = %s
-    ''', (title, category, date, duration, repeat_type, repeat_day, comment, task_id, session['user_id']))
+    
+    # Если задача ежедневная, обновляем и default_category
+    cur.execute('SELECT repeat_type FROM tasks WHERE id = %s AND user_id = %s', (task_id, session['user_id']))
+    task = cur.fetchone()
+    
+    if task and task[0] == 'daily':
+        cur.execute('''
+            UPDATE tasks SET 
+                title = %s, category = %s, default_category = %s, date = %s, duration = %s, 
+                repeat_type = %s, repeat_day = %s, comment = %s
+            WHERE id = %s AND user_id = %s
+        ''', (title, category, category, date, duration, repeat_type, repeat_day, comment, task_id, session['user_id']))
+    else:
+        cur.execute('''
+            UPDATE tasks SET 
+                title = %s, category = %s, date = %s, duration = %s, 
+                repeat_type = %s, repeat_day = %s, comment = %s
+            WHERE id = %s AND user_id = %s
+        ''', (title, category, date, duration, repeat_type, repeat_day, comment, task_id, session['user_id']))
+    
     conn.commit()
     conn.close()
     
@@ -684,7 +698,7 @@ def get_task(task_id):
     
     return jsonify(dict(task))
 
-# --- API: Выполнение задачи (ИСПРАВЛЕНО - daily задачи переносятся, а не дублируются) ---
+# --- API: Выполнение задачи (ИСПРАВЛЕНО - создает запись в "Готово") ---
 @app.route('/api/task/<int:task_id>/done', methods=['POST'])
 def done_task(task_id):
     if 'user_id' not in session:
@@ -704,7 +718,7 @@ def done_task(task_id):
     if task['repeat_type'] == 'none':
         cur.execute('UPDATE tasks SET status = %s, completed_at = %s WHERE id = %s', ('done', datetime.now(), task_id))
     
-    # Если задача ЕЖЕДНЕВНАЯ - переносим на завтра, а не создаем новую
+    # Если задача ЕЖЕДНЕВНАЯ - создаем запись в "Готово" И переносим на завтра
     elif task['repeat_type'] == 'daily':
         # Вычисляем следующую дату
         if task['date'] and task['date'] != '':
@@ -716,16 +730,31 @@ def done_task(task_id):
         else:
             new_date = datetime.now().date() + timedelta(days=1)
         
-        # Обновляем существующую задачу: переносим на следующий день, оставляем active
+        # Получаем default_category
+        default_cat = task.get('default_category') or 'personal'
+        
+        # 1. СОЗДАЕМ КОПИЮ в "Готово" (как выполненную)
+        cur.execute('''
+            INSERT INTO tasks (user_id, title, category, default_category, date, duration, 
+                               repeat_type, repeat_day, status, quarter, sphere, later_group, 
+                               sphere_id, completed_at, comment)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ''', (task['user_id'], task['title'], task['category'], task['default_category'],
+              task['date'], task['duration'], 'none', None, 'done', 
+              task['quarter'], task['sphere'], task['later_group'], 
+              task['sphere_id'], datetime.now(), task['comment']))
+        
+        # 2. ОБНОВЛЯЕМ исходную задачу - переносим на завтра и возвращаем в родной блок
         cur.execute('''
             UPDATE tasks SET 
                 date = %s,
                 status = 'active',
-                completed_at = NULL
+                completed_at = NULL,
+                category = %s
             WHERE id = %s
-        ''', (new_date.strftime('%Y-%m-%d'), task_id))
+        ''', (new_date.strftime('%Y-%m-%d'), default_cat, task_id))
     
-    # Если задача ЕЖЕНЕДЕЛЬНАЯ - переносим на следующую неделю
+    # Если задача ЕЖЕНЕДЕЛЬНАЯ
     elif task['repeat_type'] == 'weekly' and task['repeat_day'] is not None:
         if task['date'] and task['date'] != '':
             try:
@@ -740,14 +769,28 @@ def done_task(task_id):
             days_ahead += 7
         new_date = current_date + timedelta(days=days_ahead)
         
-        # Обновляем существующую задачу
+        default_cat = task.get('default_category') or 'personal'
+        
+        # 1. СОЗДАЕМ КОПИЮ в "Готово"
+        cur.execute('''
+            INSERT INTO tasks (user_id, title, category, default_category, date, duration, 
+                               repeat_type, repeat_day, status, quarter, sphere, later_group, 
+                               sphere_id, completed_at, comment)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ''', (task['user_id'], task['title'], task['category'], task['default_category'],
+              task['date'], task['duration'], 'none', None, 'done', 
+              task['quarter'], task['sphere'], task['later_group'], 
+              task['sphere_id'], datetime.now(), task['comment']))
+        
+        # 2. ОБНОВЛЯЕМ исходную задачу
         cur.execute('''
             UPDATE tasks SET 
                 date = %s,
                 status = 'active',
-                completed_at = NULL
+                completed_at = NULL,
+                category = %s
             WHERE id = %s
-        ''', (new_date.strftime('%Y-%m-%d'), task_id))
+        ''', (new_date.strftime('%Y-%m-%d'), default_cat, task_id))
     
     conn.commit()
     conn.close()
@@ -792,7 +835,7 @@ def get_done_tasks():
     
     return jsonify(result)
 
-# --- API: Переместить задачу из бэклога в категорию ---
+# --- API: Переместить задачу из бэклога в категорию (С СОХРАНЕНИЕМ default_category) ---
 @app.route('/api/task/<int:task_id>/move', methods=['PUT'])
 def move_task(task_id):
     if 'user_id' not in session:
@@ -803,7 +846,18 @@ def move_task(task_id):
     
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('UPDATE tasks SET category = %s WHERE id = %s AND user_id = %s', (category, task_id, session['user_id']))
+    
+    # Если задача имеет repeat_type = 'daily', обновляем default_category
+    cur.execute('SELECT repeat_type FROM tasks WHERE id = %s AND user_id = %s', (task_id, session['user_id']))
+    task = cur.fetchone()
+    
+    if task and task[0] == 'daily':
+        cur.execute('UPDATE tasks SET category = %s, default_category = %s WHERE id = %s AND user_id = %s', 
+                   (category, category, task_id, session['user_id']))
+    else:
+        cur.execute('UPDATE tasks SET category = %s WHERE id = %s AND user_id = %s', 
+                   (category, task_id, session['user_id']))
+    
     conn.commit()
     conn.close()
     
@@ -1819,7 +1873,8 @@ MAIN_PAGE = '''
     });
     
     function initDragDrop() {
-        const taskCards = document.querySelectorAll('.task-card');
+        // Добавляем обработку для ВСЕХ task-card, включая фокус
+        const taskCards = document.querySelectorAll('.task-card, .focus-block .task-card');
         taskCards.forEach(card => {
             card.removeEventListener('dragstart', handleDragStart);
             card.removeEventListener('dragend', handleDragEnd);
@@ -3566,7 +3621,7 @@ DONE_PAGE = '''
                         {% if task.comment and task.comment != '' %}
                         <span class="comment-badge" title="{{ task.comment }}">💬</span>
                         {% endif %}
-                        <span class="completed-time">✅ {{ task.completed_at }}</span>
+                        <span class="completed-time">✅ {{ task.completed_at.strftime('%H:%M') }}</span>
                     </div>
                     <div class="task-actions">
                         <button class="restore-btn" data-task-id="{{ task.id }}" title="Восстановить">↩️</button>
@@ -3609,7 +3664,13 @@ DONE_PAGE = '''
                 sortedDates.forEach(dateKey => {
                     const dateGroup = document.createElement('div');
                     dateGroup.className = 'date-group';
-                    dateGroup.innerHTML = `<div class="date-title">${dateKey}</div>`;
+                    const dateObj = new Date(dateKey);
+                    const months = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
+                    const weekdays = ['воскресенье', 'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота'];
+                    const day = dateObj.getDate();
+                    const month = months[dateObj.getMonth()];
+                    const weekday = weekdays[dateObj.getDay()];
+                    dateGroup.innerHTML = `<div class="date-title">${day} ${month}, ${weekday}</div>`;
                     
                     tasksByDate[dateKey].forEach(task => {
                         const item = document.createElement('div');
