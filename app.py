@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 os.environ['TZ'] = 'Europe/Moscow'
 from flask import Flask, request, render_template_string, redirect, session, url_for, jsonify
@@ -365,7 +366,6 @@ def done_page():
     tasks_by_date = {}
     for task in tasks:
         if task['completed_at']:
-            # completed_at уже в МСК (хранится как UTC+3)
             date_key = task['completed_at'].strftime('%Y-%m-%d')
             if date_key not in tasks_by_date:
                 tasks_by_date[date_key] = []
@@ -647,7 +647,6 @@ def update_task(task_id):
     task = cur.fetchone()
     
     if task and task[0] != 'none':
-        # Для повторяющихся задач обновляем и default_category
         cur.execute('''
             UPDATE tasks SET 
                 title = %s, category = %s, default_category = %s, date = %s, duration = %s, 
@@ -733,7 +732,6 @@ def done_task(task_id):
         
         default_cat = task.get('default_category') or 'personal'
         
-        # 1. СОЗДАЕМ ЗАПИСЬ В "ГОТОВО"
         cur.execute('''
             INSERT INTO tasks (user_id, title, category, default_category, date, duration, 
                                repeat_type, repeat_day, status, quarter, sphere, later_group, 
@@ -744,7 +742,6 @@ def done_task(task_id):
               task['quarter'], task['sphere'], task['later_group'], 
               task['sphere_id'], now_msk, task['comment']))
         
-        # 2. ПЕРЕНОСИМ ЗАДАЧУ НА ЗАВТРА В РОДНОЙ БЛОК
         cur.execute('''
             UPDATE tasks SET 
                 date = %s,
@@ -756,7 +753,6 @@ def done_task(task_id):
     
     # Если задача ЕЖЕНЕДЕЛЬНАЯ - ИСПРАВЛЕНА ФОРМУЛА
     elif task['repeat_type'] == 'weekly' and task['repeat_day'] is not None:
-        # Получаем текущую дату
         if task['date'] and task['date'] != '':
             try:
                 current_date = datetime.strptime(task['date'], '%Y-%m-%d').date()
@@ -765,11 +761,7 @@ def done_task(task_id):
         else:
             current_date = datetime.now().date()
         
-        # Вычисляем БЛИЖАЙШИЙ указанный день недели
-        # repeat_day: 0=воскресенье, 1=понедельник, 2=вторник, ...
         target_day = task['repeat_day']
-        # Преобразуем текущий день недели в тот же формат (0=воскресенье)
-        # python weekday: 0=понедельник, 6=воскресенье
         current_weekday = (current_date.weekday() + 1) % 7
         days_ahead = target_day - current_weekday
         if days_ahead <= 0:
@@ -778,7 +770,6 @@ def done_task(task_id):
         
         default_cat = task.get('default_category') or 'personal'
         
-        # 1. СОЗДАЕМ ЗАПИСЬ В "ГОТОВО"
         cur.execute('''
             INSERT INTO tasks (user_id, title, category, default_category, date, duration, 
                                repeat_type, repeat_day, status, quarter, sphere, later_group, 
@@ -789,7 +780,6 @@ def done_task(task_id):
               task['quarter'], task['sphere'], task['later_group'], 
               task['sphere_id'], now_msk, task['comment']))
         
-        # 2. ПЕРЕНОСИМ ЗАДАЧУ НА БЛИЖАЙШИЙ УКАЗАННЫЙ ДЕНЬ НЕДЕЛИ
         cur.execute('''
             UPDATE tasks SET 
                 date = %s,
@@ -854,7 +844,6 @@ def move_task(task_id):
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # Обновляем ТОЛЬКО category, default_category НЕ ТРОГАЕМ
     cur.execute('UPDATE tasks SET category = %s WHERE id = %s AND user_id = %s', 
                (category, task_id, session['user_id']))
     
@@ -1034,7 +1023,10 @@ def logout():
     session.clear()
     return redirect('/login')
 
-# ====== HTML ШАБЛОНЫ ======
+# ====== HTML ШАБЛОНЫ (ЧАСТЬ 2) ======
+# Смотрите ЧАСТЬ 2 для HTML шаблонов
+
+# ====== HTML ШАБЛОНЫ (ЧАСТЬ 2) ======
 
 LOGIN_PAGE = '''
 <!DOCTYPE html>
@@ -2169,7 +2161,6 @@ MAIN_PAGE = '''
     function handleDragEnd(e) {
         this.classList.remove('dragging');
         document.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
-        // Сохраняем порядок после перетаскивания с задержкой
         if (dragTimeout) clearTimeout(dragTimeout);
         dragTimeout = setTimeout(saveOrder, 300);
     }
@@ -2244,9 +2235,16 @@ MAIN_PAGE = '''
             let category = '';
             if (block.id === 'focusBlock') {
                 category = 'focus';
-            } else {
-                const match = block.id.match(/block-(\w+)/);
-                if (match) category = match[1];
+            } else if (block.id === 'block-urgent') {
+                category = 'urgent';
+            } else if (block.id === 'block-work') {
+                category = 'work';
+            } else if (block.id === 'block-home') {
+                category = 'home';
+            } else if (block.id === 'block-personal') {
+                category = 'personal';
+            } else if (block.id === 'block-waiting') {
+                category = 'waiting';
             }
             if (!category) return;
             
@@ -2271,12 +2269,20 @@ MAIN_PAGE = '''
         
         if (block.id === 'focusBlock') {
             category = 'focus';
-        } else {
-            const match = block.id.match(/block-(\w+)/);
-            if (match) category = match[1];
+        } else if (block.id === 'block-urgent') {
+            category = 'urgent';
+        } else if (block.id === 'block-work') {
+            category = 'work';
+        } else if (block.id === 'block-home') {
+            category = 'home';
+        } else if (block.id === 'block-personal') {
+            category = 'personal';
+        } else if (block.id === 'block-waiting') {
+            category = 'waiting';
         }
+        if (!category) return;
         
-        const countEl = document.getElementById(`count-${category}`);
+        const countEl = document.getElementById('count-' + category);
         if (countEl) {
             countEl.textContent = cards.length;
         }
@@ -2753,7 +2759,7 @@ MAIN_PAGE = '''
 </body>
 </html>
 '''
-
+FUTURE_PAGE = '''
 <!DOCTYPE html>
 <html lang="ru">
 <head>
