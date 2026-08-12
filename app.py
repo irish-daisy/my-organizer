@@ -151,8 +151,8 @@ def format_date_with_weekday(date_str):
     return date_formatted
 
 def get_now_msk():
-    """Возвращает текущее время по МСК (UTC+3) как UTC для хранения в БД"""
-    return datetime.now(timezone.utc) + timedelta(hours=3)
+    """Возвращает текущее время в UTC для хранения в БД"""
+    return datetime.now(timezone.utc)
 
 def move_overdue_tasks_to_backlog(user_id):
     """Переносит ВСЕ невыполненные просроченные задачи на сегодня."""
@@ -366,10 +366,14 @@ def done_page():
     tasks_by_date = {}
     for task in tasks:
         if task['completed_at']:
-            date_key = task['completed_at'].strftime('%Y-%m-%d')
+            # Конвертируем UTC в МСК (UTC+3) для отображения
+            completed_msk = task['completed_at'] + timedelta(hours=3)
+            date_key = completed_msk.strftime('%Y-%m-%d')
             if date_key not in tasks_by_date:
                 tasks_by_date[date_key] = []
-            tasks_by_date[date_key].append(dict(task))
+            task_dict = dict(task)
+            task_dict['completed_at'] = completed_msk
+            tasks_by_date[date_key].append(task_dict)
     
     sorted_dates = sorted(tasks_by_date.keys(), reverse=True)
     
@@ -377,7 +381,8 @@ def done_page():
                                    tasks_by_date=tasks_by_date,
                                    sorted_dates=sorted_dates,
                                    format_date_with_weekday=format_date_with_weekday,
-                                   username=session.get('username', 'Пользователь'))
+                                   username=session.get('username', 'Пользователь'),
+                                   timedelta=timedelta)
 
 # --- API: Добавить задачу в "Позже" ---
 @app.route('/api/task/later', methods=['POST'])
@@ -713,11 +718,11 @@ def done_task(task_id):
         conn.close()
         return jsonify({'error': 'Task not found'}), 404
     
-    now_msk = get_now_msk()
+    now_utc = get_now_msk()
     
     # Если задача НЕ повторяющаяся
     if task['repeat_type'] == 'none':
-        cur.execute('UPDATE tasks SET status = %s, completed_at = %s WHERE id = %s', ('done', now_msk, task_id))
+        cur.execute('UPDATE tasks SET status = %s, completed_at = %s WHERE id = %s', ('done', now_utc, task_id))
     
     # Если задача ЕЖЕДНЕВНАЯ
     elif task['repeat_type'] == 'daily':
@@ -740,7 +745,7 @@ def done_task(task_id):
         ''', (task['user_id'], task['title'], task['category'], task['default_category'],
               task['date'], task['duration'], 'none', None, 'done', 
               task['quarter'], task['sphere'], task['later_group'], 
-              task['sphere_id'], now_msk, task['comment']))
+              task['sphere_id'], now_utc, task['comment']))
         
         cur.execute('''
             UPDATE tasks SET 
@@ -751,7 +756,7 @@ def done_task(task_id):
             WHERE id = %s
         ''', (new_date.strftime('%Y-%m-%d'), default_cat, task_id))
     
-    # Если задача ЕЖЕНЕДЕЛЬНАЯ - ИСПРАВЛЕНА ФОРМУЛА
+    # Если задача ЕЖЕНЕДЕЛЬНАЯ
     elif task['repeat_type'] == 'weekly' and task['repeat_day'] is not None:
         if task['date'] and task['date'] != '':
             try:
@@ -778,7 +783,7 @@ def done_task(task_id):
         ''', (task['user_id'], task['title'], task['category'], task['default_category'],
               task['date'], task['duration'], 'none', None, 'done', 
               task['quarter'], task['sphere'], task['later_group'], 
-              task['sphere_id'], now_msk, task['comment']))
+              task['sphere_id'], now_utc, task['comment']))
         
         cur.execute('''
             UPDATE tasks SET 
@@ -2224,6 +2229,7 @@ MAIN_PAGE = '''
         dragTimeout = setTimeout(saveOrder, 300);
     }
     
+    // ===== ИСПРАВЛЕННАЯ ФУНКЦИЯ saveOrder =====
     function saveOrder() {
         const blocks = document.querySelectorAll('.block, .focus-block, .waiting-block');
         blocks.forEach(block => {
@@ -2245,8 +2251,9 @@ MAIN_PAGE = '''
                 category = 'personal';
             } else if (block.id === 'block-waiting') {
                 category = 'waiting';
+            } else {
+                return;
             }
-            if (!category) return;
             
             const taskIds = [];
             cards.forEach(card => {
@@ -2260,6 +2267,7 @@ MAIN_PAGE = '''
             }).catch(err => console.error('Save order error:', err));
         });
     }
+    // ===== КОНЕЦ ИСПРАВЛЕННОЙ ФУНКЦИИ =====
     
     function updatePositions(block) {
         const container = block.querySelector('[id^="tasks-"]');
@@ -2759,6 +2767,7 @@ MAIN_PAGE = '''
 </body>
 </html>
 '''
+
 FUTURE_PAGE = '''
 <!DOCTYPE html>
 <html lang="ru">
