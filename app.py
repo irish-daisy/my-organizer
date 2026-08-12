@@ -7,6 +7,7 @@ import hashlib
 from datetime import datetime, timedelta
 import json
 import re
+from datetime import timezone
 
 app = Flask(__name__)
 app.secret_key = 'секретный_ключ_для_сессий_12345'
@@ -19,7 +20,7 @@ def get_db_connection():
     conn = psycopg2.connect(database_url)
     return conn
 
-# --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ (ДОБАВЛЕНЫ comment И default_category) ---
+# --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ---
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
@@ -53,7 +54,8 @@ def init_db():
             sphere_id INTEGER,
             completed_at TIMESTAMP,
             future BOOLEAN DEFAULT FALSE,
-            comment TEXT
+            comment TEXT,
+            position INTEGER DEFAULT 0
         )
     ''')
     
@@ -147,18 +149,17 @@ def format_date_with_weekday(date_str):
         return f"{date_formatted}, {weekday}"
     return date_formatted
 
+def get_now_msk():
+    """Возвращает текущее время по МСК (UTC+3)"""
+    return datetime.now(timezone.utc) + timedelta(hours=3)
+
 def move_overdue_tasks_to_backlog(user_id):
-    """
-    Переносит ВСЕ невыполненные просроченные задачи на сегодня.
-    Сохраняет категорию. Работает и для одноразовых, и для ежедневных задач.
-    """
+    """Переносит ВСЕ невыполненные просроченные задачи на сегодня."""
     conn = get_db_connection()
     cur = conn.cursor()
     today = datetime.now().date()
     today_str = today.strftime('%Y-%m-%d')
     
-    # Переносим ВСЕ просроченные задачи (date < сегодня) на сегодня
-    # Сохраняем категорию (не сбрасываем в 'later')
     cur.execute('''
         UPDATE tasks 
         SET date = %s
@@ -169,7 +170,7 @@ def move_overdue_tasks_to_backlog(user_id):
     conn.commit()
     conn.close()
 
-# --- ГЛАВНАЯ СТРАНИЦА (С ПЕРЕКЛЮЧЕНИЕМ ДАТ) ---
+# --- ГЛАВНАЯ СТРАНИЦА ---
 @app.route('/')
 def index():
     if 'user_id' not in session:
@@ -177,21 +178,19 @@ def index():
     
     user_id = session['user_id']
     
-    # Переносим просроченные задачи на сегодня (сохраняя категории)
     move_overdue_tasks_to_backlog(user_id)
     
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    # Берем дату из URL или сегодня
     view_date_str = request.args.get('date', datetime.now().strftime('%Y-%m-%d'))
     view_date = datetime.strptime(view_date_str, '%Y-%m-%d').date()
     
     cur.execute('''
         SELECT * FROM tasks 
         WHERE user_id = %s AND status = %s AND quarter IS NULL 
-        AND (date = %s OR date IS NULL OR date = '')
-        ORDER BY id ASC
+        AND date = %s
+        ORDER BY position ASC, id ASC
     ''', (user_id, 'active', view_date_str))
     tasks = cur.fetchall()
     conn.close()
@@ -248,7 +247,7 @@ def future_page():
         SELECT * FROM tasks 
         WHERE user_id = %s AND status = %s AND quarter IS NULL 
         AND date IS NOT NULL AND date != '' AND date::date > %s
-        ORDER BY date ASC
+        ORDER BY date ASC, position ASC
     ''', (user_id, 'active', today))
     tasks = cur.fetchall()
     conn.close()
@@ -344,7 +343,7 @@ def later_page():
                                    groups=groups,
                                    username=session.get('username', 'Пользователь'))
 
-# --- СТРАНИЦА "ГОТОВО" (ИСПРАВЛЕНА) ---
+# --- СТРАНИЦА "ГОТОВО" ---
 @app.route('/done')
 def done_page():
     if 'user_id' not in session:
@@ -354,7 +353,7 @@ def done_page():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    cutoff = datetime.now() - timedelta(hours=36)
+    cutoff = get_now_msk() - timedelta(hours=36)
     cur.execute('''
         SELECT * FROM tasks 
         WHERE user_id = %s AND status = %s AND completed_at >= %s
@@ -366,10 +365,14 @@ def done_page():
     tasks_by_date = {}
     for task in tasks:
         if task['completed_at']:
-            date_key = task['completed_at'].strftime('%Y-%m-%d')
+            # Конвертируем в МСК для отображения
+            completed_msk = task['completed_at'] + timedelta(hours=3) if task['completed_at'].tzinfo is None else task['completed_at']
+            date_key = completed_msk.strftime('%Y-%m-%d')
             if date_key not in tasks_by_date:
                 tasks_by_date[date_key] = []
-            tasks_by_date[date_key].append(dict(task))
+            task_dict = dict(task)
+            task_dict['completed_at_msk'] = completed_msk
+            tasks_by_date[date_key].append(task_dict)
     
     sorted_dates = sorted(tasks_by_date.keys(), reverse=True)
     
@@ -570,7 +573,7 @@ def add_quarter_task():
     
     return jsonify({'success': True, 'message': 'Task added to quarter'})
 
-# --- API: Добавить задачу напрямую в категорию (С ОБНОВЛЕНИЕМ default_category) ---
+# --- API: Добавить задачу напрямую в категорию ---
 @app.route('/api/task/direct', methods=['POST'])
 def add_direct_task():
     if 'user_id' not in session:
@@ -643,11 +646,11 @@ def update_task(task_id):
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # Если задача ежедневная, обновляем и default_category
     cur.execute('SELECT repeat_type FROM tasks WHERE id = %s AND user_id = %s', (task_id, session['user_id']))
     task = cur.fetchone()
     
-    if task and task[0] == 'daily':
+    if task and task[0] != 'none':
+        # Для повторяющихся задач обновляем и default_category
         cur.execute('''
             UPDATE tasks SET 
                 title = %s, category = %s, default_category = %s, date = %s, duration = %s, 
@@ -698,7 +701,7 @@ def get_task(task_id):
     
     return jsonify(dict(task))
 
-# --- API: Выполнение задачи (ИСПРАВЛЕНО - создает запись в "Готово") ---
+# --- API: Выполнение задачи (ИСПРАВЛЕНО: weekly + daily) ---
 @app.route('/api/task/<int:task_id>/done', methods=['POST'])
 def done_task(task_id):
     if 'user_id' not in session:
@@ -714,13 +717,14 @@ def done_task(task_id):
         conn.close()
         return jsonify({'error': 'Task not found'}), 404
     
-    # Если задача НЕ повторяющаяся - просто отмечаем как выполненную
-    if task['repeat_type'] == 'none':
-        cur.execute('UPDATE tasks SET status = %s, completed_at = %s WHERE id = %s', ('done', datetime.now(), task_id))
+    now_msk = get_now_msk()
     
-    # Если задача ЕЖЕДНЕВНАЯ - создаем запись в "Готово" И переносим на завтра
+    # Если задача НЕ повторяющаяся
+    if task['repeat_type'] == 'none':
+        cur.execute('UPDATE tasks SET status = %s, completed_at = %s WHERE id = %s', ('done', now_msk, task_id))
+    
+    # Если задача ЕЖЕДНЕВНАЯ
     elif task['repeat_type'] == 'daily':
-        # Вычисляем следующую дату
         if task['date'] and task['date'] != '':
             try:
                 current_date = datetime.strptime(task['date'], '%Y-%m-%d').date()
@@ -730,10 +734,9 @@ def done_task(task_id):
         else:
             new_date = datetime.now().date() + timedelta(days=1)
         
-        # Получаем default_category
         default_cat = task.get('default_category') or 'personal'
         
-        # 1. СОЗДАЕМ КОПИЮ в "Готово" (как выполненную)
+        # 1. СОЗДАЕМ ЗАПИСЬ В "ГОТОВО"
         cur.execute('''
             INSERT INTO tasks (user_id, title, category, default_category, date, duration, 
                                repeat_type, repeat_day, status, quarter, sphere, later_group, 
@@ -742,9 +745,9 @@ def done_task(task_id):
         ''', (task['user_id'], task['title'], task['category'], task['default_category'],
               task['date'], task['duration'], 'none', None, 'done', 
               task['quarter'], task['sphere'], task['later_group'], 
-              task['sphere_id'], datetime.now(), task['comment']))
+              task['sphere_id'], now_msk, task['comment']))
         
-        # 2. ОБНОВЛЯЕМ исходную задачу - переносим на завтра и возвращаем в родной блок
+        # 2. ПЕРЕНОСИМ ЗАДАЧУ НА ЗАВТРА В РОДНОЙ БЛОК
         cur.execute('''
             UPDATE tasks SET 
                 date = %s,
@@ -754,8 +757,9 @@ def done_task(task_id):
             WHERE id = %s
         ''', (new_date.strftime('%Y-%m-%d'), default_cat, task_id))
     
-    # Если задача ЕЖЕНЕДЕЛЬНАЯ
+    # Если задача ЕЖЕНЕДЕЛЬНАЯ - ПЕРЕНОС НА ФИКСИРОВАННЫЙ ДЕНЬ НЕДЕЛИ
     elif task['repeat_type'] == 'weekly' and task['repeat_day'] is not None:
+        # Получаем текущую дату
         if task['date'] and task['date'] != '':
             try:
                 current_date = datetime.strptime(task['date'], '%Y-%m-%d').date()
@@ -764,14 +768,16 @@ def done_task(task_id):
         else:
             current_date = datetime.now().date()
         
-        days_ahead = task['repeat_day'] - current_date.weekday()
+        # Вычисляем БЛИЖАЙШИЙ указанный день недели
+        target_day = task['repeat_day']  # 0=воскресенье, 1=понедельник, ...
+        days_ahead = target_day - current_date.weekday()
         if days_ahead <= 0:
             days_ahead += 7
         new_date = current_date + timedelta(days=days_ahead)
         
         default_cat = task.get('default_category') or 'personal'
         
-        # 1. СОЗДАЕМ КОПИЮ в "Готово"
+        # 1. СОЗДАЕМ ЗАПИСЬ В "ГОТОВО"
         cur.execute('''
             INSERT INTO tasks (user_id, title, category, default_category, date, duration, 
                                repeat_type, repeat_day, status, quarter, sphere, later_group, 
@@ -780,9 +786,9 @@ def done_task(task_id):
         ''', (task['user_id'], task['title'], task['category'], task['default_category'],
               task['date'], task['duration'], 'none', None, 'done', 
               task['quarter'], task['sphere'], task['later_group'], 
-              task['sphere_id'], datetime.now(), task['comment']))
+              task['sphere_id'], now_msk, task['comment']))
         
-        # 2. ОБНОВЛЯЕМ исходную задачу
+        # 2. ПЕРЕНОСИМ ЗАДАЧУ НА БЛИЖАЙШИЙ УКАЗАННЫЙ ДЕНЬ НЕДЕЛИ
         cur.execute('''
             UPDATE tasks SET 
                 date = %s,
@@ -820,7 +826,7 @@ def get_done_tasks():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    cutoff = datetime.now() - timedelta(hours=36)
+    cutoff = get_now_msk() - timedelta(hours=36)
     cur.execute('''
         SELECT * FROM tasks 
         WHERE user_id = %s AND status = %s AND completed_at >= %s
@@ -835,7 +841,7 @@ def get_done_tasks():
     
     return jsonify(result)
 
-# --- API: Переместить задачу из бэклога в категорию (С СОХРАНЕНИЕМ default_category) ---
+# --- API: Переместить задачу (НЕ МЕНЯЕМ default_category) ---
 @app.route('/api/task/<int:task_id>/move', methods=['PUT'])
 def move_task(task_id):
     if 'user_id' not in session:
@@ -847,16 +853,9 @@ def move_task(task_id):
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # Если задача имеет repeat_type = 'daily', обновляем default_category
-    cur.execute('SELECT repeat_type FROM tasks WHERE id = %s AND user_id = %s', (task_id, session['user_id']))
-    task = cur.fetchone()
-    
-    if task and task[0] == 'daily':
-        cur.execute('UPDATE tasks SET category = %s, default_category = %s WHERE id = %s AND user_id = %s', 
-                   (category, category, task_id, session['user_id']))
-    else:
-        cur.execute('UPDATE tasks SET category = %s WHERE id = %s AND user_id = %s', 
-                   (category, task_id, session['user_id']))
+    # Обновляем ТОЛЬКО category, default_category НЕ ТРОГАЕМ
+    cur.execute('UPDATE tasks SET category = %s WHERE id = %s AND user_id = %s', 
+               (category, task_id, session['user_id']))
     
     conn.commit()
     conn.close()
@@ -876,7 +875,7 @@ def get_tasks():
         SELECT * FROM tasks 
         WHERE user_id = %s AND status = %s AND quarter IS NULL 
         AND (date = %s OR date IS NULL OR date = '')
-        ORDER BY id ASC
+        ORDER BY position ASC, id ASC
     ''', (session['user_id'], 'active', today))
     tasks = cur.fetchall()
     conn.close()
@@ -899,7 +898,7 @@ def get_tasks_by_date(date_str):
         SELECT * FROM tasks 
         WHERE user_id = %s AND status = %s AND quarter IS NULL 
         AND (date = %s OR date IS NULL OR date = '')
-        ORDER BY id ASC
+        ORDER BY position ASC, id ASC
     ''', (session['user_id'], 'active', date_str))
     tasks = cur.fetchall()
     conn.close()
@@ -909,6 +908,74 @@ def get_tasks_by_date(date_str):
         result.append(dict(task))
     
     return jsonify(result)
+
+# --- API: Обновить порядок задач (ДЛЯ ФОКУСА) ---
+@app.route('/api/tasks/reorder', methods=['POST'])
+def reorder_tasks():
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.json
+    task_ids = data.get('task_ids', [])
+    category = data.get('category', '')
+    
+    if not task_ids or not category:
+        return jsonify({'error': 'Task IDs and category are required'}), 400
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    for index, task_id in enumerate(task_ids):
+        cur.execute('''
+            UPDATE tasks 
+            SET position = %s 
+            WHERE id = %s AND user_id = %s AND category = %s
+        ''', (index, task_id, session['user_id'], category))
+    
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': 'Tasks reordered'})
+
+# --- API: Массовый перенос задач на дату ---
+@app.route('/api/tasks/move_to_date', methods=['POST'])
+def move_tasks_to_date():
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.json
+    task_ids = data.get('task_ids', [])
+    new_date = data.get('date', '')
+    
+    if not task_ids or not new_date:
+        return jsonify({'error': 'Task IDs and date are required'}), 400
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Проверяем, что все задачи принадлежат пользователю
+    placeholders = ','.join(['%s'] * len(task_ids))
+    cur.execute(f'''
+        SELECT id FROM tasks 
+        WHERE id IN ({placeholders}) AND user_id = %s
+    ''', (*task_ids, session['user_id']))
+    valid_tasks = cur.fetchall()
+    
+    if len(valid_tasks) != len(task_ids):
+        conn.close()
+        return jsonify({'error': 'Some tasks not found or unauthorized'}), 404
+    
+    # Обновляем дату у всех выбранных задач (сохраняем категории)
+    cur.execute(f'''
+        UPDATE tasks 
+        SET date = %s 
+        WHERE id IN ({placeholders}) AND user_id = %s
+    ''', (new_date, *task_ids, session['user_id']))
+    
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': f'{len(task_ids)} tasks moved to {new_date}'})
 
 # --- РЕГИСТРАЦИЯ ---
 @app.route('/register', methods=['GET', 'POST'])
@@ -1292,6 +1359,76 @@ MAIN_PAGE = '''
             margin-left: 6px;
         }
         
+        /* --- ПАНЕЛЬ ВЫБОРА ЗАДАЧ --- */
+        .selection-panel {
+            display: none;
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 12px 20px;
+            margin-bottom: 16px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .selection-panel.active { display: flex; }
+        .selection-panel .info { color: #8b7bb5; font-size: 14px; }
+        .selection-panel .btn-group { display: flex; gap: 8px; flex-wrap: wrap; }
+        .selection-panel .btn-group button {
+            padding: 6px 16px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 13px;
+            touch-action: manipulation;
+        }
+        .selection-panel .btn-move {
+            background: #8b7bb5;
+            color: white;
+        }
+        .selection-panel .btn-move:hover { background: #7a69a4; }
+        .selection-panel .btn-clear {
+            background: #ede5f5;
+            color: #4a3f5e;
+        }
+        .selection-panel .btn-clear:hover { background: #e0d5ec; }
+        .selection-panel .btn-select-all {
+            background: #d5c8e6;
+            color: #4a3f5e;
+        }
+        .selection-panel .btn-select-all:hover { background: #c5b8d8; }
+        
+        /* --- ДАТА ДЛЯ ПЕРЕНОСА --- */
+        .move-date-input {
+            display: none;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .move-date-input.active { display: flex; }
+        .move-date-input input[type="date"] {
+            padding: 6px 12px;
+            border: 1.5px solid #ede5f5;
+            border-radius: 8px;
+            font-size: 13px;
+            background: white;
+            color: #4a3f5e;
+            -webkit-appearance: none;
+        }
+        .move-date-input input:focus { outline: none; border-color: #8b7bb5; }
+        .move-date-input .btn-confirm-move {
+            background: #27ae60;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 6px 16px;
+            cursor: pointer;
+            font-size: 13px;
+            touch-action: manipulation;
+        }
+        .move-date-input .btn-confirm-move:hover { background: #2ecc71; }
+        
         .focus-block {
             background: #fcfaff;
             border-radius: 14px;
@@ -1387,6 +1524,13 @@ MAIN_PAGE = '''
         .task-card.dragging { opacity: 0.4; transform: scale(0.98); }
         .task-card.drag-over { border-left-color: #8b7bb5; border-left-width: 6px; }
         .task-card:hover { background: #f5eefa; }
+        .task-card .task-checkbox {
+            margin-right: 6px;
+            accent-color: #8b7bb5;
+            cursor: pointer;
+            width: 16px;
+            height: 16px;
+        }
         .task-card .task-info { 
             display: flex; 
             align-items: center; 
@@ -1639,6 +1783,9 @@ MAIN_PAGE = '''
             .modal { padding: 18px 16px; }
             .task-card { padding: 8px 10px; }
             .task-card .task-actions button { padding: 4px 4px; min-width: 28px; min-height: 28px; font-size: 13px; }
+            .selection-panel { flex-direction: column; align-items: stretch; }
+            .selection-panel .btn-group { justify-content: center; }
+            .move-date-input { flex-direction: column; }
         }
         @media (max-width: 480px) {
             .block-row { grid-template-columns: 1fr; }
@@ -1690,6 +1837,21 @@ MAIN_PAGE = '''
                 {% if is_tomorrow %}<span class="tomorrow-badge">завтра</span>{% endif %}
             </span>
             <a href="/?date={{ next_date }}" class="nav-btn">▶</a>
+        </div>
+
+        <!-- ПАНЕЛЬ ВЫБОРА -->
+        <div class="selection-panel" id="selectionPanel">
+            <span class="info" id="selectionInfo">Выбрано: 0 задач</span>
+            <div class="btn-group">
+                <button class="btn-select-all" id="selectAllBtn">Выбрать все</button>
+                <button class="btn-clear" id="clearSelectionBtn">Снять все</button>
+                <button class="btn-move" id="moveSelectedBtn">📅 Перенести на дату</button>
+            </div>
+            <div class="move-date-input" id="moveDateInput">
+                <input type="date" id="moveDatePicker" value="{{ view_date }}">
+                <button class="btn-confirm-move" id="confirmMoveBtn">✅ Перенести</button>
+                <button class="btn-clear" id="cancelMoveBtn">Отмена</button>
+            </div>
         </div>
 
         <div class="focus-block" id="focusBlock">
@@ -1866,15 +2028,103 @@ MAIN_PAGE = '''
     let currentViewDate = '{{ view_date }}';
     let draggedTaskId = null;
     let dragSourceBlock = null;
+    let selectedTasks = new Set();
     
     document.addEventListener('DOMContentLoaded', function() {
         initDragDrop();
         updateEmptyBlocks();
+        updateSelectionPanel();
+    });
+    
+    // --- ВЫБОР ЗАДАЧ ---
+    function toggleTaskSelection(taskId) {
+        if (selectedTasks.has(taskId)) {
+            selectedTasks.delete(taskId);
+        } else {
+            selectedTasks.add(taskId);
+        }
+        updateSelectionPanel();
+        updateCheckboxes();
+    }
+    
+    function selectAllTasks() {
+        const checkboxes = document.querySelectorAll('.task-checkbox');
+        checkboxes.forEach(cb => {
+            const taskId = parseInt(cb.dataset.taskId);
+            selectedTasks.add(taskId);
+            cb.checked = true;
+        });
+        updateSelectionPanel();
+    }
+    
+    function clearAllSelection() {
+        selectedTasks.clear();
+        updateSelectionPanel();
+        updateCheckboxes();
+    }
+    
+    function updateCheckboxes() {
+        document.querySelectorAll('.task-checkbox').forEach(cb => {
+            const taskId = parseInt(cb.dataset.taskId);
+            cb.checked = selectedTasks.has(taskId);
+        });
+    }
+    
+    function updateSelectionPanel() {
+        const panel = document.getElementById('selectionPanel');
+        const info = document.getElementById('selectionInfo');
+        const count = selectedTasks.size;
+        if (count > 0) {
+            panel.classList.add('active');
+            info.textContent = `✅ Выбрано: ${count} задач`;
+        } else {
+            panel.classList.remove('active');
+            info.textContent = 'Выбрано: 0 задач';
+        }
+    }
+    
+    document.getElementById('selectAllBtn').addEventListener('click', selectAllTasks);
+    document.getElementById('clearSelectionBtn').addEventListener('click', clearAllSelection);
+    
+    document.getElementById('moveSelectedBtn').addEventListener('click', function() {
+        if (selectedTasks.size === 0) {
+            alert('Выберите хотя бы одну задачу');
+            return;
+        }
+        document.getElementById('moveDateInput').classList.toggle('active');
+    });
+    
+    document.getElementById('cancelMoveBtn').addEventListener('click', function() {
+        document.getElementById('moveDateInput').classList.remove('active');
+    });
+    
+    document.getElementById('confirmMoveBtn').addEventListener('click', function() {
+        if (selectedTasks.size === 0) {
+            alert('Выберите хотя бы одну задачу');
+            return;
+        }
+        const newDate = document.getElementById('moveDatePicker').value;
+        if (!newDate) {
+            alert('Выберите дату');
+            return;
+        }
+        const taskIds = Array.from(selectedTasks);
+        fetch('/api/tasks/move_to_date', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ task_ids: taskIds, date: newDate })
+        })
+        .then(res => res.json())
+        .then(() => {
+            clearAllSelection();
+            document.getElementById('moveDateInput').classList.remove('active');
+            loadTasks();
+            loadBacklog();
+        });
     });
     
     function initDragDrop() {
-        // Добавляем обработку для ВСЕХ task-card, включая фокус
-        const taskCards = document.querySelectorAll('.task-card, .focus-block .task-card');
+        const taskCards = document.querySelectorAll('.task-card');
         taskCards.forEach(card => {
             card.removeEventListener('dragstart', handleDragStart);
             card.removeEventListener('dragend', handleDragEnd);
@@ -1909,6 +2159,8 @@ MAIN_PAGE = '''
     function handleDragEnd(e) {
         this.classList.remove('dragging');
         document.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+        // Сохраняем порядок после перетаскивания
+        saveOrder();
     }
     
     function handleDragOver(e) {
@@ -1967,6 +2219,38 @@ MAIN_PAGE = '''
         }
         
         updatePositions(block);
+        saveOrder();
+    }
+    
+    function saveOrder() {
+        // Сохраняем порядок для всех блоков
+        const blocks = document.querySelectorAll('.block, .focus-block, .waiting-block');
+        blocks.forEach(block => {
+            const container = block.querySelector('[id^="tasks-"]');
+            if (!container) return;
+            const cards = container.querySelectorAll('.task-card');
+            if (cards.length === 0) return;
+            
+            let category = '';
+            if (block.id === 'focusBlock') {
+                category = 'focus';
+            } else {
+                const match = block.id.match(/block-(\w+)/);
+                if (match) category = match[1];
+            }
+            if (!category) return;
+            
+            const taskIds = [];
+            cards.forEach(card => {
+                taskIds.push(parseInt(card.dataset.taskId));
+            });
+            
+            fetch('/api/tasks/reorder', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ task_ids: taskIds, category: category })
+            });
+        });
     }
     
     function updatePositions(block) {
@@ -1981,11 +2265,6 @@ MAIN_PAGE = '''
             const match = block.id.match(/block-(\w+)/);
             if (match) category = match[1];
         }
-        
-        cards.forEach((card, index) => {
-            // Обновляем позицию через API (если есть)
-            // Пока просто обновляем счетчик
-        });
         
         const countEl = document.getElementById(`count-${category}`);
         if (countEl) {
@@ -2056,6 +2335,8 @@ MAIN_PAGE = '''
                 renderTasks(categories);
                 initDragDrop();
                 updateEmptyBlocks();
+                updateSelectionPanel();
+                updateCheckboxes();
             });
     }
     
@@ -2095,6 +2376,7 @@ MAIN_PAGE = '''
             }
         }
         updateEmptyBlocks();
+        updateSelectionPanel();
     }
     
     function createTaskCard(task, category) {
@@ -2102,6 +2384,8 @@ MAIN_PAGE = '''
         div.className = `task-card tag-${category}`;
         div.dataset.taskId = task.id;
         div.draggable = true;
+        
+        const isChecked = selectedTasks.has(task.id);
         
         let durationHtml = '';
         if (task.duration) {
@@ -2115,6 +2399,7 @@ MAIN_PAGE = '''
         
         div.innerHTML = `
             <div class="task-info" data-task-id="${task.id}">
+                <input type="checkbox" class="task-checkbox" data-task-id="${task.id}" ${isChecked ? 'checked' : ''}>
                 <span>${task.title}</span>
                 ${durationHtml}
                 ${commentHtml}
@@ -2126,7 +2411,15 @@ MAIN_PAGE = '''
             </div>
         `;
         
+        const checkbox = div.querySelector('.task-checkbox');
+        checkbox.addEventListener('change', function(e) {
+            e.stopPropagation();
+            const taskId = parseInt(this.dataset.taskId);
+            toggleTaskSelection(taskId);
+        });
+        
         div.querySelector('.task-info').addEventListener('click', function(e) {
+            if (e.target.type === 'checkbox') return;
             e.stopPropagation();
             const taskId = this.dataset.taskId;
             viewTask(taskId);
@@ -3621,7 +3914,11 @@ DONE_PAGE = '''
                         {% if task.comment and task.comment != '' %}
                         <span class="comment-badge" title="{{ task.comment }}">💬</span>
                         {% endif %}
-                        <span class="completed-time">✅ {{ task.completed_at.strftime('%H:%M') }}</span>
+                        {% if task.completed_at_msk %}
+                        <span class="completed-time">✅ {{ task.completed_at_msk.strftime('%H:%M') }}</span>
+                        {% else %}
+                        <span class="completed-time">✅ выполнено</span>
+                        {% endif %}
                     </div>
                     <div class="task-actions">
                         <button class="restore-btn" data-task-id="{{ task.id }}" title="Восстановить">↩️</button>
@@ -3664,7 +3961,7 @@ DONE_PAGE = '''
                 sortedDates.forEach(dateKey => {
                     const dateGroup = document.createElement('div');
                     dateGroup.className = 'date-group';
-                    const dateObj = new Date(dateKey);
+                    const dateObj = new Date(dateKey + 'T00:00:00+03:00');
                     const months = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
                     const weekdays = ['воскресенье', 'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота'];
                     const day = dateObj.getDate();
