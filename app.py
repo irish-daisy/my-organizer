@@ -150,7 +150,7 @@ def format_date_with_weekday(date_str):
     return date_formatted
 
 def get_now_msk():
-    """Возвращает текущее время по МСК (UTC+3)"""
+    """Возвращает текущее время по МСК (UTC+3) как UTC для хранения в БД"""
     return datetime.now(timezone.utc) + timedelta(hours=3)
 
 def move_overdue_tasks_to_backlog(user_id):
@@ -343,7 +343,7 @@ def later_page():
                                    groups=groups,
                                    username=session.get('username', 'Пользователь'))
 
-# --- СТРАНИЦА "ГОТОВО" ---
+# --- СТРАНИЦА "ГОТОВО" (ИСПРАВЛЕНО ВРЕМЯ МСК) ---
 @app.route('/done')
 def done_page():
     if 'user_id' not in session:
@@ -365,14 +365,11 @@ def done_page():
     tasks_by_date = {}
     for task in tasks:
         if task['completed_at']:
-            # Конвертируем в МСК для отображения
-            completed_msk = task['completed_at'] + timedelta(hours=3) if task['completed_at'].tzinfo is None else task['completed_at']
-            date_key = completed_msk.strftime('%Y-%m-%d')
+            # completed_at уже в МСК (хранится как UTC+3)
+            date_key = task['completed_at'].strftime('%Y-%m-%d')
             if date_key not in tasks_by_date:
                 tasks_by_date[date_key] = []
-            task_dict = dict(task)
-            task_dict['completed_at_msk'] = completed_msk
-            tasks_by_date[date_key].append(task_dict)
+            tasks_by_date[date_key].append(dict(task))
     
     sorted_dates = sorted(tasks_by_date.keys(), reverse=True)
     
@@ -701,7 +698,7 @@ def get_task(task_id):
     
     return jsonify(dict(task))
 
-# --- API: Выполнение задачи (ИСПРАВЛЕНО: weekly + daily) ---
+# --- API: Выполнение задачи (ИСПРАВЛЕНЫ daily И weekly) ---
 @app.route('/api/task/<int:task_id>/done', methods=['POST'])
 def done_task(task_id):
     if 'user_id' not in session:
@@ -757,7 +754,7 @@ def done_task(task_id):
             WHERE id = %s
         ''', (new_date.strftime('%Y-%m-%d'), default_cat, task_id))
     
-    # Если задача ЕЖЕНЕДЕЛЬНАЯ - ПЕРЕНОС НА ФИКСИРОВАННЫЙ ДЕНЬ НЕДЕЛИ
+    # Если задача ЕЖЕНЕДЕЛЬНАЯ - ИСПРАВЛЕНА ФОРМУЛА
     elif task['repeat_type'] == 'weekly' and task['repeat_day'] is not None:
         # Получаем текущую дату
         if task['date'] and task['date'] != '':
@@ -769,8 +766,12 @@ def done_task(task_id):
             current_date = datetime.now().date()
         
         # Вычисляем БЛИЖАЙШИЙ указанный день недели
-        target_day = task['repeat_day']  # 0=воскресенье, 1=понедельник, ...
-        days_ahead = target_day - current_date.weekday()
+        # repeat_day: 0=воскресенье, 1=понедельник, 2=вторник, ...
+        target_day = task['repeat_day']
+        # Преобразуем текущий день недели в тот же формат (0=воскресенье)
+        # python weekday: 0=понедельник, 6=воскресенье
+        current_weekday = (current_date.weekday() + 1) % 7
+        days_ahead = target_day - current_weekday
         if days_ahead <= 0:
             days_ahead += 7
         new_date = current_date + timedelta(days=days_ahead)
@@ -909,7 +910,7 @@ def get_tasks_by_date(date_str):
     
     return jsonify(result)
 
-# --- API: Обновить порядок задач (ДЛЯ ФОКУСА) ---
+# --- API: Обновить порядок задач ---
 @app.route('/api/tasks/reorder', methods=['POST'])
 def reorder_tasks():
     if 'user_id' not in session:
@@ -953,7 +954,6 @@ def move_tasks_to_date():
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # Проверяем, что все задачи принадлежат пользователю
     placeholders = ','.join(['%s'] * len(task_ids))
     cur.execute(f'''
         SELECT id FROM tasks 
@@ -965,7 +965,6 @@ def move_tasks_to_date():
         conn.close()
         return jsonify({'error': 'Some tasks not found or unauthorized'}), 404
     
-    # Обновляем дату у всех выбранных задач (сохраняем категории)
     cur.execute(f'''
         UPDATE tasks 
         SET date = %s 
@@ -1359,7 +1358,6 @@ MAIN_PAGE = '''
             margin-left: 6px;
         }
         
-        /* --- ПАНЕЛЬ ВЫБОРА ЗАДАЧ --- */
         .selection-panel {
             display: none;
             background: #fcfaff;
@@ -1399,7 +1397,6 @@ MAIN_PAGE = '''
         }
         .selection-panel .btn-select-all:hover { background: #c5b8d8; }
         
-        /* --- ДАТА ДЛЯ ПЕРЕНОСА --- */
         .move-date-input {
             display: none;
             align-items: center;
@@ -1428,6 +1425,17 @@ MAIN_PAGE = '''
             touch-action: manipulation;
         }
         .move-date-input .btn-confirm-move:hover { background: #2ecc71; }
+        .move-date-input .btn-cancel-move {
+            background: #ede5f5;
+            color: #4a3f5e;
+            border: none;
+            border-radius: 8px;
+            padding: 6px 16px;
+            cursor: pointer;
+            font-size: 13px;
+            touch-action: manipulation;
+        }
+        .move-date-input .btn-cancel-move:hover { background: #e0d5ec; }
         
         .focus-block {
             background: #fcfaff;
@@ -1530,6 +1538,7 @@ MAIN_PAGE = '''
             cursor: pointer;
             width: 16px;
             height: 16px;
+            flex-shrink: 0;
         }
         .task-card .task-info { 
             display: flex; 
@@ -1558,6 +1567,7 @@ MAIN_PAGE = '''
         .task-card .task-actions {
             display: flex;
             gap: 4px;
+            flex-shrink: 0;
         }
         .task-card .task-actions button {
             background: none;
@@ -1583,6 +1593,7 @@ MAIN_PAGE = '''
         .task-card.tag-work { border-left-color: #3498db; }
         .task-card.tag-home { border-left-color: #2ecc71; }
         .task-card.tag-personal { border-left-color: #e74c3c; }
+        .task-card.tag-waiting { border-left-color: #8e44ad; }
         
         .empty-block { color: #c5b8d8; font-size: 13px; text-align: center; padding: 16px; }
         .add-task-btn {
@@ -1785,7 +1796,7 @@ MAIN_PAGE = '''
             .task-card .task-actions button { padding: 4px 4px; min-width: 28px; min-height: 28px; font-size: 13px; }
             .selection-panel { flex-direction: column; align-items: stretch; }
             .selection-panel .btn-group { justify-content: center; }
-            .move-date-input { flex-direction: column; }
+            .move-date-input { flex-direction: column; align-items: stretch; }
         }
         @media (max-width: 480px) {
             .block-row { grid-template-columns: 1fr; }
@@ -1839,7 +1850,6 @@ MAIN_PAGE = '''
             <a href="/?date={{ next_date }}" class="nav-btn">▶</a>
         </div>
 
-        <!-- ПАНЕЛЬ ВЫБОРА -->
         <div class="selection-panel" id="selectionPanel">
             <span class="info" id="selectionInfo">Выбрано: 0 задач</span>
             <div class="btn-group">
@@ -1850,7 +1860,7 @@ MAIN_PAGE = '''
             <div class="move-date-input" id="moveDateInput">
                 <input type="date" id="moveDatePicker" value="{{ view_date }}">
                 <button class="btn-confirm-move" id="confirmMoveBtn">✅ Перенести</button>
-                <button class="btn-clear" id="cancelMoveBtn">Отмена</button>
+                <button class="btn-cancel-move" id="cancelMoveBtn">Отмена</button>
             </div>
         </div>
 
@@ -2029,6 +2039,7 @@ MAIN_PAGE = '''
     let draggedTaskId = null;
     let dragSourceBlock = null;
     let selectedTasks = new Set();
+    let dragTimeout = null;
     
     document.addEventListener('DOMContentLoaded', function() {
         initDragDrop();
@@ -2036,7 +2047,6 @@ MAIN_PAGE = '''
         updateSelectionPanel();
     });
     
-    // --- ВЫБОР ЗАДАЧ ---
     function toggleTaskSelection(taskId) {
         if (selectedTasks.has(taskId)) {
             selectedTasks.delete(taskId);
@@ -2076,7 +2086,7 @@ MAIN_PAGE = '''
         const count = selectedTasks.size;
         if (count > 0) {
             panel.classList.add('active');
-            info.textContent = `✅ Выбрано: ${count} задач`;
+            info.textContent = '✅ Выбрано: ' + count + ' задач';
         } else {
             panel.classList.remove('active');
             info.textContent = 'Выбрано: 0 задач';
@@ -2159,8 +2169,9 @@ MAIN_PAGE = '''
     function handleDragEnd(e) {
         this.classList.remove('dragging');
         document.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
-        // Сохраняем порядок после перетаскивания
-        saveOrder();
+        // Сохраняем порядок после перетаскивания с задержкой
+        if (dragTimeout) clearTimeout(dragTimeout);
+        dragTimeout = setTimeout(saveOrder, 300);
     }
     
     function handleDragOver(e) {
@@ -2184,11 +2195,10 @@ MAIN_PAGE = '''
         const targetBlock = this.closest('.block, .waiting-block, .focus-block');
         const sourceBlock = dragSourceBlock;
         
-        if (!targetBlock || !sourceBlock || targetBlock === sourceBlock) {
-            if (sourceBlock && draggedTaskId) {
-                reorderTasks(sourceBlock, draggedTaskId, targetCard);
-            }
-            return;
+        if (!targetBlock || !sourceBlock) return;
+        
+        if (targetBlock === sourceBlock) {
+            reorderTasks(sourceBlock, draggedTaskId, targetCard);
         }
     }
     
@@ -2219,11 +2229,11 @@ MAIN_PAGE = '''
         }
         
         updatePositions(block);
-        saveOrder();
+        if (dragTimeout) clearTimeout(dragTimeout);
+        dragTimeout = setTimeout(saveOrder, 300);
     }
     
     function saveOrder() {
-        // Сохраняем порядок для всех блоков
         const blocks = document.querySelectorAll('.block, .focus-block, .waiting-block');
         blocks.forEach(block => {
             const container = block.querySelector('[id^="tasks-"]');
@@ -2249,7 +2259,7 @@ MAIN_PAGE = '''
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ task_ids: taskIds, category: category })
-            });
+            }).catch(err => console.error('Save order error:', err));
         });
     }
     
@@ -2325,7 +2335,7 @@ MAIN_PAGE = '''
     }
     
     function loadTasks() {
-        fetch(`/api/tasks/date/${currentViewDate}`)
+        fetch('/api/tasks/date/' + currentViewDate)
             .then(res => res.json())
             .then(tasks => {
                 const categories = { focus: [], urgent: [], work: [], home: [], personal: [], waiting: [] };
@@ -2381,7 +2391,7 @@ MAIN_PAGE = '''
     
     function createTaskCard(task, category) {
         const div = document.createElement('div');
-        div.className = `task-card tag-${category}`;
+        div.className = 'task-card tag-' + category;
         div.dataset.taskId = task.id;
         div.draggable = true;
         
@@ -2389,12 +2399,12 @@ MAIN_PAGE = '''
         
         let durationHtml = '';
         if (task.duration) {
-            durationHtml = `<span class="task-duration">⏱️ ${task.duration}</span>`;
+            durationHtml = '<span class="task-duration">⏱️ ' + task.duration + '</span>';
         }
         
         let commentHtml = '';
         if (task.comment && task.comment.trim() !== '') {
-            commentHtml = `<span class="comment-badge" title="${task.comment.replace(/"/g, '&quot;')}">💬</span>`;
+            commentHtml = '<span class="comment-badge" title="' + task.comment.replace(/"/g, '&quot;') + '">💬</span>';
         }
         
         div.innerHTML = `
@@ -2427,7 +2437,7 @@ MAIN_PAGE = '''
         
         div.querySelector('.done-btn').addEventListener('click', (e) => {
             e.stopPropagation();
-            fetch(`/api/task/${task.id}/done`, { method: 'POST' })
+            fetch('/api/task/' + task.id + '/done', { method: 'POST' })
                 .then(() => { loadTasks(); loadBacklog(); });
         });
         
@@ -2436,7 +2446,7 @@ MAIN_PAGE = '''
             focusBtn.addEventListener('click', function(e) {
                 e.stopPropagation();
                 const taskId = this.dataset.taskId;
-                fetch(`/api/task/${taskId}/move`, {
+                fetch('/api/task/' + taskId + '/move', {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ category: 'focus' })
@@ -2449,12 +2459,12 @@ MAIN_PAGE = '''
     }
     
     function viewTask(taskId) {
-        fetch(`/api/task/${taskId}`)
+        fetch('/api/task/' + taskId)
             .then(res => res.json())
             .then(task => {
                 currentViewTaskId = task.id;
                 document.getElementById('viewTaskId').value = task.id;
-                document.getElementById('viewTaskTitle').textContent = `📌 ${task.title}`;
+                document.getElementById('viewTaskTitle').textContent = '📌 ' + task.title;
                 document.getElementById('viewTaskTitleInput').value = task.title || '';
                 document.getElementById('viewTaskDate').value = task.date || '';
                 document.getElementById('viewTaskDuration').value = task.duration || '';
@@ -2506,15 +2516,15 @@ MAIN_PAGE = '''
             }
         }
         
-        fetch(`/api/task/${taskId}`, {
+        fetch('/api/task/' + taskId, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ 
-                title, 
-                date, 
-                duration, 
-                comment,
-                category, 
+                title: title, 
+                date: date, 
+                duration: duration, 
+                comment: comment,
+                category: category, 
                 repeat_type: repeatType, 
                 repeat_day: repeatDay 
             })
@@ -2529,7 +2539,7 @@ MAIN_PAGE = '''
     
     document.getElementById('viewTaskDelete').addEventListener('click', function() {
         if (currentViewTaskId && confirm('Удалить задачу навсегда?')) {
-            fetch(`/api/task/${currentViewTaskId}`, { method: 'DELETE' })
+            fetch('/api/task/' + currentViewTaskId, { method: 'DELETE' })
                 .then(() => {
                     document.getElementById('viewTaskModal').classList.remove('open');
                     loadTasks();
@@ -2564,7 +2574,7 @@ MAIN_PAGE = '''
             e.stopPropagation();
             const category = this.dataset.category;
             document.getElementById('addTaskCategory').value = category;
-            document.getElementById('addTaskModalSub').textContent = `Добавьте задачу в категорию: ${getCategoryName(category)}`;
+            document.getElementById('addTaskModalSub').textContent = 'Добавьте задачу в категорию: ' + getCategoryName(category);
             document.getElementById('addTaskTitle').value = '';
             document.getElementById('addTaskDate').value = currentViewDate;
             document.getElementById('addTaskDuration').value = '';
@@ -2616,7 +2626,7 @@ MAIN_PAGE = '''
         fetch('/api/task/direct', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title, category, date, duration, comment, repeat_type: repeatType, repeat_day: repeatDay })
+            body: JSON.stringify({ title: title, category: category, date: date, duration: duration, comment: comment, repeat_type: repeatType, repeat_day: repeatDay })
         })
         .then(res => res.json())
         .then(() => {
@@ -2655,7 +2665,7 @@ MAIN_PAGE = '''
         fetch('/api/task', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title })
+            body: JSON.stringify({ title: title })
         })
         .then(res => res.json())
         .then(() => {
@@ -2695,7 +2705,7 @@ MAIN_PAGE = '''
                         const task = backlogTasks.find(t => t.id == taskId);
                         if (task) {
                             document.getElementById('moveTaskId').value = taskId;
-                            document.getElementById('moveTaskTitle').textContent = `"${task.title}" → куда?`;
+                            document.getElementById('moveTaskTitle').textContent = '"' + task.title + '" → куда?';
                             document.getElementById('moveModal').classList.add('open');
                         }
                     });
@@ -2708,10 +2718,10 @@ MAIN_PAGE = '''
             const taskId = document.getElementById('moveTaskId').value;
             const category = this.dataset.category;
             
-            fetch(`/api/task/${taskId}/move`, {
+            fetch('/api/task/' + taskId + '/move', {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ category })
+                body: JSON.stringify({ category: category })
             })
             .then(res => res.json())
             .then(() => {
@@ -2727,7 +2737,6 @@ MAIN_PAGE = '''
         document.getElementById('moveModal').classList.remove('open');
     });
     
-    // Обработка кликов по кнопкам навигации для переключения дат
     document.querySelectorAll('.nav-btn').forEach(btn => {
         btn.addEventListener('click', function(e) {
             e.preventDefault();
@@ -2745,7 +2754,6 @@ MAIN_PAGE = '''
 </html>
 '''
 
-FUTURE_PAGE = '''
 <!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -2898,7 +2906,7 @@ FUTURE_PAGE = '''
     document.querySelectorAll('.done-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
-            fetch(`/api/task/${taskId}/done`, { method: 'POST' })
+            fetch('/api/task/' + taskId + '/done', { method: 'POST' })
                 .then(() => location.reload());
         });
     });
@@ -2907,7 +2915,7 @@ FUTURE_PAGE = '''
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
             if (confirm('Удалить задачу?')) {
-                fetch(`/api/task/${taskId}`, { method: 'DELETE' })
+                fetch('/api/task/' + taskId, { method: 'DELETE' })
                     .then(() => location.reload());
             }
         });
@@ -3212,7 +3220,7 @@ QUARTER_PAGE = '''
         fetch('/api/sphere', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, quarter })
+            body: JSON.stringify({ name: name, quarter: quarter })
         })
         .then(res => res.json())
         .then(() => location.reload());
@@ -3228,7 +3236,7 @@ QUARTER_PAGE = '''
             const sphereName = this.dataset.sphereName;
             const newName = prompt('Введите новое название сферы:', sphereName);
             if (newName && newName.trim()) {
-                fetch(`/api/sphere/${sphereId}`, {
+                fetch('/api/sphere/' + sphereId, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ name: newName.trim() })
@@ -3243,8 +3251,8 @@ QUARTER_PAGE = '''
         btn.addEventListener('click', function() {
             const sphereId = this.dataset.sphereId;
             const sphereName = this.dataset.sphereName;
-            if (confirm(`Удалить сферу "${sphereName}"? Задачи переедут в "Распределить".`)) {
-                fetch(`/api/sphere/${sphereId}`, { method: 'DELETE' })
+            if (confirm('Удалить сферу "' + sphereName + '"? Задачи переедут в "Распределить".')) {
+                fetch('/api/sphere/' + sphereId, { method: 'DELETE' })
                     .then(() => location.reload());
             }
         });
@@ -3262,7 +3270,7 @@ QUARTER_PAGE = '''
             fetch('/api/task/quarter', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ title, sphere, quarter, date: '' })
+                body: JSON.stringify({ title: title, sphere: sphere, quarter: quarter, date: '' })
             })
             .then(res => res.json())
             .then(() => location.reload());
@@ -3280,7 +3288,7 @@ QUARTER_PAGE = '''
     document.querySelectorAll('.done-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
-            fetch(`/api/task/${taskId}/done`, { method: 'POST' })
+            fetch('/api/task/' + taskId + '/done', { method: 'POST' })
                 .then(() => location.reload());
         });
     });
@@ -3289,7 +3297,7 @@ QUARTER_PAGE = '''
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
             if (confirm('Удалить задачу?')) {
-                fetch(`/api/task/${taskId}`, { method: 'DELETE' })
+                fetch('/api/task/' + taskId, { method: 'DELETE' })
                     .then(() => location.reload());
             }
         });
@@ -3673,7 +3681,7 @@ LATER_PAGE = '''
         fetch('/api/task/later', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title })
+            body: JSON.stringify({ title: title })
         })
         .then(res => res.json())
         .then(() => location.reload());
@@ -3691,7 +3699,7 @@ LATER_PAGE = '''
         fetch('/api/later/group', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name })
+            body: JSON.stringify({ name: name })
         })
         .then(res => res.json())
         .then(() => location.reload());
@@ -3707,7 +3715,7 @@ LATER_PAGE = '''
             const groupName = prompt('Введите название группы, куда переместить задачу:');
             if (!groupName) return;
             
-            fetch(`/api/task/${taskId}/move_to_later_group`, {
+            fetch('/api/task/' + taskId + '/move_to_later_group', {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ group: groupName })
@@ -3728,7 +3736,7 @@ LATER_PAGE = '''
             fetch('/api/task/later/group', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ title, group })
+                body: JSON.stringify({ title: title, group: group })
             })
             .then(res => res.json())
             .then(() => location.reload());
@@ -3747,8 +3755,8 @@ LATER_PAGE = '''
         btn.addEventListener('click', function() {
             const groupId = this.dataset.groupId;
             const groupName = this.dataset.groupName;
-            if (confirm(`Удалить группу "${groupName}"? Задачи вернутся в общий список.`)) {
-                fetch(`/api/later/group/${groupId}`, { method: 'DELETE' })
+            if (confirm('Удалить группу "' + groupName + '"? Задачи вернутся в общий список.')) {
+                fetch('/api/later/group/' + groupId, { method: 'DELETE' })
                     .then(() => location.reload());
             }
         });
@@ -3757,7 +3765,7 @@ LATER_PAGE = '''
     document.querySelectorAll('.done-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
-            fetch(`/api/task/${taskId}/done`, { method: 'POST' })
+            fetch('/api/task/' + taskId + '/done', { method: 'POST' })
                 .then(() => location.reload());
         });
     });
@@ -3766,7 +3774,7 @@ LATER_PAGE = '''
         btn.addEventListener('click', function() {
             const taskId = this.dataset.taskId;
             if (confirm('Удалить задачу?')) {
-                fetch(`/api/task/${taskId}`, { method: 'DELETE' })
+                fetch('/api/task/' + taskId, { method: 'DELETE' })
                     .then(() => location.reload());
             }
         });
@@ -3914,11 +3922,7 @@ DONE_PAGE = '''
                         {% if task.comment and task.comment != '' %}
                         <span class="comment-badge" title="{{ task.comment }}">💬</span>
                         {% endif %}
-                        {% if task.completed_at_msk %}
-                        <span class="completed-time">✅ {{ task.completed_at_msk.strftime('%H:%M') }}</span>
-                        {% else %}
-                        <span class="completed-time">✅ выполнено</span>
-                        {% endif %}
+                        <span class="completed-time">✅ {{ task.completed_at.strftime('%H:%M') }}</span>
                     </div>
                     <div class="task-actions">
                         <button class="restore-btn" data-task-id="{{ task.id }}" title="Восстановить">↩️</button>
@@ -3967,7 +3971,7 @@ DONE_PAGE = '''
                     const day = dateObj.getDate();
                     const month = months[dateObj.getMonth()];
                     const weekday = weekdays[dateObj.getDay()];
-                    dateGroup.innerHTML = `<div class="date-title">${day} ${month}, ${weekday}</div>`;
+                    dateGroup.innerHTML = '<div class="date-title">' + day + ' ' + month + ', ' + weekday + '</div>';
                     
                     tasksByDate[dateKey].forEach(task => {
                         const item = document.createElement('div');
@@ -3993,7 +3997,7 @@ DONE_PAGE = '''
                 document.querySelectorAll('.restore-btn').forEach(btn => {
                     btn.addEventListener('click', function() {
                         const taskId = this.dataset.taskId;
-                        fetch(`/api/task/${taskId}/restore`, { method: 'POST' })
+                        fetch('/api/task/' + taskId + '/restore', { method: 'POST' })
                             .then(() => loadDoneTasks());
                     });
                 });
@@ -4002,7 +4006,7 @@ DONE_PAGE = '''
                     btn.addEventListener('click', function() {
                         const taskId = this.dataset.taskId;
                         if (confirm('Удалить задачу навсегда?')) {
-                            fetch(`/api/task/${taskId}`, { method: 'DELETE' })
+                            fetch('/api/task/' + taskId, { method: 'DELETE' })
                                 .then(() => loadDoneTasks());
                         }
                     });
