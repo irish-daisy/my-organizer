@@ -203,7 +203,7 @@ def move_overdue_tasks_to_backlog(user_id):
     conn.commit()
     conn.close()
 
-# --- ГЛАВНАЯ СТРАНИЦА (УДАЛЕН БЛОК "РАСПРЕДЕЛИТЬ") ---
+# --- ГЛАВНАЯ СТРАНИЦА ---
 @app.route('/')
 def index():
     if 'user_id' not in session:
@@ -603,7 +603,7 @@ def add_quarter_task():
     
     return jsonify({'success': True, 'message': 'Task added to quarter'})
 
-# --- API: Добавить задачу напрямую в категорию (С ДОБАВЛЕНИЕМ ДЕДЛАЙНА) ---
+# --- API: Добавить задачу напрямую в категорию ---
 @app.route('/api/task/direct', methods=['POST'])
 def add_direct_task():
     if 'user_id' not in session:
@@ -634,7 +634,7 @@ def add_direct_task():
     
     return jsonify({'success': True, 'message': 'Task added'})
 
-# --- API: Обновление задачи (С ДОБАВЛЕНИЕМ ДЕДЛАЙНА) ---
+# --- API: Обновление задачи ---
 @app.route('/api/task/<int:task_id>', methods=['PUT'])
 def update_task(task_id):
     if 'user_id' not in session:
@@ -681,6 +681,37 @@ def update_task(task_id):
     conn.close()
     
     return jsonify({'success': True, 'message': 'Task updated'})
+
+# --- API: Удаление задачи ---
+@app.route('/api/task/<int:task_id>', methods=['DELETE'])
+def delete_task(task_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('DELETE FROM tasks WHERE id = %s AND user_id = %s', (task_id, session['user_id']))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': 'Task deleted'})
+
+# --- API: Получить задачу по ID ---
+@app.route('/api/task/<int:task_id>')
+def get_task(task_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT * FROM tasks WHERE id = %s AND user_id = %s', (task_id, session['user_id']))
+    task = cur.fetchone()
+    conn.close()
+    
+    if not task:
+        return jsonify({'error': 'Task not found'}), 404
+    
+    return jsonify(dict(task))
 
 # --- API: Выполнение задачи ---
 @app.route('/api/task/<int:task_id>/done', methods=['POST'])
@@ -1438,7 +1469,12 @@ MAIN_PAGE = '''
             transform: scale(1.08);
         }
         
-        .right-column { flex: 0 0 160px; display: flex; flex-direction: column; gap: 12px; }
+        .right-column { 
+            flex: 0 0 200px; 
+            display: flex; 
+            flex-direction: column; 
+            gap: 12px; 
+        }
         .sidebar-card {
             background: #fcfaff;
             border-radius: 12px;
@@ -1509,6 +1545,79 @@ MAIN_PAGE = '''
             touch-action: manipulation;
         }
         .sidebar-card .big-btn-future:hover { background: #7d3c98; }
+        
+        /* Блок "Жду ответа" в правой колонке */
+        .waiting-block {
+            background: #fcfaff;
+            border-radius: 12px;
+            padding: 12px 14px;
+            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+        }
+        .waiting-block .block-header {
+            font-size: 13px;
+            font-weight: 600;
+            color: #4a3f5e;
+            margin-bottom: 8px;
+            padding-bottom: 6px;
+            border-bottom: 2px solid #8e44ad;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .waiting-block .block-header .count {
+            font-size: 11px;
+            font-weight: 400;
+            color: #8b7bb5;
+            background: #f0e8fa;
+            padding: 2px 10px;
+            border-radius: 12px;
+        }
+        .waiting-task {
+            background: #faf5ff;
+            border-radius: 6px;
+            padding: 6px 10px;
+            margin-bottom: 4px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 12px;
+            border-left: 3px solid #8e44ad;
+        }
+        .waiting-task .task-actions button {
+            background: none;
+            border: none;
+            color: #c5b8d8;
+            cursor: pointer;
+            font-size: 12px;
+            padding: 2px 4px;
+            touch-action: manipulation;
+        }
+        .waiting-task .task-actions button:hover { color: #8b7bb5; }
+        .waiting-block .add-task-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background: #f0e8fa;
+            color: #8b7bb5;
+            border: 2px solid #e0d5ec;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 300;
+            margin: 4px auto 0;
+            transition: 0.2s;
+            line-height: 1;
+            touch-action: manipulation;
+        }
+        .waiting-block .add-task-btn:hover { 
+            background: #8b7bb5; 
+            color: white; 
+            border-color: #8b7bb5; 
+            transform: scale(1.08);
+        }
+        .waiting-empty { color: #c5b8d8; font-size: 11px; text-align: center; padding: 8px; }
         
         .modal-overlay {
             display: none;
@@ -1602,6 +1711,7 @@ MAIN_PAGE = '''
             .app-container { flex-direction: column; }
             .right-column { flex: 1 1 100%; flex-direction: row; flex-wrap: wrap; }
             .right-column .sidebar-card { flex: 1; min-width: 120px; }
+            .right-column .waiting-block { flex: 1; min-width: 120px; }
             .center-column { flex: 1 1 100%; }
             .block { min-height: 140px; }
             .block-row { grid-template-columns: 1fr 1fr; }
@@ -1619,6 +1729,7 @@ MAIN_PAGE = '''
             .date-nav .date-label { font-size: 12px; min-width: 80px; }
             .date-nav .nav-btn { font-size: 16px; }
             .right-column .sidebar-card { min-width: 100px; }
+            .right-column .waiting-block { min-width: 100px; }
             .right-column .sidebar-card .big-btn { font-size: 13px; padding: 10px; }
         }
     </style>
@@ -1694,15 +1805,6 @@ MAIN_PAGE = '''
                 </div>
             </div>
         </div>
-        
-        <div class="block waiting-block" id="block-waiting" style="margin-top:16px;">
-            <div class="block-header">
-                ⏳ Жду ответа
-                <span class="count" id="count-waiting">0</span>
-            </div>
-            <div id="tasks-waiting"></div>
-            <button class="add-task-btn" data-category="waiting">+</button>
-        </div>
     </div>
 
     <div class="right-column">
@@ -1711,6 +1813,16 @@ MAIN_PAGE = '''
             <a href="/future" class="big-btn-future">📅 Будущие</a>
             <a href="/later" class="big-btn-secondary">🕰️ Позже</a>
             <a href="/done" class="big-btn-done">✅ Готово</a>
+        </div>
+        
+        <!-- Блок "Жду ответа" перенесен в правую колонку -->
+        <div class="waiting-block" id="block-waiting">
+            <div class="block-header">
+                ⏳ Жду ответа
+                <span class="count" id="count-waiting">0</span>
+            </div>
+            <div id="tasks-waiting"></div>
+            <button class="add-task-btn" data-category="waiting" title="Добавить задачу">+</button>
         </div>
     </div>
 </div>
@@ -2077,10 +2189,17 @@ MAIN_PAGE = '''
                 taskIds.push(parseInt(card.dataset.taskId));
             });
             
+            console.log('Saving order for category:', category, 'taskIds:', taskIds);
+            
             fetch('/api/tasks/reorder', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ task_ids: taskIds, category: category })
+            }).then(res => {
+                console.log('Reorder response:', res.status);
+                return res.json();
+            }).then(data => {
+                console.log('Reorder result:', data);
             }).catch(err => console.error('Save order error:', err));
         });
     }
@@ -2239,9 +2358,10 @@ MAIN_PAGE = '''
         
         let deadlineHtml = '';
         if (task.deadline_date) {
-            const deadlineText = '{{ format_deadline("' + task.deadline_date + '", "' + (task.deadline_time or '') + '", "' + currentViewDate + '") }}';
-            // Простая проверка на наличие дедлайна
-            deadlineHtml = '<span class="deadline-badge">⏳ ' + getDeadlineText(task.deadline_date, task.deadline_time) + '</span>';
+            const deadlineText = getDeadlineText(task.deadline_date, task.deadline_time);
+            if (deadlineText) {
+                deadlineHtml = '<span class="deadline-badge">' + deadlineText + '</span>';
+            }
         }
         
         div.innerHTML = `
@@ -2304,17 +2424,16 @@ MAIN_PAGE = '''
             const deadline = new Date(deadlineDate + 'T00:00:00');
             const diffDays = Math.floor((deadline - today) / (1000 * 60 * 60 * 24));
             
-            if (diffDays < 0) return 'просрочен!';
+            if (diffDays < 0) return '🔴 просрочен!';
             if (diffDays === 0) {
-                if (deadlineTime) return 'до ' + deadlineTime;
-                return 'сегодня';
+                if (deadlineTime) return '⏳ до ' + deadlineTime;
+                return '⏳ сегодня';
             }
-            if (diffDays === 1) return 'до завтра';
-            // Форматируем дату
+            if (diffDays === 1) return '⏳ до завтра';
             const months = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
             const day = deadline.getDate();
             const month = months[deadline.getMonth()];
-            return 'до ' + day + ' ' + month;
+            return '⏳ до ' + day + ' ' + month;
         } catch(e) {
             return '';
         }
