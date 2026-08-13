@@ -21,7 +21,7 @@ def get_db_connection():
     conn = psycopg2.connect(database_url)
     return conn
 
-# --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ---
+# --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ (ДОБАВЛЕНЫ deadline_date И deadline_time) ---
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
@@ -56,7 +56,9 @@ def init_db():
             completed_at TIMESTAMP,
             future BOOLEAN DEFAULT FALSE,
             comment TEXT,
-            position INTEGER DEFAULT 0
+            position INTEGER DEFAULT 0,
+            deadline_date TEXT,
+            deadline_time TEXT
         )
     ''')
     
@@ -154,6 +156,36 @@ def get_now_msk():
     """Возвращает текущее время по МСК (UTC+3)"""
     return datetime.now(timezone.utc) + timedelta(hours=3)
 
+def format_deadline(deadline_date, deadline_time, current_date):
+    """Форматирует дедлайн для отображения на карточке задачи"""
+    if not deadline_date:
+        return ''
+    
+    try:
+        deadline_date_obj = datetime.strptime(deadline_date, '%Y-%m-%d').date()
+    except:
+        return ''
+    
+    today = current_date or datetime.now().date()
+    days_diff = (deadline_date_obj - today).days
+    
+    if days_diff < 0:
+        return '🔴 просрочен!'
+    elif days_diff == 0:
+        # Сегодня
+        if deadline_time and deadline_time.strip():
+            return f'⏳ до {deadline_time}'
+        else:
+            return '⏳ сегодня'
+    elif days_diff == 1:
+        # Завтра
+        return f'⏳ до завтра'
+    else:
+        # В будущем
+        return f'⏳ до {format_date_ru(deadline_date)}'
+    
+    return ''
+
 def move_overdue_tasks_to_backlog(user_id):
     """Переносит ВСЕ невыполненные просроченные задачи на сегодня."""
     conn = get_db_connection()
@@ -171,7 +203,7 @@ def move_overdue_tasks_to_backlog(user_id):
     conn.commit()
     conn.close()
 
-# --- ГЛАВНАЯ СТРАНИЦА ---
+# --- ГЛАВНАЯ СТРАНИЦА (УДАЛЕН БЛОК "РАСПРЕДЕЛИТЬ") ---
 @app.route('/')
 def index():
     if 'user_id' not in session:
@@ -231,7 +263,8 @@ def index():
                                    is_tomorrow=is_tomorrow,
                                    prev_date=(view_date - timedelta(days=1)).strftime('%Y-%m-%d'),
                                    next_date=(view_date + timedelta(days=1)).strftime('%Y-%m-%d'),
-                                   format_date_with_weekday=format_date_with_weekday)
+                                   format_date_with_weekday=format_date_with_weekday,
+                                   format_deadline=format_deadline)
 
 # --- СТРАНИЦА "БУДУЩИЕ" ---
 @app.route('/future')
@@ -344,7 +377,7 @@ def later_page():
                                    groups=groups,
                                    username=session.get('username', 'Пользователь'))
 
-# --- СТРАНИЦА "ГОТОВО" (ВОЗВРАЩЕНА КАК БЫЛА) ---
+# --- СТРАНИЦА "ГОТОВО" ---
 @app.route('/done')
 def done_page():
     if 'user_id' not in session:
@@ -570,7 +603,7 @@ def add_quarter_task():
     
     return jsonify({'success': True, 'message': 'Task added to quarter'})
 
-# --- API: Добавить задачу напрямую в категорию ---
+# --- API: Добавить задачу напрямую в категорию (С ДОБАВЛЕНИЕМ ДЕДЛАЙНА) ---
 @app.route('/api/task/direct', methods=['POST'])
 def add_direct_task():
     if 'user_id' not in session:
@@ -584,6 +617,8 @@ def add_direct_task():
     repeat_type = data.get('repeat_type', 'none')
     repeat_day = data.get('repeat_day')
     comment = data.get('comment', '')
+    deadline_date = data.get('deadline_date', '')
+    deadline_time = data.get('deadline_time', '')
     
     if not title:
         return jsonify({'error': 'Title is required'}), 400
@@ -591,38 +626,15 @@ def add_direct_task():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute('''
-        INSERT INTO tasks (user_id, title, category, default_category, date, duration, repeat_type, repeat_day, status, comment)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, category, category, date, duration, repeat_type, repeat_day, 'active', comment))
+        INSERT INTO tasks (user_id, title, category, default_category, date, duration, repeat_type, repeat_day, status, comment, deadline_date, deadline_time)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, category, category, date, duration, repeat_type, repeat_day, 'active', comment, deadline_date, deadline_time))
     conn.commit()
     conn.close()
     
     return jsonify({'success': True, 'message': 'Task added'})
 
-# --- API: Добавить задачу в бэклог ---
-@app.route('/api/task', methods=['POST'])
-def add_task():
-    if 'user_id' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    data = request.json
-    title = data.get('title', '').strip()
-    
-    if not title:
-        return jsonify({'error': 'Title is required'}), 400
-    
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('''
-        INSERT INTO tasks (user_id, title, category, default_category, date, duration, repeat_type, repeat_day, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, 'later', 'later', '', '', 'none', None, 'active'))
-    conn.commit()
-    conn.close()
-    
-    return jsonify({'success': True, 'message': 'Task added'})
-
-# --- API: Обновление задачи ---
+# --- API: Обновление задачи (С ДОБАВЛЕНИЕМ ДЕДЛАЙНА) ---
 @app.route('/api/task/<int:task_id>', methods=['PUT'])
 def update_task(task_id):
     if 'user_id' not in session:
@@ -636,6 +648,8 @@ def update_task(task_id):
     repeat_type = data.get('repeat_type', 'none')
     repeat_day = data.get('repeat_day')
     comment = data.get('comment', '')
+    deadline_date = data.get('deadline_date', '')
+    deadline_time = data.get('deadline_time', '')
     
     if not title:
         return jsonify({'error': 'Title is required'}), 400
@@ -650,52 +664,23 @@ def update_task(task_id):
         cur.execute('''
             UPDATE tasks SET 
                 title = %s, category = %s, default_category = %s, date = %s, duration = %s, 
-                repeat_type = %s, repeat_day = %s, comment = %s
+                repeat_type = %s, repeat_day = %s, comment = %s,
+                deadline_date = %s, deadline_time = %s
             WHERE id = %s AND user_id = %s
-        ''', (title, category, category, date, duration, repeat_type, repeat_day, comment, task_id, session['user_id']))
+        ''', (title, category, category, date, duration, repeat_type, repeat_day, comment, deadline_date, deadline_time, task_id, session['user_id']))
     else:
         cur.execute('''
             UPDATE tasks SET 
                 title = %s, category = %s, date = %s, duration = %s, 
-                repeat_type = %s, repeat_day = %s, comment = %s
+                repeat_type = %s, repeat_day = %s, comment = %s,
+                deadline_date = %s, deadline_time = %s
             WHERE id = %s AND user_id = %s
-        ''', (title, category, date, duration, repeat_type, repeat_day, comment, task_id, session['user_id']))
+        ''', (title, category, date, duration, repeat_type, repeat_day, comment, deadline_date, deadline_time, task_id, session['user_id']))
     
     conn.commit()
     conn.close()
     
     return jsonify({'success': True, 'message': 'Task updated'})
-
-# --- API: Удаление задачи ---
-@app.route('/api/task/<int:task_id>', methods=['DELETE'])
-def delete_task(task_id):
-    if 'user_id' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('DELETE FROM tasks WHERE id = %s AND user_id = %s', (task_id, session['user_id']))
-    conn.commit()
-    conn.close()
-    
-    return jsonify({'success': True, 'message': 'Task deleted'})
-
-# --- API: Получить задачу по ID ---
-@app.route('/api/task/<int:task_id>')
-def get_task(task_id):
-    if 'user_id' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute('SELECT * FROM tasks WHERE id = %s AND user_id = %s', (task_id, session['user_id']))
-    task = cur.fetchone()
-    conn.close()
-    
-    if not task:
-        return jsonify({'error': 'Task not found'}), 404
-    
-    return jsonify(dict(task))
 
 # --- API: Выполнение задачи ---
 @app.route('/api/task/<int:task_id>/done', methods=['POST'])
@@ -715,11 +700,9 @@ def done_task(task_id):
     
     now_msk = get_now_msk()
     
-    # Если задача НЕ повторяющаяся
     if task['repeat_type'] == 'none':
         cur.execute('UPDATE tasks SET status = %s, completed_at = %s WHERE id = %s', ('done', now_msk, task_id))
     
-    # Если задача ЕЖЕДНЕВНАЯ
     elif task['repeat_type'] == 'daily':
         if task['date'] and task['date'] != '':
             try:
@@ -735,12 +718,12 @@ def done_task(task_id):
         cur.execute('''
             INSERT INTO tasks (user_id, title, category, default_category, date, duration, 
                                repeat_type, repeat_day, status, quarter, sphere, later_group, 
-                               sphere_id, completed_at, comment)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                               sphere_id, completed_at, comment, deadline_date, deadline_time)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ''', (task['user_id'], task['title'], task['category'], task['default_category'],
               task['date'], task['duration'], 'none', None, 'done', 
               task['quarter'], task['sphere'], task['later_group'], 
-              task['sphere_id'], now_msk, task['comment']))
+              task['sphere_id'], now_msk, task['comment'], task.get('deadline_date', ''), task.get('deadline_time', '')))
         
         cur.execute('''
             UPDATE tasks SET 
@@ -751,7 +734,6 @@ def done_task(task_id):
             WHERE id = %s
         ''', (new_date.strftime('%Y-%m-%d'), default_cat, task_id))
     
-    # Если задача ЕЖЕНЕДЕЛЬНАЯ
     elif task['repeat_type'] == 'weekly' and task['repeat_day'] is not None:
         if task['date'] and task['date'] != '':
             try:
@@ -773,12 +755,12 @@ def done_task(task_id):
         cur.execute('''
             INSERT INTO tasks (user_id, title, category, default_category, date, duration, 
                                repeat_type, repeat_day, status, quarter, sphere, later_group, 
-                               sphere_id, completed_at, comment)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                               sphere_id, completed_at, comment, deadline_date, deadline_time)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ''', (task['user_id'], task['title'], task['category'], task['default_category'],
               task['date'], task['duration'], 'none', None, 'done', 
               task['quarter'], task['sphere'], task['later_group'], 
-              task['sphere_id'], now_msk, task['comment']))
+              task['sphere_id'], now_msk, task['comment'], task.get('deadline_date', ''), task.get('deadline_time', '')))
         
         cur.execute('''
             UPDATE tasks SET 
@@ -852,30 +834,6 @@ def move_task(task_id):
     
     return jsonify({'success': True, 'message': 'Task moved'})
 
-# --- API: Получить задачи на сегодня ---
-@app.route('/api/tasks')
-def get_tasks():
-    if 'user_id' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    today = datetime.now().strftime('%Y-%m-%d')
-    cur.execute('''
-        SELECT * FROM tasks 
-        WHERE user_id = %s AND status = %s AND quarter IS NULL 
-        AND (date = %s OR date IS NULL OR date = '')
-        ORDER BY position ASC, id ASC
-    ''', (session['user_id'], 'active', today))
-    tasks = cur.fetchall()
-    conn.close()
-    
-    result = []
-    for task in tasks:
-        result.append(dict(task))
-    
-    return jsonify(result)
-
 # --- API: Получить задачи на конкретную дату ---
 @app.route('/api/tasks/date/<date_str>')
 def get_tasks_by_date(date_str):
@@ -887,7 +845,7 @@ def get_tasks_by_date(date_str):
     cur.execute('''
         SELECT * FROM tasks 
         WHERE user_id = %s AND status = %s AND quarter IS NULL 
-        AND (date = %s OR date IS NULL OR date = '')
+        AND date = %s
         ORDER BY position ASC, id ASC
     ''', (session['user_id'], 'active', date_str))
     tasks = cur.fetchall()
@@ -1024,9 +982,6 @@ def logout():
     return redirect('/login')
 
 # ====== HTML ШАБЛОНЫ (ЧАСТЬ 2) ======
-# Смотрите ЧАСТЬ 2 для HTML шаблонов
-
-# ====== HTML ШАБЛОНЫ (ЧАСТЬ 2) ======
 
 LOGIN_PAGE = '''
 <!DOCTYPE html>
@@ -1132,145 +1087,6 @@ MAIN_PAGE = '''
             align-items: flex-start;
             flex-wrap: wrap;
         }
-        .left-column {
-            flex: 0 0 240px;
-            background: #fcfaff;
-            border-radius: 14px;
-            padding: 18px 14px;
-            min-height: 400px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-            display: flex;
-            flex-direction: column;
-            gap: 16px;
-        }
-        .left-column h2 { font-size: 15px; color: #8b7bb5; margin-bottom: 12px; }
-        
-        .backlog-add {
-            display: flex;
-            gap: 6px;
-            margin-bottom: 12px;
-            flex-wrap: wrap;
-        }
-        .backlog-add input {
-            flex: 1;
-            padding: 8px 12px;
-            border: 1.5px solid #ede5f5;
-            border-radius: 8px;
-            font-size: 13px;
-            min-width: 100px;
-            background: white;
-            color: #4a3f5e;
-            -webkit-appearance: none;
-        }
-        .backlog-add input:focus { outline: none; border-color: #8b7bb5; }
-        .backlog-add button {
-            background: #8b7bb5;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            padding: 8px 14px;
-            cursor: pointer;
-            font-size: 13px;
-            touch-action: manipulation;
-        }
-        .backlog-add button:hover { background: #7a69a4; }
-        .backlog-item {
-            background: white;
-            border-radius: 8px;
-            padding: 10px 12px;
-            margin-bottom: 8px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-size: 14px;
-            border-left: 4px solid #d5c8e6;
-            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.06);
-        }
-        .backlog-item .move-btn {
-            background: none;
-            border: none;
-            color: #b5a7cc;
-            cursor: pointer;
-            font-size: 16px;
-            padding: 4px 8px;
-            touch-action: manipulation;
-        }
-        .backlog-item .move-btn:hover { color: #8b7bb5; }
-        .backlog-hint { font-size: 11px; color: #c5b8d8; margin-top: 8px; }
-        
-        .waiting-block {
-            background: white;
-            border-radius: 12px;
-            padding: 14px 16px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-            margin-top: 8px;
-        }
-        .waiting-block .block-header {
-            font-size: 14px;
-            font-weight: 600;
-            color: #4a3f5e;
-            margin-bottom: 10px;
-            padding-bottom: 8px;
-            border-bottom: 2px solid #8e44ad;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .waiting-block .block-header .count {
-            font-size: 11px;
-            font-weight: 400;
-            color: #8b7bb5;
-            background: #f0e8fa;
-            padding: 2px 10px;
-            border-radius: 12px;
-        }
-        .waiting-task {
-            background: #faf5ff;
-            border-radius: 8px;
-            padding: 8px 12px;
-            margin-bottom: 6px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-size: 13px;
-            border-left: 4px solid #8e44ad;
-        }
-        .waiting-task .task-actions button {
-            background: none;
-            border: none;
-            color: #c5b8d8;
-            cursor: pointer;
-            font-size: 13px;
-            padding: 4px 6px;
-            touch-action: manipulation;
-        }
-        .waiting-task .task-actions button:hover { color: #8b7bb5; }
-        .waiting-block .add-task-btn {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            width: 28px;
-            height: 28px;
-            border-radius: 50%;
-            background: #f0e8fa;
-            color: #8b7bb5;
-            border: 2px solid #e0d5ec;
-            cursor: pointer;
-            font-size: 16px;
-            font-weight: 300;
-            margin: 4px auto 0;
-            transition: 0.2s;
-            line-height: 1;
-            touch-action: manipulation;
-        }
-        .waiting-block .add-task-btn:hover { 
-            background: #8b7bb5; 
-            color: white; 
-            border-color: #8b7bb5; 
-            transform: scale(1.08);
-        }
-        .waiting-empty { color: #c5b8d8; font-size: 13px; text-align: center; padding: 12px; }
-        
         .center-column {
             flex: 1;
             min-width: 280px;
@@ -1556,6 +1372,15 @@ MAIN_PAGE = '''
             border-radius: 10px;
             cursor: help;
         }
+        .task-card .task-info .deadline-badge {
+            font-size: 11px;
+            color: #e67e22;
+            background: #fef5e7;
+            padding: 1px 8px;
+            border-radius: 10px;
+            margin-left: 4px;
+            white-space: nowrap;
+        }
         .task-card .task-actions {
             display: flex;
             gap: 4px;
@@ -1775,7 +1600,6 @@ MAIN_PAGE = '''
         @media (max-width: 768px) {
             body { padding: 10px; }
             .app-container { flex-direction: column; }
-            .left-column { flex: 1 1 100%; }
             .right-column { flex: 1 1 100%; flex-direction: row; flex-wrap: wrap; }
             .right-column .sidebar-card { flex: 1; min-width: 120px; }
             .center-column { flex: 1 1 100%; }
@@ -1801,27 +1625,6 @@ MAIN_PAGE = '''
 </head>
 <body>
 <div class="app-container">
-
-    <div class="left-column">
-        <div>
-            <h2>📥 Распределить</h2>
-            <div class="backlog-add">
-                <input type="text" id="newTaskInput" placeholder="Новая задача..." autofocus>
-                <button id="addBacklogBtn">+</button>
-            </div>
-            <div id="backlogList"></div>
-            <div class="backlog-hint">⬅️ Нажмите → чтобы распределить</div>
-        </div>
-
-        <div class="waiting-block" id="block-waiting">
-            <div class="block-header">
-                ⏳ Жду ответа
-                <span class="count" id="count-waiting">0</span>
-            </div>
-            <div id="tasks-waiting"></div>
-            <button class="add-task-btn" data-category="waiting" title="Добавить задачу">+</button>
-        </div>
-    </div>
 
     <div class="center-column">
         <div class="header">
@@ -1891,6 +1694,15 @@ MAIN_PAGE = '''
                 </div>
             </div>
         </div>
+        
+        <div class="block waiting-block" id="block-waiting" style="margin-top:16px;">
+            <div class="block-header">
+                ⏳ Жду ответа
+                <span class="count" id="count-waiting">0</span>
+            </div>
+            <div id="tasks-waiting"></div>
+            <button class="add-task-btn" data-category="waiting">+</button>
+        </div>
     </div>
 
     <div class="right-column">
@@ -1916,6 +1728,12 @@ MAIN_PAGE = '''
         <input type="text" id="addTaskDuration" placeholder="1 ч">
         <label for="addTaskComment">💬 Комментарий</label>
         <textarea id="addTaskComment" placeholder="Дополнительная информация..."></textarea>
+        
+        <label for="addDeadlineDate">⏰ Дедлайн (дата)</label>
+        <input type="date" id="addDeadlineDate" value="">
+        <label for="addDeadlineTime">⏰ Дедлайн (время)</label>
+        <input type="time" id="addDeadlineTime" value="">
+        
         <div class="checkbox-group">
             <input type="checkbox" id="addTaskRepeat">
             <label for="addTaskRepeat">🔄 Повторяющаяся задача</label>
@@ -1959,6 +1777,12 @@ MAIN_PAGE = '''
         <input type="text" id="viewTaskDuration" placeholder="1 ч" style="margin-bottom:8px;">
         <label for="viewTaskComment">💬 Комментарий</label>
         <textarea id="viewTaskComment" placeholder="Дополнительная информация..." style="margin-bottom:8px;"></textarea>
+        
+        <label for="viewDeadlineDate">⏰ Дедлайн (дата)</label>
+        <input type="date" id="viewDeadlineDate" style="margin-bottom:8px;">
+        <label for="viewDeadlineTime">⏰ Дедлайн (время)</label>
+        <input type="time" id="viewDeadlineTime" style="margin-bottom:8px;">
+        
         <label for="viewTaskCategorySelect">📂 Категория</label>
         <select id="viewTaskCategorySelect" style="margin-bottom:8px;">
             <option value="focus">🎯 Фокус</option>
@@ -2121,7 +1945,6 @@ MAIN_PAGE = '''
             clearAllSelection();
             document.getElementById('moveDateInput').classList.remove('active');
             loadTasks();
-            loadBacklog();
         });
     });
     
@@ -2414,12 +2237,20 @@ MAIN_PAGE = '''
             commentHtml = '<span class="comment-badge" title="' + task.comment.replace(/"/g, '&quot;') + '">💬</span>';
         }
         
+        let deadlineHtml = '';
+        if (task.deadline_date) {
+            const deadlineText = '{{ format_deadline("' + task.deadline_date + '", "' + (task.deadline_time or '') + '", "' + currentViewDate + '") }}';
+            // Простая проверка на наличие дедлайна
+            deadlineHtml = '<span class="deadline-badge">⏳ ' + getDeadlineText(task.deadline_date, task.deadline_time) + '</span>';
+        }
+        
         div.innerHTML = `
             <div class="task-info" data-task-id="${task.id}">
                 <input type="checkbox" class="task-checkbox" data-task-id="${task.id}" ${isChecked ? 'checked' : ''}>
                 <span>${task.title}</span>
                 ${durationHtml}
                 ${commentHtml}
+                ${deadlineHtml}
             </div>
             <div class="task-actions">
                 <span class="drag-handle" title="Перетащить">⠿</span>
@@ -2445,7 +2276,7 @@ MAIN_PAGE = '''
         div.querySelector('.done-btn').addEventListener('click', (e) => {
             e.stopPropagation();
             fetch('/api/task/' + task.id + '/done', { method: 'POST' })
-                .then(() => { loadTasks(); loadBacklog(); });
+                .then(() => { loadTasks(); });
         });
         
         const focusBtn = div.querySelector('.move-to-focus-btn');
@@ -2458,11 +2289,35 @@ MAIN_PAGE = '''
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ category: 'focus' })
                 })
-                .then(() => { loadTasks(); loadBacklog(); });
+                .then(() => { loadTasks(); });
             });
         }
         
         return div;
+    }
+    
+    function getDeadlineText(deadlineDate, deadlineTime) {
+        if (!deadlineDate) return '';
+        try {
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            const deadline = new Date(deadlineDate + 'T00:00:00');
+            const diffDays = Math.floor((deadline - today) / (1000 * 60 * 60 * 24));
+            
+            if (diffDays < 0) return 'просрочен!';
+            if (diffDays === 0) {
+                if (deadlineTime) return 'до ' + deadlineTime;
+                return 'сегодня';
+            }
+            if (diffDays === 1) return 'до завтра';
+            // Форматируем дату
+            const months = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+            const day = deadline.getDate();
+            const month = months[deadline.getMonth()];
+            return 'до ' + day + ' ' + month;
+        } catch(e) {
+            return '';
+        }
     }
     
     function viewTask(taskId) {
@@ -2476,6 +2331,8 @@ MAIN_PAGE = '''
                 document.getElementById('viewTaskDate').value = task.date || '';
                 document.getElementById('viewTaskDuration').value = task.duration || '';
                 document.getElementById('viewTaskComment').value = task.comment || '';
+                document.getElementById('viewDeadlineDate').value = task.deadline_date || '';
+                document.getElementById('viewDeadlineTime').value = task.deadline_time || '';
                 document.getElementById('viewTaskCategorySelect').value = task.category || 'later';
                 
                 const isRepeating = task.repeat_type && task.repeat_type !== 'none';
@@ -2510,6 +2367,8 @@ MAIN_PAGE = '''
         const duration = document.getElementById('viewTaskDuration').value.trim();
         const comment = document.getElementById('viewTaskComment').value.trim();
         const category = document.getElementById('viewTaskCategorySelect').value;
+        const deadline_date = document.getElementById('viewDeadlineDate').value;
+        const deadline_time = document.getElementById('viewDeadlineTime').value;
         const isRepeating = document.getElementById('viewTaskRepeat').checked;
         let repeatType = 'none';
         let repeatDay = null;
@@ -2533,14 +2392,15 @@ MAIN_PAGE = '''
                 comment: comment,
                 category: category, 
                 repeat_type: repeatType, 
-                repeat_day: repeatDay 
+                repeat_day: repeatDay,
+                deadline_date: deadline_date,
+                deadline_time: deadline_time
             })
         })
         .then(res => res.json())
         .then(() => {
             document.getElementById('viewTaskModal').classList.remove('open');
             loadTasks();
-            loadBacklog();
         });
     });
     
@@ -2550,7 +2410,6 @@ MAIN_PAGE = '''
                 .then(() => {
                     document.getElementById('viewTaskModal').classList.remove('open');
                     loadTasks();
-                    loadBacklog();
                 });
         }
     });
@@ -2586,6 +2445,8 @@ MAIN_PAGE = '''
             document.getElementById('addTaskDate').value = currentViewDate;
             document.getElementById('addTaskDuration').value = '';
             document.getElementById('addTaskComment').value = '';
+            document.getElementById('addDeadlineDate').value = '';
+            document.getElementById('addDeadlineTime').value = '';
             document.getElementById('addTaskRepeat').checked = false;
             document.getElementById('addRepeatOptions').classList.remove('visible');
             document.getElementById('addWeeklyDayGroup').style.display = 'none';
@@ -2617,6 +2478,8 @@ MAIN_PAGE = '''
         const date = document.getElementById('addTaskDate').value;
         const duration = document.getElementById('addTaskDuration').value.trim();
         const comment = document.getElementById('addTaskComment').value.trim();
+        const deadline_date = document.getElementById('addDeadlineDate').value;
+        const deadline_time = document.getElementById('addDeadlineTime').value;
         const isRepeating = document.getElementById('addTaskRepeat').checked;
         let repeatType = 'none';
         let repeatDay = null;
@@ -2633,13 +2496,22 @@ MAIN_PAGE = '''
         fetch('/api/task/direct', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title: title, category: category, date: date, duration: duration, comment: comment, repeat_type: repeatType, repeat_day: repeatDay })
+            body: JSON.stringify({ 
+                title: title, 
+                category: category, 
+                date: date, 
+                duration: duration, 
+                comment: comment, 
+                repeat_type: repeatType, 
+                repeat_day: repeatDay,
+                deadline_date: deadline_date,
+                deadline_time: deadline_time
+            })
         })
         .then(res => res.json())
         .then(() => {
             document.getElementById('addTaskModal').classList.remove('open');
             loadTasks();
-            loadBacklog();
         });
     });
     
@@ -2664,62 +2536,6 @@ MAIN_PAGE = '''
         document.getElementById('addWeeklyDayGroup').style.display = this.value === 'weekly' ? 'block' : 'none';
     });
     
-    document.getElementById('addBacklogBtn').addEventListener('click', () => {
-        const input = document.getElementById('newTaskInput');
-        const title = input.value.trim();
-        if (!title) return;
-        
-        fetch('/api/task', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title: title })
-        })
-        .then(res => res.json())
-        .then(() => {
-            input.value = '';
-            loadTasks();
-            loadBacklog();
-        });
-    });
-    
-    document.getElementById('newTaskInput').addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') {
-            document.getElementById('addBacklogBtn').click();
-        }
-    });
-    
-    function loadBacklog() {
-        fetch('/api/tasks')
-            .then(res => res.json())
-            .then(tasks => {
-                const backlogTasks = tasks.filter(t => t.category === 'later');
-                const container = document.getElementById('backlogList');
-                container.innerHTML = '';
-                backlogTasks.forEach(task => {
-                    const item = document.createElement('div');
-                    item.className = 'backlog-item';
-                    item.innerHTML = `
-                        <span>${task.title}</span>
-                        <button class="move-btn" data-task-id="${task.id}" title="Переместить">→</button>
-                    `;
-                    container.appendChild(item);
-                });
-                
-                document.querySelectorAll('.move-btn').forEach(btn => {
-                    btn.addEventListener('click', function(e) {
-                        e.stopPropagation();
-                        const taskId = this.dataset.taskId;
-                        const task = backlogTasks.find(t => t.id == taskId);
-                        if (task) {
-                            document.getElementById('moveTaskId').value = taskId;
-                            document.getElementById('moveTaskTitle').textContent = '"' + task.title + '" → куда?';
-                            document.getElementById('moveModal').classList.add('open');
-                        }
-                    });
-                });
-            });
-    }
-    
     document.querySelectorAll('.move-cat-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const taskId = document.getElementById('moveTaskId').value;
@@ -2734,7 +2550,6 @@ MAIN_PAGE = '''
             .then(() => {
                 document.getElementById('moveModal').classList.remove('open');
                 loadTasks();
-                loadBacklog();
                 updateEmptyBlocks();
             });
         });
@@ -2755,7 +2570,6 @@ MAIN_PAGE = '''
     });
     
     loadTasks();
-    loadBacklog();
 </script>
 </body>
 </html>
