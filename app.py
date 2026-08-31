@@ -1,25 +1,24 @@
 # -*- coding: utf-8 -*-
 import os
 os.environ['TZ'] = 'Europe/Moscow'
-from flask import Flask, request, render_template_string, redirect, session, url_for, jsonify
+from flask import Flask, request, render_template_string, redirect, session, jsonify
 import psycopg2
 from psycopg2.extras import RealDictCursor
-import hashlib
-from datetime import datetime, timedelta
-import json
-import re
-from datetime import timezone
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
-app.secret_key = 'секретный_ключ_для_сессий_12345'
+# В продакшене обязательно задайте SECRET_KEY в переменных окружения.
+app.secret_key = os.environ.get('SECRET_KEY') or os.urandom(32)
 
 # --- ПОДКЛЮЧЕНИЕ К POSTGRESQL ---
 def get_db_connection():
     database_url = os.environ.get('DATABASE_URL')
     if not database_url:
-        database_url = "postgresql://organizer_user:пароль@localhost:5432/organizer"
-    conn = psycopg2.connect(database_url)
-    return conn
+        raise RuntimeError(
+            'Не задана переменная окружения DATABASE_URL. '             'Укажите строку подключения к PostgreSQL.'
+        )
+    return psycopg2.connect(database_url)
 
 # --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ (ДОБАВЛЕНЫ deadline_date И deadline_time) ---
 def init_db():
@@ -54,14 +53,15 @@ def init_db():
             later_group TEXT,
             sphere_id INTEGER,
             completed_at TIMESTAMP,
-            future BOOLEAN DEFAULT FALSE,
             comment TEXT,
-            position INTEGER DEFAULT 0,
-            deadline_date TEXT,
-            deadline_time TEXT
+            position INTEGER DEFAULT 0
         )
     ''')
     
+    # Мягкая миграция старых баз: добавляем новые поля без потери данных.
+    cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline_date TEXT")
+    cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline_time TEXT")
+
     cur.execute('''
         CREATE TABLE IF NOT EXISTS spheres (
             id SERIAL PRIMARY KEY,
@@ -87,8 +87,6 @@ def init_db():
 init_db()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-def get_user_id():
-    return session.get('user_id')
 
 def get_current_quarter():
     now = datetime.now()
@@ -567,7 +565,7 @@ def delete_sphere(sphere_id):
     cur.execute('SELECT name FROM spheres WHERE id = %s AND user_id = %s', (sphere_id, session['user_id']))
     sphere = cur.fetchone()
     if sphere:
-        cur.execute('UPDATE tasks SET category = %s, sphere = NULL, quarter = NULL, sphere_id = NULL WHERE user_id = %s AND sphere = %s', ('later', session['user_id'], sphere[0]))
+        cur.execute('UPDATE tasks SET category = %s, sphere = NULL, quarter = NULL, sphere_id = NULL WHERE user_id = %s AND sphere_id = %s', ('later', session['user_id'], sphere_id))
     cur.execute('DELETE FROM spheres WHERE id = %s AND user_id = %s', (sphere_id, session['user_id']))
     conn.commit()
     conn.close()
@@ -751,7 +749,7 @@ def done_task(task_id):
                                repeat_type, repeat_day, status, quarter, sphere, later_group, 
                                sphere_id, completed_at, comment, deadline_date, deadline_time)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (task['user_id'], task['title'], task['category'], task['default_category'],
+        ''', (task['user_id'], task['title'], task['category'], default_cat,
               task['date'], task['duration'], 'none', None, 'done', 
               task['quarter'], task['sphere'], task['later_group'], 
               task['sphere_id'], now_msk, task['comment'], task.get('deadline_date', ''), task.get('deadline_time', '')))
@@ -788,7 +786,7 @@ def done_task(task_id):
                                repeat_type, repeat_day, status, quarter, sphere, later_group, 
                                sphere_id, completed_at, comment, deadline_date, deadline_time)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (task['user_id'], task['title'], task['category'], task['default_category'],
+        ''', (task['user_id'], task['title'], task['category'], default_cat,
               task['date'], task['duration'], 'none', None, 'done', 
               task['quarter'], task['sphere'], task['later_group'], 
               task['sphere_id'], now_msk, task['comment'], task.get('deadline_date', ''), task.get('deadline_time', '')))
@@ -839,11 +837,7 @@ def get_done_tasks():
     tasks = cur.fetchall()
     conn.close()
     
-    result = []
-    for task in tasks:
-        result.append(dict(task))
-    
-    return jsonify(result)
+    return jsonify([dict(task) for task in tasks])
 
 # --- API: Переместить задачу (НЕ МЕНЯЕМ default_category) ---
 @app.route('/api/task/<int:task_id>/move', methods=['PUT'])
@@ -882,11 +876,7 @@ def get_tasks_by_date(date_str):
     tasks = cur.fetchall()
     conn.close()
     
-    result = []
-    for task in tasks:
-        result.append(dict(task))
-    
-    return jsonify(result)
+    return jsonify([dict(task) for task in tasks])
 
 # --- API: Обновить порядок задач ---
 @app.route('/api/tasks/reorder', methods=['POST'])
@@ -959,14 +949,16 @@ def move_tasks_to_date():
 def register():
     error = None
     if request.method == 'POST':
-        username = request.form['username'].strip()
-        password = hashlib.md5(request.form['password'].encode()).hexdigest()
+        username = request.form.get('username', '').strip()
+        raw_password = request.form.get('password', '')
         email = request.form.get('email', '').strip()
         phone = request.form.get('phone', '').strip()
         
-        if not username or not password:
+        if not username or not raw_password:
             error = 'Заполните все обязательные поля'
             return render_template_string(REGISTER_PAGE, error=error)
+        
+        password = generate_password_hash(raw_password)
         
         conn = get_db_connection()
         cur = conn.cursor()
@@ -988,21 +980,42 @@ def register():
 def login():
     error = None
     if request.method == 'POST':
-        username = request.form['username'].strip()
-        password = hashlib.md5(request.form['password'].encode()).hexdigest()
+        username = request.form.get('username', '').strip()
+        raw_password = request.form.get('password', '')
         
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute('SELECT id, username FROM users WHERE username = %s AND password = %s', (username, password))
+        cur.execute('SELECT id, username, password FROM users WHERE username = %s', (username,))
         user = cur.fetchone()
-        conn.close()
         
+        valid_password = False
         if user:
+            stored_password = user['password'] or ''
+            try:
+                valid_password = check_password_hash(stored_password, raw_password)
+            except (ValueError, TypeError):
+                valid_password = False
+            
+            # Однократно поддерживаем старые MD5-пароли и сразу заменяем их
+            # на безопасный хеш после успешного входа.
+            if not valid_password and len(stored_password) == 32:
+                import hashlib
+                if hashlib.md5(raw_password.encode('utf-8')).hexdigest() == stored_password:
+                    valid_password = True
+                    cur.execute(
+                        'UPDATE users SET password = %s WHERE id = %s',
+                        (generate_password_hash(raw_password), user['id'])
+                    )
+        
+        if user and valid_password:
+            conn.commit()
+            conn.close()
             session['user_id'] = user['id']
             session['username'] = user['username']
             return redirect('/')
-        else:
-            error = 'Неверный логин или пароль'
+        
+        conn.close()
+        error = 'Неверный логин или пароль'
     
     return render_template_string(LOGIN_PAGE, error=error)
 
