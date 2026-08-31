@@ -53,6 +53,7 @@ def init_db():
             later_group TEXT,
             sphere_id INTEGER,
             completed_at TIMESTAMP,
+            future BOOLEAN DEFAULT FALSE,
             comment TEXT,
             position INTEGER DEFAULT 0
         )
@@ -172,15 +173,15 @@ def format_deadline(deadline_date, deadline_time, current_date):
     elif days_diff == 0:
         # Сегодня
         if deadline_time and deadline_time.strip():
-            return f'⏳ до {deadline_time}'
+            return f'⏰ до {deadline_time}'
         else:
-            return '⏳ сегодня'
+            return '⏰ сегодня'
     elif days_diff == 1:
         # Завтра
-        return f'⏳ до завтра'
+        return f'⏰ до завтра'
     else:
         # В будущем
-        return f'⏳ до {format_date_ru(deadline_date)}'
+        return f'⏰ до {format_date_ru(deadline_date)}'
     
     return ''
 
@@ -878,6 +879,29 @@ def get_tasks_by_date(date_str):
     
     return jsonify([dict(task) for task in tasks])
 
+# --- API: Поиск среди активных задач ---
+@app.route('/api/tasks/search')
+def search_tasks():
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    query = (request.args.get('q') or '').strip()
+    if not query:
+        return jsonify([])
+    pattern = '%' + query + '%'
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('''
+        SELECT id, title, date, category, comment, deadline_date, deadline_time
+        FROM tasks
+        WHERE user_id = %s AND status = 'active'
+          AND (title ILIKE %s OR COALESCE(comment, '') ILIKE %s)
+        ORDER BY CASE WHEN date IS NULL OR date = '' THEN 1 ELSE 0 END, date ASC, position ASC, id ASC
+        LIMIT 30
+    ''', (session['user_id'], pattern, pattern))
+    tasks = cur.fetchall()
+    conn.close()
+    return jsonify([dict(task) for task in tasks])
+
 # --- API: Обновить порядок задач ---
 @app.route('/api/tasks/reorder', methods=['POST'])
 def reorder_tasks():
@@ -1161,13 +1185,14 @@ MAIN_PAGE = '''
         .header .btn-exit:hover { background: #c5b8d8; }
         
         .date-nav {
+            position: relative;
             display: flex;
             align-items: center;
             justify-content: center;
-            gap: 16px;
+            gap: 12px;
             margin-bottom: 16px;
             background: #fcfaff;
-            padding: 10px 20px;
+            padding: 8px 14px;
             border-radius: 12px;
             box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
         }
@@ -1209,6 +1234,24 @@ MAIN_PAGE = '''
             border-radius: 12px;
             margin-left: 6px;
         }
+
+        .search-area { display: flex; align-items: center; margin-left: auto; position: relative; }
+        .search-toggle { border: none; background: transparent; color: #8b7bb5; cursor: pointer; padding: 6px 10px; border-radius: 8px; font-size: 13px; white-space: nowrap; transition: 0.2s; }
+        .search-toggle:hover { background: #ede5f5; }
+        .search-box { width: 0; opacity: 0; overflow: hidden; transition: width 0.25s ease, opacity 0.2s ease; }
+        .search-area.expanded .search-box { width: 230px; opacity: 1; }
+        .search-input { width: 100%; border: 1.5px solid #ede5f5; border-radius: 8px; padding: 7px 10px; font-size: 13px; color: #4a3f5e; background: white; outline: none; margin: 0; }
+        .search-input:focus { border-color: #8b7bb5; }
+        .search-results { display: none; position: absolute; z-index: 1000; top: calc(100% + 6px); right: 0; width: min(420px, calc(100vw - 32px)); max-height: 360px; overflow-y: auto; background: white; border: 1px solid #ede5f5; border-radius: 12px; box-shadow: 0 8px 24px rgba(74, 63, 94, 0.14); }
+        .search-results.visible { display: block; }
+        .search-result { padding: 10px 12px; border-bottom: 1px solid #f0eaf7; cursor: pointer; transition: background 0.15s; }
+        .search-result:last-child { border-bottom: none; }
+        .search-result:hover { background: #f8f4fc; }
+        .search-result-title { color: #4a3f5e; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+        .search-result-meta { color: #a095b5; font-size: 11px; }
+        .search-empty { padding: 14px; color: #a095b5; text-align: center; font-size: 13px; }
+        .flatpickr-calendar { border-radius: 12px; box-shadow: 0 8px 30px rgba(74, 63, 94, 0.16); font-family: 'Segoe UI', sans-serif; }
+        .flatpickr-day.selected, .flatpickr-day.selected:hover { background: #8b7bb5; border-color: #8b7bb5; }
         
         .selection-panel {
             display: none;
@@ -1317,11 +1360,6 @@ MAIN_PAGE = '''
         .focus-block .empty-block { color: #c5b8d8; font-size: 13px; text-align: center; padding: 16px; }
         
         .block-grid {
-            display: flex;
-            flex-direction: column;
-            gap: 14px;
-        }
-        .block-row {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 14px;
@@ -1333,12 +1371,8 @@ MAIN_PAGE = '''
             box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
             min-height: 180px;
             transition: opacity 0.3s, transform 0.3s;
-            order: 1;
         }
-        .block.empty {
-            opacity: 0.6;
-            order: 999;
-        }
+        .block.empty { opacity: 0.6; }
         .block .block-header {
             font-size: 14px;
             font-weight: 600;
@@ -1727,8 +1761,11 @@ MAIN_PAGE = '''
             .right-column .waiting-block { flex: 1; min-width: 120px; }
             .center-column { flex: 1 1 100%; }
             .block { min-height: 140px; }
-            .block-row { grid-template-columns: 1fr 1fr; }
+            .block-grid { grid-template-columns: 1fr 1fr; }
             .date-nav .date-label { font-size: 14px; min-width: 100px; }
+            .date-nav { gap: 6px; padding: 8px 10px; }
+            .search-area.expanded .search-box { width: 170px; }
+            .search-toggle { padding: 6px 7px; font-size: 12px; }
             .header { flex-direction: column; text-align: center; }
             .modal { padding: 18px 16px; }
             .task-card { padding: 8px 10px; }
@@ -1738,14 +1775,21 @@ MAIN_PAGE = '''
             .move-date-input { flex-direction: column; align-items: stretch; }
         }
         @media (max-width: 480px) {
-            .block-row { grid-template-columns: 1fr; }
+            .block-grid { grid-template-columns: 1fr; }
             .date-nav .date-label { font-size: 12px; min-width: 80px; }
+            .search-area.expanded .search-box { width: 140px; }
+            .search-toggle { font-size: 0; padding: 6px; }
+            .search-toggle::before { content: '🔎'; font-size: 15px; }
             .date-nav .nav-btn { font-size: 16px; }
             .right-column .sidebar-card { min-width: 100px; }
             .right-column .waiting-block { min-width: 100px; }
             .right-column .sidebar-card .big-btn { font-size: 13px; padding: 10px; }
         }
     </style>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/themes/airbnb.css">
+    <script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/l10n/ru.js"></script>
 </head>
 <body>
 <div class="app-container">
@@ -1759,7 +1803,7 @@ MAIN_PAGE = '''
             </div>
         </div>
 
-        <div class="date-nav">
+        <div class="date-nav" id="dateNav">
             <a href="/?date={{ prev_date }}" class="nav-btn">◀</a>
             <span class="date-label">
                 {{ date_label }}
@@ -1767,6 +1811,13 @@ MAIN_PAGE = '''
                 {% if is_tomorrow %}<span class="tomorrow-badge">завтра</span>{% endif %}
             </span>
             <a href="/?date={{ next_date }}" class="nav-btn">▶</a>
+            <div class="search-area" id="searchArea">
+                <button type="button" class="search-toggle" id="searchToggle">🔎 Поиск задач</button>
+                <div class="search-box">
+                    <input type="search" class="search-input" id="taskSearchInput" placeholder="Найти задачу..." autocomplete="off">
+                </div>
+                <div class="search-results" id="searchResults"></div>
+            </div>
         </div>
 
         <div class="selection-panel" id="selectionPanel">
@@ -1793,29 +1844,25 @@ MAIN_PAGE = '''
         </div>
 
         <div class="block-grid" id="blockGrid">
-            <div class="block-row">
-                <div class="block block-urgent" id="block-urgent">
-                    <div class="block-header">⚡ До 15 минут <span class="count" id="count-urgent">0</span></div>
-                    <div id="tasks-urgent"></div>
-                    <button class="add-task-btn" data-category="urgent">+</button>
-                </div>
-                <div class="block block-work" id="block-work">
-                    <div class="block-header">💼 Работа <span class="count" id="count-work">0</span></div>
-                    <div id="tasks-work"></div>
-                    <button class="add-task-btn" data-category="work">+</button>
-                </div>
+            <div class="block block-urgent" id="block-urgent">
+                <div class="block-header">⚡ До 15 минут <span class="count" id="count-urgent">0</span></div>
+                <div id="tasks-urgent"></div>
+                <button class="add-task-btn" data-category="urgent">+</button>
             </div>
-            <div class="block-row">
-                <div class="block block-home" id="block-home">
-                    <div class="block-header">🏠 Дом <span class="count" id="count-home">0</span></div>
-                    <div id="tasks-home"></div>
-                    <button class="add-task-btn" data-category="home">+</button>
-                </div>
-                <div class="block block-personal" id="block-personal">
-                    <div class="block-header">❤️ Личное <span class="count" id="count-personal">0</span></div>
-                    <div id="tasks-personal"></div>
-                    <button class="add-task-btn" data-category="personal">+</button>
-                </div>
+            <div class="block block-work" id="block-work">
+                <div class="block-header">💼 Работа <span class="count" id="count-work">0</span></div>
+                <div id="tasks-work"></div>
+                <button class="add-task-btn" data-category="work">+</button>
+            </div>
+            <div class="block block-home" id="block-home">
+                <div class="block-header">🏠 Дом <span class="count" id="count-home">0</span></div>
+                <div id="tasks-home"></div>
+                <button class="add-task-btn" data-category="home">+</button>
+            </div>
+            <div class="block block-personal" id="block-personal">
+                <div class="block-header">❤️ Личное <span class="count" id="count-personal">0</span></div>
+                <div id="tasks-personal"></div>
+                <button class="add-task-btn" data-category="personal">+</button>
             </div>
         </div>
     </div>
@@ -1986,6 +2033,8 @@ MAIN_PAGE = '''
         initDragDrop();
         updateEmptyBlocks();
         updateSelectionPanel();
+        initTaskSearch();
+        initDatePickers();
     });
     
     function toggleTaskSelection(taskId) {
@@ -2141,8 +2190,22 @@ MAIN_PAGE = '''
         }
     }
     
+    function getTaskContainer(block) {
+        if (!block) return null;
+        return block.querySelector('[id^="tasks-"]') || block.querySelector('#focusTasks');
+    }
+
+    function getBlockCategory(block) {
+        if (!block) return '';
+        const categoryById = {
+            'focusBlock': 'focus', 'block-urgent': 'urgent', 'block-work': 'work',
+            'block-home': 'home', 'block-personal': 'personal', 'block-waiting': 'waiting'
+        };
+        return categoryById[block.id] || '';
+    }
+
     function reorderTasks(block, taskId, targetElement) {
-        const container = block.querySelector('[id^="tasks-"]');
+        const container = getTaskContainer(block);
         if (!container) return;
         const cards = container.querySelectorAll('.task-card');
         let targetIndex = -1;
@@ -2175,27 +2238,13 @@ MAIN_PAGE = '''
     function saveOrder() {
         const blocks = document.querySelectorAll('.block, .focus-block, .waiting-block');
         blocks.forEach(block => {
-            const container = block.querySelector('[id^="tasks-"]');
+            const container = getTaskContainer(block);
             if (!container) return;
             const cards = container.querySelectorAll('.task-card');
             if (cards.length === 0) return;
             
-            let category = '';
-            if (block.id === 'focusBlock') {
-                category = 'focus';
-            } else if (block.id === 'block-urgent') {
-                category = 'urgent';
-            } else if (block.id === 'block-work') {
-                category = 'work';
-            } else if (block.id === 'block-home') {
-                category = 'home';
-            } else if (block.id === 'block-personal') {
-                category = 'personal';
-            } else if (block.id === 'block-waiting') {
-                category = 'waiting';
-            } else {
-                return;
-            }
+            const category = getBlockCategory(block);
+            if (!category) return;
             
             const taskIds = [];
             cards.forEach(card => {
@@ -2218,24 +2267,10 @@ MAIN_PAGE = '''
     }
     
     function updatePositions(block) {
-        const container = block.querySelector('[id^="tasks-"]');
+        const container = getTaskContainer(block);
         if (!container) return;
         const cards = container.querySelectorAll('.task-card');
-        let category = '';
-        
-        if (block.id === 'focusBlock') {
-            category = 'focus';
-        } else if (block.id === 'block-urgent') {
-            category = 'urgent';
-        } else if (block.id === 'block-work') {
-            category = 'work';
-        } else if (block.id === 'block-home') {
-            category = 'home';
-        } else if (block.id === 'block-personal') {
-            category = 'personal';
-        } else if (block.id === 'block-waiting') {
-            category = 'waiting';
-        }
+        const category = getBlockCategory(block);
         if (!category) return;
         
         const countEl = document.getElementById('count-' + category);
@@ -2247,17 +2282,14 @@ MAIN_PAGE = '''
     }
     
     function updateEmptyBlocks() {
-        const blocks = document.querySelectorAll('.block');
-        blocks.forEach(block => {
-            const container = block.querySelector('[id^="tasks-"]');
-            if (container) {
-                const tasks = container.querySelectorAll('.task-card');
-                if (tasks.length === 0) {
-                    block.classList.add('empty');
-                } else {
-                    block.classList.remove('empty');
-                }
-            }
+        const blockGrid = document.getElementById('blockGrid');
+        if (!blockGrid) return;
+        const blocks = Array.from(blockGrid.querySelectorAll('.block'));
+        blocks.forEach((block, index) => {
+            const container = getTaskContainer(block);
+            const hasTasks = !!(container && container.querySelector('.task-card'));
+            block.classList.toggle('empty', !hasTasks);
+            block.style.order = hasTasks ? index : blocks.length + index;
         });
     }
     
@@ -2439,19 +2471,125 @@ MAIN_PAGE = '''
             
             if (diffDays < 0) return '🔴 просрочен!';
             if (diffDays === 0) {
-                if (deadlineTime) return '⏳ до ' + deadlineTime;
-                return '⏳ сегодня';
+                if (deadlineTime) return '⏰ до ' + deadlineTime;
+                return '⏰ сегодня';
             }
-            if (diffDays === 1) return '⏳ до завтра';
+            if (diffDays === 1) return '⏰ до завтра';
             const months = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
             const day = deadline.getDate();
             const month = months[deadline.getMonth()];
-            return '⏳ до ' + day + ' ' + month;
+            return '⏰ до ' + day + ' ' + month;
         } catch(e) {
             return '';
         }
     }
     
+    let searchTimeout = null;
+
+    function escapeHtml(value) {
+        return String(value ?? '').replace(/[&<>"']/g, function(char) {
+            return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'})[char];
+        });
+    }
+
+    function formatSearchDate(dateStr) {
+        if (!dateStr) return 'Без даты';
+        try {
+            const date = new Date(dateStr + 'T00:00:00');
+            const months = ['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];
+            return date.getDate() + ' ' + months[date.getMonth()];
+        } catch (e) { return dateStr; }
+    }
+
+    function getSearchCategoryName(category) {
+        const names = { focus:'🎯 Фокус', urgent:'⚡ До 15 минут', work:'💼 Работа', home:'🏠 Дом', personal:'❤️ Личное', waiting:'⏳ Жду ответа', later:'🕰️ Позже' };
+        return names[category] || category || '';
+    }
+
+    function renderSearchResults(tasks) {
+        const results = document.getElementById('searchResults');
+        if (!results) return;
+        if (!tasks.length) {
+            results.innerHTML = '<div class="search-empty">Ничего не найдено</div>';
+            results.classList.add('visible');
+            return;
+        }
+        results.innerHTML = tasks.map(task => `
+            <div class="search-result" data-task-id="${task.id}">
+                <div class="search-result-title">${escapeHtml(task.title)}</div>
+                <div class="search-result-meta">📅 ${escapeHtml(formatSearchDate(task.date))} · ${escapeHtml(getSearchCategoryName(task.category))}</div>
+            </div>
+        `).join('');
+        results.querySelectorAll('.search-result').forEach(item => {
+            item.addEventListener('click', function() {
+                viewTask(this.dataset.taskId);
+                results.classList.remove('visible');
+            });
+        });
+        results.classList.add('visible');
+    }
+
+    function performTaskSearch(query) {
+        const trimmed = query.trim();
+        const results = document.getElementById('searchResults');
+        if (!results) return;
+        if (!trimmed) {
+            results.innerHTML = '';
+            results.classList.remove('visible');
+            return;
+        }
+        fetch('/api/tasks/search?q=' + encodeURIComponent(trimmed))
+            .then(res => res.json())
+            .then(tasks => renderSearchResults(tasks))
+            .catch(() => {
+                results.innerHTML = '<div class="search-empty">Не удалось выполнить поиск</div>';
+                results.classList.add('visible');
+            });
+    }
+
+    function initTaskSearch() {
+        const area = document.getElementById('searchArea');
+        const toggle = document.getElementById('searchToggle');
+        const input = document.getElementById('taskSearchInput');
+        if (!area || !toggle || !input) return;
+        toggle.addEventListener('click', function() {
+            area.classList.add('expanded');
+            setTimeout(() => input.focus(), 120);
+        });
+        input.addEventListener('input', function() {
+            clearTimeout(searchTimeout);
+            const query = this.value;
+            searchTimeout = setTimeout(() => performTaskSearch(query), 250);
+        });
+        input.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                this.value = '';
+                document.getElementById('searchResults').classList.remove('visible');
+                area.classList.remove('expanded');
+                toggle.focus();
+            }
+        });
+        document.addEventListener('click', function(e) {
+            if (!area.contains(e.target)) document.getElementById('searchResults').classList.remove('visible');
+        });
+    }
+
+    function setDateInputValue(id, value) {
+        const input = document.getElementById(id);
+        if (!input) return;
+        if (input._flatpickr) input._flatpickr.setDate(value || null, false);
+        else input.value = value || '';
+    }
+
+    function initDatePickers() {
+        if (typeof flatpickr === 'undefined') return;
+        flatpickr.localize(flatpickr.l10ns.ru);
+        document.querySelectorAll('input[type="date"]').forEach(input => {
+            if (input._flatpickr) return;
+            flatpickr(input, { locale: flatpickr.l10ns.ru, dateFormat: 'Y-m-d', altInput: true, altFormat: 'j F Y', allowInput: true, disableMobile: true });
+        });
+    }
+
     function viewTask(taskId) {
         fetch('/api/task/' + taskId)
             .then(res => res.json())
@@ -2460,10 +2598,10 @@ MAIN_PAGE = '''
                 document.getElementById('viewTaskId').value = task.id;
                 document.getElementById('viewTaskTitle').textContent = '📌 ' + task.title;
                 document.getElementById('viewTaskTitleInput').value = task.title || '';
-                document.getElementById('viewTaskDate').value = task.date || '';
+                setDateInputValue('viewTaskDate', task.date || '');
                 document.getElementById('viewTaskDuration').value = task.duration || '';
                 document.getElementById('viewTaskComment').value = task.comment || '';
-                document.getElementById('viewDeadlineDate').value = task.deadline_date || '';
+                setDateInputValue('viewDeadlineDate', task.deadline_date || '');
                 document.getElementById('viewDeadlineTime').value = task.deadline_time || '';
                 document.getElementById('viewTaskCategorySelect').value = task.category || 'later';
                 
@@ -2574,10 +2712,10 @@ MAIN_PAGE = '''
             document.getElementById('addTaskCategory').value = category;
             document.getElementById('addTaskModalSub').textContent = 'Добавьте задачу в категорию: ' + getCategoryName(category);
             document.getElementById('addTaskTitle').value = '';
-            document.getElementById('addTaskDate').value = currentViewDate;
+            setDateInputValue('addTaskDate', currentViewDate);
             document.getElementById('addTaskDuration').value = '';
             document.getElementById('addTaskComment').value = '';
-            document.getElementById('addDeadlineDate').value = '';
+            setDateInputValue('addDeadlineDate', '');
             document.getElementById('addDeadlineTime').value = '';
             document.getElementById('addTaskRepeat').checked = false;
             document.getElementById('addRepeatOptions').classList.remove('visible');
