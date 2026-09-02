@@ -89,6 +89,10 @@ init_db()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
+def get_now_utc():
+    """Current UTC time stored as a naive timestamp for PostgreSQL TIMESTAMP columns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 def get_current_quarter():
     now = datetime.now()
     month = now.month
@@ -386,7 +390,7 @@ def done_page():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    cutoff = get_now_msk() - timedelta(hours=36)
+    cutoff = get_now_utc() - timedelta(hours=36)
     cur.execute('''
         SELECT * FROM tasks 
         WHERE user_id = %s AND status = %s AND completed_at >= %s
@@ -395,105 +399,103 @@ def done_page():
     tasks = cur.fetchall()
     conn.close()
     
-    tasks_by_date = {}
-    for task in tasks:
-        if task['completed_at']:
-            date_key = task['completed_at'].strftime('%Y-%m-%d')
-            if date_key not in tasks_by_date:
-                tasks_by_date[date_key] = []
-            tasks_by_date[date_key].append(dict(task))
-    
-    sorted_dates = sorted(tasks_by_date.keys(), reverse=True)
-    
-    return render_template_string(DONE_PAGE, 
-                                   tasks_by_date=tasks_by_date,
-                                   sorted_dates=sorted_dates,
-                                   format_date_with_weekday=format_date_with_weekday,
-                                   username=session.get('username', 'Пользователь'))
+    # Дату и время выполнения группирует браузер по часовому поясу устройства.
+    return render_template_string(DONE_PAGE, username=session.get('username', 'Пользователь'))
 
 # --- API: Добавить задачу в "Позже" ---
 @app.route('/api/task/later', methods=['POST'])
 def add_later_task():
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
-    
-    data = request.json
+    data = request.json or {}
     title = data.get('title', '').strip()
-    
     if not title:
         return jsonify({'error': 'Title is required'}), 400
-    
     conn = get_db_connection()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute('''
         INSERT INTO tasks (user_id, title, category, default_category, date, duration, repeat_type, repeat_day, status)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING *
     ''', (session['user_id'], title, 'later', 'later', '', '', 'none', None, 'active'))
+    task = cur.fetchone()
     conn.commit()
     conn.close()
-    
-    return jsonify({'success': True, 'message': 'Task added to later'})
+    return jsonify({'success': True, 'task': dict(task)})
 
 # --- API: Добавить группу в "Позже" ---
 @app.route('/api/later/group', methods=['POST'])
 def add_later_group():
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
-    
-    data = request.json
+    data = request.json or {}
     name = data.get('name', '').strip()
-    
     if not name:
         return jsonify({'error': 'Name is required'}), 400
-    
     conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('INSERT INTO later_groups (user_id, name) VALUES (%s, %s)', (session['user_id'], name))
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('INSERT INTO later_groups (user_id, name) VALUES (%s, %s) RETURNING id, name', (session['user_id'], name))
+    group = cur.fetchone()
     conn.commit()
     conn.close()
-    
-    return jsonify({'success': True, 'message': 'Group added'})
+    return jsonify({'success': True, 'group': dict(group)})
+
+@app.route('/api/later/groups')
+def get_later_groups():
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT id, name FROM later_groups WHERE user_id = %s ORDER BY created_at ASC', (session['user_id'],))
+    groups = cur.fetchall()
+    conn.close()
+    return jsonify([dict(group) for group in groups])
 
 # --- API: Добавить задачу в группу "Позже" ---
 @app.route('/api/task/later/group', methods=['POST'])
 def add_task_to_later_group():
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
-    
-    data = request.json
+    data = request.json or {}
     title = data.get('title', '').strip()
-    group = data.get('group', '')
-    
+    group = data.get('group', '').strip()
     if not title or not group:
         return jsonify({'error': 'Title and group are required'}), 400
-    
     conn = get_db_connection()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT name FROM later_groups WHERE user_id = %s AND name = %s', (session['user_id'], group))
+    if not cur.fetchone():
+        conn.close()
+        return jsonify({'error': 'Group not found'}), 404
     cur.execute('''
         INSERT INTO tasks (user_id, title, category, default_category, date, duration, repeat_type, repeat_day, status, later_group)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING *
     ''', (session['user_id'], title, 'later', 'later', '', '', 'none', None, 'active', group))
+    task = cur.fetchone()
     conn.commit()
     conn.close()
-    
-    return jsonify({'success': True, 'message': 'Task added to later group'})
+    return jsonify({'success': True, 'task': dict(task)})
 
 # --- API: Переместить задачу в группу "Позже" ---
 @app.route('/api/task/<int:task_id>/move_to_later_group', methods=['PUT'])
 def move_to_later_group(task_id):
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
-    
-    data = request.json
-    group = data.get('group', '')
-    
+    data = request.json or {}
+    group = data.get('group', '').strip()
+    if not group:
+        return jsonify({'error': 'Group is required'}), 400
     conn = get_db_connection()
     cur = conn.cursor()
+    cur.execute('SELECT 1 FROM later_groups WHERE user_id = %s AND name = %s', (session['user_id'], group))
+    if not cur.fetchone():
+        conn.close()
+        return jsonify({'error': 'Group not found'}), 404
     cur.execute('UPDATE tasks SET later_group = %s WHERE id = %s AND user_id = %s', (group, task_id, session['user_id']))
     conn.commit()
     conn.close()
-    
-    return jsonify({'success': True, 'message': 'Task moved to later group'})
+    return jsonify({'success': True, 'group': group})
 
 # --- API: Удалить группу "Позже" ---
 @app.route('/api/later/group/<int:group_id>', methods=['DELETE'])
@@ -728,20 +730,15 @@ def done_task(task_id):
         conn.close()
         return jsonify({'error': 'Task not found'}), 404
     
-    now_msk = get_now_msk()
+    now_utc = get_now_utc()
     
     if task['repeat_type'] == 'none':
-        cur.execute('UPDATE tasks SET status = %s, completed_at = %s WHERE id = %s', ('done', now_msk, task_id))
+        cur.execute('UPDATE tasks SET status = %s, completed_at = %s WHERE id = %s', ('done', now_utc, task_id))
     
     elif task['repeat_type'] == 'daily':
-        if task['date'] and task['date'] != '':
-            try:
-                current_date = datetime.strptime(task['date'], '%Y-%m-%d').date()
-                new_date = current_date + timedelta(days=1)
-            except:
-                new_date = datetime.now().date() + timedelta(days=1)
-        else:
-            new_date = datetime.now().date() + timedelta(days=1)
+        # Повтор строим от фактического дня выполнения, а не от старой даты задачи.
+        completion_date = datetime.now().date()
+        new_date = completion_date + timedelta(days=1)
         
         default_cat = task.get('default_category') or 'personal'
         
@@ -753,7 +750,7 @@ def done_task(task_id):
         ''', (task['user_id'], task['title'], task['category'], default_cat,
               task['date'], task['duration'], 'none', None, 'done', 
               task['quarter'], task['sphere'], task['later_group'], 
-              task['sphere_id'], now_msk, task['comment'], task.get('deadline_date', ''), task.get('deadline_time', '')))
+              task['sphere_id'], now_utc, task['comment'], task.get('deadline_date', ''), task.get('deadline_time', '')))
         
         cur.execute('''
             UPDATE tasks SET 
@@ -765,20 +762,15 @@ def done_task(task_id):
         ''', (new_date.strftime('%Y-%m-%d'), default_cat, task_id))
     
     elif task['repeat_type'] == 'weekly' and task['repeat_day'] is not None:
-        if task['date'] and task['date'] != '':
-            try:
-                current_date = datetime.strptime(task['date'], '%Y-%m-%d').date()
-            except:
-                current_date = datetime.now().date()
-        else:
-            current_date = datetime.now().date()
-        
-        target_day = task['repeat_day']
-        current_weekday = (current_date.weekday() + 1) % 7
-        days_ahead = target_day - current_weekday
-        if days_ahead <= 0:
-            days_ahead += 7
-        new_date = current_date + timedelta(days=days_ahead)
+        # Всегда выбираем ближайший СЛЕДУЮЩИЙ заданный день недели
+        # относительно фактического дня выполнения.
+        completion_date = datetime.now().date()
+        target_day = int(task['repeat_day'])  # 0=вс, 1=пн, ... 6=сб
+        completion_weekday = (completion_date.weekday() + 1) % 7
+        days_ahead = (target_day - completion_weekday) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+        new_date = completion_date + timedelta(days=days_ahead)
         
         default_cat = task.get('default_category') or 'personal'
         
@@ -790,7 +782,7 @@ def done_task(task_id):
         ''', (task['user_id'], task['title'], task['category'], default_cat,
               task['date'], task['duration'], 'none', None, 'done', 
               task['quarter'], task['sphere'], task['later_group'], 
-              task['sphere_id'], now_msk, task['comment'], task.get('deadline_date', ''), task.get('deadline_time', '')))
+              task['sphere_id'], now_utc, task['comment'], task.get('deadline_date', ''), task.get('deadline_time', '')))
         
         cur.execute('''
             UPDATE tasks SET 
@@ -829,7 +821,7 @@ def get_done_tasks():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    cutoff = get_now_msk() - timedelta(hours=36)
+    cutoff = get_now_utc() - timedelta(hours=36)
     cur.execute('''
         SELECT * FROM tasks 
         WHERE user_id = %s AND status = %s AND completed_at >= %s
@@ -838,7 +830,15 @@ def get_done_tasks():
     tasks = cur.fetchall()
     conn.close()
     
-    return jsonify([dict(task) for task in tasks])
+    result = []
+    for task in tasks:
+        item = dict(task)
+        if item.get('completed_at'):
+            # В базе completed_at хранится в UTC. Суффикс Z сообщает браузеру,
+            # что время нужно преобразовать в часовой пояс текущего устройства.
+            item['completed_at'] = item['completed_at'].isoformat(timespec='seconds') + 'Z'
+        result.append(item)
+    return jsonify(result)
 
 # --- API: Переместить задачу (НЕ МЕНЯЕМ default_category) ---
 @app.route('/api/task/<int:task_id>/move', methods=['PUT'])
@@ -1235,14 +1235,23 @@ MAIN_PAGE = '''
             margin-left: 6px;
         }
 
-        .search-area { display: flex; align-items: center; margin-left: auto; position: relative; }
+        .date-center {
+            position: absolute;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+        }
+        .search-area { display: flex; align-items: center; margin-left: auto; position: relative; z-index: 5; }
         .search-toggle { border: none; background: transparent; color: #8b7bb5; cursor: pointer; padding: 6px 10px; border-radius: 8px; font-size: 13px; white-space: nowrap; transition: 0.2s; }
         .search-toggle:hover { background: #ede5f5; }
-        .search-box { width: 0; opacity: 0; overflow: hidden; transition: width 0.25s ease, opacity 0.2s ease; }
-        .search-area.expanded .search-box { width: 230px; opacity: 1; }
+        .search-box { position: absolute; top: calc(100% + 6px); right: 0; width: 0; opacity: 0; overflow: hidden; transition: width 0.25s ease, opacity 0.2s ease; }
+        .search-area.expanded .search-box { width: 230px; opacity: 1; overflow: visible; }
         .search-input { width: 100%; border: 1.5px solid #ede5f5; border-radius: 8px; padding: 7px 10px; font-size: 13px; color: #4a3f5e; background: white; outline: none; margin: 0; }
         .search-input:focus { border-color: #8b7bb5; }
-        .search-results { display: none; position: absolute; z-index: 1000; top: calc(100% + 6px); right: 0; width: min(420px, calc(100vw - 32px)); max-height: 360px; overflow-y: auto; background: white; border: 1px solid #ede5f5; border-radius: 12px; box-shadow: 0 8px 24px rgba(74, 63, 94, 0.14); }
+        .search-results { display: none; position: absolute; z-index: 1000; top: calc(100% + 46px); right: 0; width: min(420px, calc(100vw - 32px)); max-height: 360px; overflow-y: auto; background: white; border: 1px solid #ede5f5; border-radius: 12px; box-shadow: 0 8px 24px rgba(74, 63, 94, 0.14); }
         .search-results.visible { display: block; }
         .search-result { padding: 10px 12px; border-bottom: 1px solid #f0eaf7; cursor: pointer; transition: background 0.15s; }
         .search-result:last-child { border-bottom: none; }
@@ -1804,13 +1813,15 @@ MAIN_PAGE = '''
         </div>
 
         <div class="date-nav" id="dateNav">
-            <a href="/?date={{ prev_date }}" class="nav-btn">◀</a>
-            <span class="date-label">
-                {{ date_label }}
-                {% if is_today %}<span class="today-badge">сегодня</span>{% endif %}
-                {% if is_tomorrow %}<span class="tomorrow-badge">завтра</span>{% endif %}
-            </span>
-            <a href="/?date={{ next_date }}" class="nav-btn">▶</a>
+            <div class="date-center">
+                <a href="/?date={{ prev_date }}" class="nav-btn">◀</a>
+                <span class="date-label">
+                    {{ date_label }}
+                    {% if is_today %}<span class="today-badge">сегодня</span>{% endif %}
+                    {% if is_tomorrow %}<span class="tomorrow-badge">завтра</span>{% endif %}
+                </span>
+                <a href="/?date={{ next_date }}" class="nav-btn">▶</a>
+            </div>
             <div class="search-area" id="searchArea">
                 <button type="button" class="search-toggle" id="searchToggle">🔎 Поиск задач</button>
                 <div class="search-box">
@@ -1987,10 +1998,6 @@ MAIN_PAGE = '''
                     <option value="6">Суббота</option>
                 </select>
             </div>
-        </div>
-        <div class="task-detail" style="margin-top:12px;" id="viewTaskDetails">
-            <div class="detail-row"><span class="detail-label">📁 Группа</span><span id="viewTaskGroup">—</span></div>
-            <div class="detail-row"><span class="detail-label">🗓️ Квартал</span><span id="viewTaskQuarter">—</span></div>
         </div>
         <div class="modal-actions">
             <button class="btn-save" id="viewTaskSave">💾 Сохранить изменения</button>
@@ -2623,8 +2630,6 @@ MAIN_PAGE = '''
                     document.getElementById('viewWeeklyDayGroup').style.display = 'none';
                 }
                 
-                document.getElementById('viewTaskGroup').textContent = task.later_group || '—';
-                document.getElementById('viewTaskQuarter').textContent = task.quarter || '—';
                 
                 document.getElementById('viewTaskModal').classList.add('open');
             });
@@ -2901,6 +2906,7 @@ FUTURE_PAGE = '''
             border-bottom: 2px solid #ede5f5;
         }
         .task-item {
+            cursor: pointer;
             background: #faf5ff;
             border-radius: 8px;
             padding: 12px 16px;
@@ -2947,6 +2953,21 @@ FUTURE_PAGE = '''
         .task-item .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
         
         .empty-list { color: #c5b8d8; text-align: center; padding: 30px; }
+        .modal-overlay { display:none; position:fixed; inset:0; background:rgba(40,30,55,.35); z-index:2000; align-items:center; justify-content:center; padding:16px; }
+        .modal-overlay.open { display:flex; }
+        .modal { width:min(520px, 100%); max-height:90vh; overflow-y:auto; background:#fcfaff; border-radius:14px; padding:20px; box-shadow:0 16px 50px rgba(40,30,55,.2); }
+        .modal h3 { margin-bottom:12px; }
+        .modal label { display:block; margin:9px 0 4px; font-size:13px; color:#8b7bb5; }
+        .modal input, .modal textarea, .modal select { width:100%; padding:9px 11px; border:1.5px solid #ede5f5; border-radius:8px; background:white; color:#4a3f5e; outline:none; font:inherit; }
+        .modal textarea { min-height:70px; resize:vertical; }
+        .modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:16px; flex-wrap:wrap; }
+        .modal-actions button { border:none; border-radius:8px; padding:9px 14px; cursor:pointer; }
+        .modal-actions .save { background:#8b7bb5; color:white; }
+        .modal-actions .cancel { background:#ede5f5; color:#4a3f5e; }
+        .repeat-row { display:flex; gap:8px; align-items:center; margin-top:10px; }
+        .repeat-row input { width:auto; }
+        .weekly-row { display:none; }
+        .weekly-row.visible { display:block; }
         
         @media (max-width: 600px) {
             .header { flex-direction: column; text-align: center; }
@@ -2994,22 +3015,109 @@ FUTURE_PAGE = '''
     </div>
 </div>
 
+<div class="modal-overlay" id="futureEditModal">
+    <div class="modal">
+        <h3>✏️ Редактировать задачу</h3>
+        <input type="hidden" id="futureEditId">
+        <label>Название задачи</label><input type="text" id="futureEditTitle">
+        <label>📅 Дата выполнения</label><input type="date" id="futureEditDate">
+        <label>⏱️ Время выполнения</label><input type="text" id="futureEditDuration" placeholder="1 ч">
+        <label>💬 Комментарий</label><textarea id="futureEditComment"></textarea>
+        <label>⏰ Дедлайн (дата)</label><input type="date" id="futureEditDeadlineDate">
+        <label>⏰ Дедлайн (время)</label><input type="time" id="futureEditDeadlineTime">
+        <label>📂 Категория</label>
+        <select id="futureEditCategory">
+            <option value="focus">🎯 Фокус</option><option value="urgent">⚡ До 15 минут</option>
+            <option value="work">💼 Работа</option><option value="home">🏠 Дом</option>
+            <option value="personal">❤️ Личное</option><option value="waiting">⏳ Жду ответа</option>
+            <option value="later">🕰️ Позже</option>
+        </select>
+        <div class="repeat-row"><input type="checkbox" id="futureEditRepeat"><label for="futureEditRepeat" style="margin:0;">🔄 Повторяющаяся задача</label></div>
+        <div id="futureRepeatSettings" style="display:none;">
+            <label>Тип повторения</label>
+            <select id="futureRepeatType"><option value="daily">📆 Ежедневно</option><option value="weekly">📅 Еженедельно</option></select>
+            <div class="weekly-row" id="futureWeeklyRow">
+                <label>День недели</label>
+                <select id="futureRepeatDay"><option value="0">Воскресенье</option><option value="1">Понедельник</option><option value="2">Вторник</option><option value="3">Среда</option><option value="4">Четверг</option><option value="5">Пятница</option><option value="6">Суббота</option></select>
+            </div>
+        </div>
+        <div class="modal-actions"><button class="save" id="futureEditSave">💾 Сохранить</button><button class="cancel" id="futureEditCancel">Закрыть</button></div>
+    </div>
+</div>
+
 <script>
-    document.querySelectorAll('.done-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const taskId = this.dataset.taskId;
-            fetch('/api/task/' + taskId + '/done', { method: 'POST' })
-                .then(() => location.reload());
+    const futureModal = document.getElementById('futureEditModal');
+    const repeatCheck = document.getElementById('futureEditRepeat');
+    const repeatType = document.getElementById('futureRepeatType');
+
+    function syncFutureRepeatUI() {
+        document.getElementById('futureRepeatSettings').style.display = repeatCheck.checked ? 'block' : 'none';
+        document.getElementById('futureWeeklyRow').classList.toggle('visible', repeatCheck.checked && repeatType.value === 'weekly');
+    }
+    repeatCheck.addEventListener('change', syncFutureRepeatUI);
+    repeatType.addEventListener('change', syncFutureRepeatUI);
+
+    function openFutureTask(taskId) {
+        fetch('/api/task/' + taskId)
+            .then(res => { if (!res.ok) throw new Error('Не удалось открыть задачу'); return res.json(); })
+            .then(task => {
+                document.getElementById('futureEditId').value = task.id;
+                document.getElementById('futureEditTitle').value = task.title || '';
+                document.getElementById('futureEditDate').value = task.date || '';
+                document.getElementById('futureEditDuration').value = task.duration || '';
+                document.getElementById('futureEditComment').value = task.comment || '';
+                document.getElementById('futureEditDeadlineDate').value = task.deadline_date || '';
+                document.getElementById('futureEditDeadlineTime').value = task.deadline_time || '';
+                document.getElementById('futureEditCategory').value = task.category || 'personal';
+                repeatCheck.checked = task.repeat_type && task.repeat_type !== 'none';
+                repeatType.value = task.repeat_type === 'weekly' ? 'weekly' : 'daily';
+                document.getElementById('futureRepeatDay').value = task.repeat_day == null ? '1' : String(task.repeat_day);
+                syncFutureRepeatUI();
+                futureModal.classList.add('open');
+            }).catch(err => alert(err.message));
+    }
+
+    document.querySelectorAll('.task-item').forEach(item => {
+        item.addEventListener('click', function(e) {
+            if (e.target.closest('button')) return;
+            openFutureTask(this.dataset.taskId);
         });
     });
-    
+
+    document.getElementById('futureEditCancel').addEventListener('click', () => futureModal.classList.remove('open'));
+    futureModal.addEventListener('click', e => { if (e.target === futureModal) futureModal.classList.remove('open'); });
+
+    document.getElementById('futureEditSave').addEventListener('click', function() {
+        const taskId = document.getElementById('futureEditId').value;
+        const title = document.getElementById('futureEditTitle').value.trim();
+        if (!title) { alert('Введите название задачи'); return; }
+        const isRepeat = repeatCheck.checked;
+        const payload = {
+            title,
+            category: document.getElementById('futureEditCategory').value,
+            date: document.getElementById('futureEditDate').value,
+            duration: document.getElementById('futureEditDuration').value.trim(),
+            comment: document.getElementById('futureEditComment').value.trim(),
+            deadline_date: document.getElementById('futureEditDeadlineDate').value,
+            deadline_time: document.getElementById('futureEditDeadlineTime').value,
+            repeat_type: isRepeat ? repeatType.value : 'none',
+            repeat_day: isRepeat && repeatType.value === 'weekly' ? parseInt(document.getElementById('futureRepeatDay').value) : null
+        };
+        fetch('/api/task/' + taskId, { method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) })
+            .then(res => { if (!res.ok) throw new Error('Не удалось сохранить задачу'); location.reload(); })
+            .catch(err => alert(err.message));
+    });
+
+    document.querySelectorAll('.done-btn').forEach(btn => {
+        btn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            fetch('/api/task/' + this.dataset.taskId + '/done', { method: 'POST' }).then(() => location.reload());
+        });
+    });
     document.querySelectorAll('.delete-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const taskId = this.dataset.taskId;
-            if (confirm('Удалить задачу?')) {
-                fetch('/api/task/' + taskId, { method: 'DELETE' })
-                    .then(() => location.reload());
-            }
+        btn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            if (confirm('Удалить задачу?')) fetch('/api/task/' + this.dataset.taskId, { method: 'DELETE' }).then(() => location.reload());
         });
     });
 </script>
@@ -3675,6 +3783,34 @@ LATER_PAGE = '''
         .group-task-list {
             margin-top: 6px;
         }
+        .group-picker {
+            display: none;
+            position: fixed;
+            z-index: 3000;
+            background: #fcfaff;
+            border: 1.5px solid #ede5f5;
+            border-radius: 10px;
+            padding: 10px;
+            box-shadow: 0 8px 28px rgba(74,63,94,.18);
+            gap: 8px;
+            align-items: center;
+        }
+        .group-picker.open { display: flex; }
+        .group-picker select {
+            min-width: 170px;
+            max-width: 240px;
+            padding: 8px 10px;
+            border: 1.5px solid #ede5f5;
+            border-radius: 8px;
+            color: #4a3f5e;
+            background: white;
+            outline: none;
+        }
+        .group-picker button {
+            border: none; border-radius: 8px; padding: 8px 10px; cursor: pointer;
+            background: #8b7bb5; color: white;
+        }
+        .group-picker .picker-cancel { background: #ede5f5; color: #4a3f5e; }
         
         @media (max-width: 900px) {
             .later-layout { flex-direction: column; }
@@ -3764,112 +3900,178 @@ LATER_PAGE = '''
     </div>
 </div>
 
+<div class="group-picker" id="groupPicker">
+    <select id="groupPickerSelect"></select>
+    <button type="button" id="groupPickerConfirm">Переместить</button>
+    <button type="button" class="picker-cancel" id="groupPickerCancel">✕</button>
+</div>
+
 <script>
-    document.getElementById('addLaterBtn').addEventListener('click', function() {
-        const input = document.getElementById('laterTaskInput');
-        const title = input.value.trim();
-        if (!title) { alert('Введите название задачи'); return; }
-        
-        fetch('/api/task/later', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title: title })
-        })
-        .then(res => res.json())
-        .then(() => location.reload());
-    });
-    
-    document.getElementById('laterTaskInput').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') document.getElementById('addLaterBtn').click();
-    });
-    
-    document.getElementById('addGroupBtn').addEventListener('click', function() {
-        const input = document.getElementById('newGroupInput');
-        const name = input.value.trim();
-        if (!name) { alert('Введите название группы'); return; }
-        
-        fetch('/api/later/group', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: name })
-        })
-        .then(res => res.json())
-        .then(() => location.reload());
-    });
-    
-    document.getElementById('newGroupInput').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') document.getElementById('addGroupBtn').click();
-    });
-    
-    document.querySelectorAll('.move-to-group-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const taskId = this.dataset.taskId;
-            const groupName = prompt('Введите название группы, куда переместить задачу:');
-            if (!groupName) return;
-            
-            fetch('/api/task/' + taskId + '/move_to_later_group', {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ group: groupName })
-            })
+    let pendingMoveTaskId = null;
+
+    function refreshLaterLayout() {
+        const scrollY = window.scrollY;
+        return fetch('/later', { headers: { 'X-Requested-With': 'fetch' } })
+            .then(res => res.text())
+            .then(html => {
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                const fresh = doc.querySelector('.later-layout');
+                const current = document.querySelector('.later-layout');
+                if (fresh && current) current.replaceWith(fresh);
+                window.scrollTo(0, scrollY);
+            });
+    }
+
+    function closeGroupPicker() {
+        const picker = document.getElementById('groupPicker');
+        picker.classList.remove('open');
+        pendingMoveTaskId = null;
+    }
+
+    function openGroupPicker(button) {
+        pendingMoveTaskId = button.dataset.taskId;
+        const picker = document.getElementById('groupPicker');
+        const select = document.getElementById('groupPickerSelect');
+        select.innerHTML = '<option>Загрузка…</option>';
+        picker.classList.add('open');
+
+        const rect = button.getBoundingClientRect();
+        picker.style.top = Math.min(window.innerHeight - 80, rect.bottom + 6) + 'px';
+        picker.style.left = Math.max(10, Math.min(window.innerWidth - 330, rect.left - 170)) + 'px';
+
+        fetch('/api/later/groups')
             .then(res => res.json())
-            .then(() => location.reload());
-        });
+            .then(groups => {
+                select.innerHTML = '';
+                if (!Array.isArray(groups) || groups.length === 0) {
+                    const option = document.createElement('option');
+                    option.value = '';
+                    option.textContent = 'Сначала создайте группу';
+                    select.appendChild(option);
+                    document.getElementById('groupPickerConfirm').disabled = true;
+                    return;
+                }
+                document.getElementById('groupPickerConfirm').disabled = false;
+                groups.forEach(group => {
+                    const option = document.createElement('option');
+                    option.value = group.name;
+                    option.textContent = group.name;
+                    select.appendChild(option);
+                });
+            });
+    }
+
+    document.getElementById('groupPickerCancel').addEventListener('click', closeGroupPicker);
+    document.getElementById('groupPickerConfirm').addEventListener('click', function() {
+        const group = document.getElementById('groupPickerSelect').value;
+        if (!pendingMoveTaskId || !group) return;
+        fetch('/api/task/' + pendingMoveTaskId + '/move_to_later_group', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ group })
+        }).then(res => {
+            if (!res.ok) throw new Error('Не удалось переместить задачу');
+            closeGroupPicker();
+            return refreshLaterLayout();
+        }).catch(err => alert(err.message));
     });
-    
-    document.querySelectorAll('.add-group-task-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const group = this.dataset.group;
-            const container = this.closest('.group-section');
-            const input = container.querySelector('.group-task-input');
+
+    document.addEventListener('click', function(e) {
+        const addLaterBtn = e.target.closest('#addLaterBtn');
+        if (addLaterBtn) {
+            const input = document.getElementById('laterTaskInput');
             const title = input.value.trim();
             if (!title) { alert('Введите название задачи'); return; }
-            
+            fetch('/api/task/later', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title })
+            }).then(res => {
+                if (!res.ok) throw new Error('Не удалось добавить задачу');
+                input.value = '';
+                return refreshLaterLayout();
+            }).catch(err => alert(err.message));
+            return;
+        }
+
+        const addGroupBtn = e.target.closest('#addGroupBtn');
+        if (addGroupBtn) {
+            const input = document.getElementById('newGroupInput');
+            const name = input.value.trim();
+            if (!name) { alert('Введите название группы'); return; }
+            fetch('/api/later/group', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name })
+            }).then(res => {
+                if (!res.ok) throw new Error('Не удалось создать группу');
+                input.value = '';
+                return refreshLaterLayout();
+            }).catch(err => alert(err.message));
+            return;
+        }
+
+        const moveBtn = e.target.closest('.move-to-group-btn');
+        if (moveBtn) { openGroupPicker(moveBtn); return; }
+
+        const addGroupTaskBtn = e.target.closest('.add-group-task-btn');
+        if (addGroupTaskBtn) {
+            const group = addGroupTaskBtn.dataset.group;
+            const section = addGroupTaskBtn.closest('.group-section');
+            const input = section.querySelector('.group-task-input');
+            const title = input.value.trim();
+            if (!title) { alert('Введите название задачи'); return; }
             fetch('/api/task/later/group', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ title: title, group: group })
-            })
-            .then(res => res.json())
-            .then(() => location.reload());
-        });
-    });
-    
-    document.querySelectorAll('.group-task-input').forEach(input => {
-        input.addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                this.closest('.group-section').querySelector('.add-group-task-btn').click();
-            }
-        });
-    });
-    
-    document.querySelectorAll('.delete-group').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const groupId = this.dataset.groupId;
-            const groupName = this.dataset.groupName;
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title, group })
+            }).then(res => {
+                if (!res.ok) throw new Error('Не удалось добавить задачу');
+                input.value = '';
+                return refreshLaterLayout();
+            }).catch(err => alert(err.message));
+            return;
+        }
+
+        const deleteGroupBtn = e.target.closest('.delete-group');
+        if (deleteGroupBtn) {
+            const groupId = deleteGroupBtn.dataset.groupId;
+            const groupName = deleteGroupBtn.dataset.groupName;
             if (confirm('Удалить группу "' + groupName + '"? Задачи вернутся в общий список.')) {
                 fetch('/api/later/group/' + groupId, { method: 'DELETE' })
-                    .then(() => location.reload());
+                    .then(res => { if (!res.ok) throw new Error('Не удалось удалить группу'); return refreshLaterLayout(); })
+                    .catch(err => alert(err.message));
             }
-        });
-    });
-    
-    document.querySelectorAll('.done-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const taskId = this.dataset.taskId;
-            fetch('/api/task/' + taskId + '/done', { method: 'POST' })
-                .then(() => location.reload());
-        });
-    });
-    
-    document.querySelectorAll('.delete-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const taskId = this.dataset.taskId;
+            return;
+        }
+
+        const doneBtn = e.target.closest('.done-btn');
+        if (doneBtn && doneBtn.closest('.later-layout')) {
+            fetch('/api/task/' + doneBtn.dataset.taskId + '/done', { method: 'POST' })
+                .then(res => { if (!res.ok) throw new Error('Не удалось выполнить задачу'); return refreshLaterLayout(); })
+                .catch(err => alert(err.message));
+            return;
+        }
+
+        const deleteBtn = e.target.closest('.delete-btn');
+        if (deleteBtn && deleteBtn.closest('.later-layout')) {
             if (confirm('Удалить задачу?')) {
-                fetch('/api/task/' + taskId, { method: 'DELETE' })
-                    .then(() => location.reload());
+                fetch('/api/task/' + deleteBtn.dataset.taskId, { method: 'DELETE' })
+                    .then(res => { if (!res.ok) throw new Error('Не удалось удалить задачу'); return refreshLaterLayout(); })
+                    .catch(err => alert(err.message));
             }
-        });
+            return;
+        }
+
+        if (!e.target.closest('#groupPicker')) closeGroupPicker();
+    });
+
+    document.addEventListener('keydown', function(e) {
+        if (e.key !== 'Enter') return;
+        if (e.target.id === 'laterTaskInput') {
+            e.preventDefault(); document.getElementById('addLaterBtn').click();
+        } else if (e.target.id === 'newGroupInput') {
+            e.preventDefault(); document.getElementById('addGroupBtn').click();
+        } else if (e.target.classList.contains('group-task-input')) {
+            e.preventDefault(); e.target.closest('.group-section').querySelector('.add-group-task-btn').click();
+        }
     });
 </script>
 </body>
@@ -4003,30 +4205,7 @@ DONE_PAGE = '''
     </div>
     
     <div id="doneContainer">
-        {% if sorted_dates %}
-            {% for date_key in sorted_dates %}
-            <div class="date-group">
-                <div class="date-title">{{ format_date_with_weekday(date_key) }}</div>
-                {% for task in tasks_by_date[date_key] %}
-                <div class="task-item" data-task-id="{{ task.id }}">
-                    <div class="task-info">
-                        <span>{{ task.title }}</span>
-                        {% if task.comment and task.comment != '' %}
-                        <span class="comment-badge" title="{{ task.comment }}">💬</span>
-                        {% endif %}
-                        <span class="completed-time">✅ {{ task.completed_at.strftime('%H:%M') }}</span>
-                    </div>
-                    <div class="task-actions">
-                        <button class="restore-btn" data-task-id="{{ task.id }}" title="Восстановить">↩️</button>
-                        <button class="delete-btn" data-task-id="{{ task.id }}" title="Удалить навсегда">🗑️</button>
-                    </div>
-                </div>
-                {% endfor %}
-            </div>
-            {% endfor %}
-        {% else %}
-            <div class="empty-list">📭 Здесь пока пусто. Выполненные задачи появятся здесь на 36 часов.</div>
-        {% endif %}
+        <div class="empty-list">Загрузка…</div>
     </div>
     <div class="info-note">⏳ Задачи хранятся 36 часов, затем удаляются автоматически</div>
 </div>
@@ -4045,7 +4224,8 @@ DONE_PAGE = '''
                 const tasksByDate = {};
                 tasks.forEach(task => {
                     if (task.completed_at) {
-                        const dateKey = new Date(task.completed_at).toISOString().split('T')[0];
+                        const completed = new Date(task.completed_at);
+                        const dateKey = [completed.getFullYear(), String(completed.getMonth() + 1).padStart(2, '0'), String(completed.getDate()).padStart(2, '0')].join('-');
                         if (!tasksByDate[dateKey]) tasksByDate[dateKey] = [];
                         tasksByDate[dateKey].push(task);
                     }
@@ -4057,7 +4237,8 @@ DONE_PAGE = '''
                 sortedDates.forEach(dateKey => {
                     const dateGroup = document.createElement('div');
                     dateGroup.className = 'date-group';
-                    const dateObj = new Date(dateKey + 'T00:00:00+03:00');
+                    const parts = dateKey.split('-').map(Number);
+                    const dateObj = new Date(parts[0], parts[1] - 1, parts[2]);
                     const months = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
                     const weekdays = ['воскресенье', 'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота'];
                     const day = dateObj.getDate();
@@ -4069,7 +4250,7 @@ DONE_PAGE = '''
                         const item = document.createElement('div');
                         item.className = 'task-item';
                         item.dataset.taskId = task.id;
-                        const completedTime = task.completed_at ? new Date(task.completed_at).toLocaleString('ru-RU') : 'только что';
+                        const completedTime = task.completed_at ? new Date(task.completed_at).toLocaleTimeString('ru-RU', {hour: '2-digit', minute: '2-digit'}) : 'только что';
                         item.innerHTML = `
                             <div class="task-info">
                                 <span>${task.title}</span>
