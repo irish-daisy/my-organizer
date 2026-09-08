@@ -6,10 +6,14 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta, timezone
+from calendar import monthrange
 
 app = Flask(__name__)
 # В продакшене обязательно задайте SECRET_KEY в переменных окружения.
 app.secret_key = os.environ.get('SECRET_KEY') or os.urandom(32)
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=90)
+app.config['SESSION_REFRESH_EACH_REQUEST'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
 # --- ПОДКЛЮЧЕНИЕ К POSTGRESQL ---
 def get_db_connection():
@@ -62,6 +66,7 @@ def init_db():
     # Мягкая миграция старых баз: добавляем новые поля без потери данных.
     cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline_date TEXT")
     cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline_time TEXT")
+    cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completed_at_epoch BIGINT")
 
     cur.execute('''
         CREATE TABLE IF NOT EXISTS spheres (
@@ -82,6 +87,18 @@ def init_db():
         )
     ''')
     
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS subtasks (
+            id SERIAL PRIMARY KEY,
+            task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            is_done BOOLEAN DEFAULT FALSE,
+            position INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
     conn.commit()
     conn.close()
 
@@ -92,6 +109,54 @@ init_db()
 def get_now_utc():
     """Current UTC time stored as a naive timestamp for PostgreSQL TIMESTAMP columns."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+def get_now_epoch():
+    """Unix timestamp in seconds; timezone-independent."""
+    return int(datetime.now(timezone.utc).timestamp())
+
+def next_weekday_after(base_date, target_day):
+    """Nearest strictly-next weekday. repeat_day uses 0=Sun, 1=Mon ... 6=Sat."""
+    current = (base_date.weekday() + 1) % 7
+    days_ahead = (int(target_day) - current) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    return base_date + timedelta(days=days_ahead)
+
+def next_biweekly_date(task_date_str, completion_date, target_day):
+    """Keep a 14-day cadence and always land on the selected weekday."""
+    try:
+        scheduled = datetime.strptime(task_date_str or '', '%Y-%m-%d').date()
+    except (ValueError, TypeError):
+        # Для старой задачи без даты сначала находим выбранный день недели.
+        return next_weekday_after(completion_date, target_day)
+    candidate = scheduled + timedelta(days=14)
+    candidate_weekday = (candidate.weekday() + 1) % 7
+    shift = (int(target_day) - candidate_weekday) % 7
+    candidate += timedelta(days=shift)
+    while candidate <= completion_date:
+        candidate += timedelta(days=14)
+    return candidate
+
+def _month_add(year, month, delta=1):
+    month0 = (month - 1) + delta
+    return year + month0 // 12, month0 % 12 + 1
+
+def monthly_occurrence(year, month, requested_day):
+    day = max(1, min(int(requested_day), 31))
+    return datetime(year, month, min(day, monthrange(year, month)[1])).date()
+
+def next_monthly_date(task_date_str, completion_date, requested_day):
+    """Next monthly occurrence; 29/30/31 use the month's last day when needed."""
+    try:
+        scheduled = datetime.strptime(task_date_str or '', '%Y-%m-%d').date()
+        year, month = _month_add(scheduled.year, scheduled.month, 1)
+    except (ValueError, TypeError):
+        year, month = _month_add(completion_date.year, completion_date.month, 1)
+    candidate = monthly_occurrence(year, month, requested_day)
+    while candidate <= completion_date:
+        year, month = _month_add(year, month, 1)
+        candidate = monthly_occurrence(year, month, requested_day)
+    return candidate
 
 def get_current_quarter():
     now = datetime.now()
@@ -319,9 +384,20 @@ def quarter_page(quarter):
     spheres = cur.fetchall()
     
     for sphere in spheres:
-        cur.execute('SELECT * FROM tasks WHERE user_id = %s AND sphere_id = %s AND quarter = %s AND status = %s ORDER BY created_at ASC', 
-                   (user_id, sphere['id'], quarter, 'active'))
-        sphere['tasks'] = cur.fetchall()
+        cur.execute('''
+            SELECT * FROM tasks
+            WHERE user_id = %s AND sphere_id = %s AND quarter = %s AND status = %s
+            ORDER BY position ASC, created_at ASC, id ASC
+        ''', (user_id, sphere['id'], quarter, 'active'))
+        sphere_tasks = cur.fetchall()
+        for task in sphere_tasks:
+            cur.execute('''
+                SELECT * FROM subtasks
+                WHERE user_id = %s AND task_id = %s
+                ORDER BY position ASC, created_at ASC, id ASC
+            ''', (user_id, task['id']))
+            task['subtasks'] = cur.fetchall()
+        sphere['tasks'] = sphere_tasks
     
     conn.close()
     
@@ -343,7 +419,8 @@ def quarter_page(quarter):
                                    quarters=quarter_data,
                                    spheres=spheres,
                                    username=session.get('username', 'Пользователь'),
-                                   current_quarter=current_q)
+                                   current_quarter=current_q,
+                                   format_date_ru=format_date_ru)
 
 # --- СТРАНИЦА "ПОЗЖЕ" ---
 @app.route('/later')
@@ -580,29 +657,184 @@ def delete_sphere(sphere_id):
 def add_quarter_task():
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
-    
-    data = request.json
+
+    data = request.json or {}
     title = data.get('title', '').strip()
-    sphere = data.get('sphere', '')
-    quarter = data.get('quarter', '')
-    
+    sphere = data.get('sphere', '').strip()
+    quarter = data.get('quarter', '').strip()
+
     if not title or not sphere or not quarter:
         return jsonify({'error': 'Title, sphere and quarter are required'}), 400
-    
+
     conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT id FROM spheres WHERE user_id = %s AND name = %s AND quarter = %s', (session['user_id'], sphere, quarter))
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT id FROM spheres WHERE user_id = %s AND name = %s AND quarter = %s',
+                (session['user_id'], sphere, quarter))
     sphere_result = cur.fetchone()
-    sphere_id = sphere_result[0] if sphere_result else None
-    
-    cur.execute('''
-        INSERT INTO tasks (user_id, title, category, default_category, date, duration, status, quarter, sphere, sphere_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, 'later', 'later', '', '', 'active', quarter, sphere, sphere_id))
+    if not sphere_result:
+        conn.close()
+        return jsonify({'error': 'Sphere not found'}), 404
+    sphere_id = sphere_result['id']
+
+    cur.execute("""
+        SELECT COALESCE(MAX(position), -1) + 1 AS next_position
+        FROM tasks
+        WHERE user_id = %s AND sphere_id = %s AND quarter = %s AND status = 'active'
+    """, (session['user_id'], sphere_id, quarter))
+    position = cur.fetchone()['next_position']
+
+    cur.execute("""
+        INSERT INTO tasks (
+            user_id, title, category, default_category, date, duration, status,
+            quarter, sphere, sphere_id, position, comment, deadline_date
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING *
+    """, (session['user_id'], title, 'later', 'later', '', '', 'active',
+          quarter, sphere, sphere_id, position, '', ''))
+    task = dict(cur.fetchone())
+    task['subtasks'] = []
     conn.commit()
     conn.close()
-    
-    return jsonify({'success': True, 'message': 'Task added to quarter'})
+
+    return jsonify({'success': True, 'task': task})
+
+
+@app.route('/api/task/<int:task_id>/quarter_edit', methods=['PUT'])
+def update_quarter_task(task_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.json or {}
+    title = data.get('title', '').strip()
+    comment = data.get('comment', '').strip()
+    deadline_date = data.get('deadline_date', '').strip()
+    if not title:
+        return jsonify({'error': 'Title is required'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        UPDATE tasks
+        SET title = %s, comment = %s, deadline_date = %s
+        WHERE id = %s AND user_id = %s AND quarter IS NOT NULL
+        RETURNING *
+    """, (title, comment, deadline_date, task_id, session['user_id']))
+    task = cur.fetchone()
+    if not task:
+        conn.close()
+        return jsonify({'error': 'Task not found'}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'task': dict(task)})
+
+
+@app.route('/api/quarter/tasks/reorder', methods=['POST'])
+def reorder_quarter_tasks():
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.json or {}
+    task_ids = data.get('task_ids') or []
+    sphere_id = data.get('sphere_id')
+    quarter = data.get('quarter')
+    if not task_ids or not sphere_id or not quarter:
+        return jsonify({'error': 'task_ids, sphere_id and quarter are required'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    for position, task_id in enumerate(task_ids):
+        cur.execute("""
+            UPDATE tasks SET position = %s
+            WHERE id = %s AND user_id = %s AND sphere_id = %s
+              AND quarter = %s AND status = 'active'
+        """, (position, task_id, session['user_id'], sphere_id, quarter))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/api/task/<int:task_id>/subtasks', methods=['POST'])
+def add_subtask(task_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.json or {}
+    title = data.get('title', '').strip()
+    if not title:
+        return jsonify({'error': 'Title is required'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT 1 FROM tasks WHERE id = %s AND user_id = %s AND quarter IS NOT NULL',
+                (task_id, session['user_id']))
+    if not cur.fetchone():
+        conn.close()
+        return jsonify({'error': 'Task not found'}), 404
+
+    cur.execute("""
+        SELECT COALESCE(MAX(position), -1) + 1 AS next_position
+        FROM subtasks WHERE task_id = %s AND user_id = %s
+    """, (task_id, session['user_id']))
+    position = cur.fetchone()['next_position']
+    cur.execute("""
+        INSERT INTO subtasks (task_id, user_id, title, position)
+        VALUES (%s, %s, %s, %s)
+        RETURNING *
+    """, (task_id, session['user_id'], title, position))
+    subtask = dict(cur.fetchone())
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'subtask': subtask})
+
+
+@app.route('/api/subtask/<int:subtask_id>', methods=['PUT'])
+def update_subtask(subtask_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.json or {}
+
+    fields = []
+    values = []
+    if 'title' in data:
+        title = str(data.get('title') or '').strip()
+        if not title:
+            return jsonify({'error': 'Title is required'}), 400
+        fields.append('title = %s')
+        values.append(title)
+    if 'is_done' in data:
+        fields.append('is_done = %s')
+        values.append(bool(data.get('is_done')))
+    if not fields:
+        return jsonify({'error': 'Nothing to update'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    values.extend([subtask_id, session['user_id']])
+    cur.execute(f"""
+        UPDATE subtasks SET {", ".join(fields)}
+        WHERE id = %s AND user_id = %s
+        RETURNING *
+    """, values)
+    subtask = cur.fetchone()
+    if not subtask:
+        conn.close()
+        return jsonify({'error': 'Subtask not found'}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'subtask': dict(subtask)})
+
+
+@app.route('/api/subtask/<int:subtask_id>', methods=['DELETE'])
+def delete_subtask(subtask_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('DELETE FROM subtasks WHERE id = %s AND user_id = %s',
+                (subtask_id, session['user_id']))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
 
 # --- API: Добавить задачу напрямую в категорию ---
 @app.route('/api/task/direct', methods=['POST'])
@@ -719,83 +951,80 @@ def get_task(task_id):
 def done_task(task_id):
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
-    
+
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    
     cur.execute('SELECT * FROM tasks WHERE id = %s AND user_id = %s', (task_id, session['user_id']))
     task = cur.fetchone()
-    
+
     if not task:
         conn.close()
         return jsonify({'error': 'Task not found'}), 404
-    
+
     now_utc = get_now_utc()
-    
-    if task['repeat_type'] == 'none':
-        cur.execute('UPDATE tasks SET status = %s, completed_at = %s WHERE id = %s', ('done', now_utc, task_id))
-    
-    elif task['repeat_type'] == 'daily':
-        # Повтор строим от фактического дня выполнения, а не от старой даты задачи.
+    now_epoch = get_now_epoch()
+    repeat_type = task.get('repeat_type') or 'none'
+
+    if repeat_type == 'none':
+        cur.execute('''
+            UPDATE tasks
+            SET status = %s, completed_at = %s, completed_at_epoch = %s
+            WHERE id = %s
+        ''', ('done', now_utc, now_epoch, task_id))
+    else:
         completion_date = datetime.now().date()
-        new_date = completion_date + timedelta(days=1)
-        
         default_cat = task.get('default_category') or 'personal'
-        
+
+        if repeat_type == 'daily':
+            new_date = completion_date + timedelta(days=1)
+        elif repeat_type == 'weekly' and task.get('repeat_day') is not None:
+            new_date = next_weekday_after(completion_date, task['repeat_day'])
+        elif repeat_type == 'biweekly' and task.get('repeat_day') is not None:
+            new_date = next_biweekly_date(task.get('date'), completion_date, task['repeat_day'])
+        elif repeat_type == 'monthly' and task.get('repeat_day') is not None:
+            new_date = next_monthly_date(task.get('date'), completion_date, task['repeat_day'])
+        else:
+            # Повреждённые старые данные: завершаем задачу без создания нового повтора.
+            cur.execute('''
+                UPDATE tasks
+                SET status = %s, completed_at = %s, completed_at_epoch = %s
+                WHERE id = %s
+            ''', ('done', now_utc, now_epoch, task_id))
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True, 'message': 'Task done'})
+
+        # В "Готово" создаём снимок выполненного экземпляра,
+        # а исходную повторяющуюся задачу переносим на следующую дату.
         cur.execute('''
-            INSERT INTO tasks (user_id, title, category, default_category, date, duration, 
-                               repeat_type, repeat_day, status, quarter, sphere, later_group, 
-                               sphere_id, completed_at, comment, deadline_date, deadline_time)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (task['user_id'], task['title'], task['category'], default_cat,
-              task['date'], task['duration'], 'none', None, 'done', 
-              task['quarter'], task['sphere'], task['later_group'], 
-              task['sphere_id'], now_utc, task['comment'], task.get('deadline_date', ''), task.get('deadline_time', '')))
-        
+            INSERT INTO tasks (
+                user_id, title, category, default_category, date, duration,
+                repeat_type, repeat_day, status, quarter, sphere, later_group,
+                sphere_id, completed_at, completed_at_epoch, comment,
+                deadline_date, deadline_time, position
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ''', (
+            task['user_id'], task['title'], task['category'], default_cat,
+            task.get('date'), task.get('duration'), 'none', None, 'done',
+            task.get('quarter'), task.get('sphere'), task.get('later_group'),
+            task.get('sphere_id'), now_utc, now_epoch, task.get('comment'),
+            task.get('deadline_date', ''), task.get('deadline_time', ''),
+            task.get('position', 0)
+        ))
+
         cur.execute('''
-            UPDATE tasks SET 
+            UPDATE tasks SET
                 date = %s,
                 status = 'active',
                 completed_at = NULL,
+                completed_at_epoch = NULL,
                 category = %s
             WHERE id = %s
         ''', (new_date.strftime('%Y-%m-%d'), default_cat, task_id))
-    
-    elif task['repeat_type'] == 'weekly' and task['repeat_day'] is not None:
-        # Всегда выбираем ближайший СЛЕДУЮЩИЙ заданный день недели
-        # относительно фактического дня выполнения.
-        completion_date = datetime.now().date()
-        target_day = int(task['repeat_day'])  # 0=вс, 1=пн, ... 6=сб
-        completion_weekday = (completion_date.weekday() + 1) % 7
-        days_ahead = (target_day - completion_weekday) % 7
-        if days_ahead == 0:
-            days_ahead = 7
-        new_date = completion_date + timedelta(days=days_ahead)
-        
-        default_cat = task.get('default_category') or 'personal'
-        
-        cur.execute('''
-            INSERT INTO tasks (user_id, title, category, default_category, date, duration, 
-                               repeat_type, repeat_day, status, quarter, sphere, later_group, 
-                               sphere_id, completed_at, comment, deadline_date, deadline_time)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (task['user_id'], task['title'], task['category'], default_cat,
-              task['date'], task['duration'], 'none', None, 'done', 
-              task['quarter'], task['sphere'], task['later_group'], 
-              task['sphere_id'], now_utc, task['comment'], task.get('deadline_date', ''), task.get('deadline_time', '')))
-        
-        cur.execute('''
-            UPDATE tasks SET 
-                date = %s,
-                status = 'active',
-                completed_at = NULL,
-                category = %s
-            WHERE id = %s
-        ''', (new_date.strftime('%Y-%m-%d'), default_cat, task_id))
-    
+
     conn.commit()
     conn.close()
-    
     return jsonify({'success': True, 'message': 'Task done'})
 
 # --- API: Восстановить задачу из "Готово" ---
@@ -806,7 +1035,7 @@ def restore_task(task_id):
     
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('UPDATE tasks SET status = %s, completed_at = NULL WHERE id = %s AND user_id = %s', ('active', task_id, session['user_id']))
+    cur.execute('UPDATE tasks SET status = %s, completed_at = NULL, completed_at_epoch = NULL WHERE id = %s AND user_id = %s', ('active', task_id, session['user_id']))
     conn.commit()
     conn.close()
     
@@ -834,9 +1063,9 @@ def get_done_tasks():
     for task in tasks:
         item = dict(task)
         if item.get('completed_at'):
-            # В базе completed_at хранится в UTC. Суффикс Z сообщает браузеру,
-            # что время нужно преобразовать в часовой пояс текущего устройства.
-            item['completed_at'] = item['completed_at'].isoformat(timespec='seconds') + 'Z'
+            item['completed_at'] = item['completed_at'].isoformat(timespec='seconds')
+        if item.get('completed_at_epoch') is not None:
+            item['completed_at_epoch'] = int(item['completed_at_epoch'])
         result.append(item)
     return jsonify(result)
 
@@ -1034,6 +1263,7 @@ def login():
         if user and valid_password:
             conn.commit()
             conn.close()
+            session.permanent = True
             session['user_id'] = user['id']
             session['username'] = user['username']
             return redirect('/')
@@ -1924,8 +2154,10 @@ MAIN_PAGE = '''
         <div class="repeat-options" id="addRepeatOptions">
             <label for="addRepeatType">Тип повторения</label>
             <select id="addRepeatType">
-                <option value="daily">📆 Ежедневно</option>
-                <option value="weekly">📅 Еженедельно</option>
+                <option value="daily">📆 Каждый день</option>
+                <option value="weekly">📅 Каждую неделю</option>
+                <option value="biweekly">🗓️ Каждые 2 недели</option>
+                <option value="monthly">📌 Каждый месяц</option>
             </select>
             <div id="addWeeklyDayGroup" style="margin-top:8px; display:none;">
                 <label for="addRepeatDay">День недели</label>
@@ -1938,6 +2170,13 @@ MAIN_PAGE = '''
                     <option value="5">Пятница</option>
                     <option value="6">Суббота</option>
                 </select>
+            </div>
+            <div id="addMonthlyDayGroup" style="margin-top:8px; display:none;">
+                <label for="addMonthlyDay">Число месяца</label>
+                <select id="addMonthlyDay">
+                    <option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option><option value="24">24</option><option value="25">25</option><option value="26">26</option><option value="27">27</option><option value="28">28</option><option value="29">29</option><option value="30">30</option><option value="31">31</option>
+                </select>
+                <div style="font-size:11px; color:#9b8db5; margin-top:4px;">Если такого числа нет, задача появится в последний день месяца.</div>
             </div>
         </div>
         <div class="modal-actions">
@@ -1983,8 +2222,10 @@ MAIN_PAGE = '''
         <div class="repeat-options" id="viewRepeatOptions">
             <label for="viewRepeatType">Тип повторения</label>
             <select id="viewRepeatType">
-                <option value="daily">📆 Ежедневно</option>
-                <option value="weekly">📅 Еженедельно</option>
+                <option value="daily">📆 Каждый день</option>
+                <option value="weekly">📅 Каждую неделю</option>
+                <option value="biweekly">🗓️ Каждые 2 недели</option>
+                <option value="monthly">📌 Каждый месяц</option>
             </select>
             <div id="viewWeeklyDayGroup" style="margin-top:8px; display:none;">
                 <label for="viewRepeatDay">День недели</label>
@@ -1997,6 +2238,13 @@ MAIN_PAGE = '''
                     <option value="5">Пятница</option>
                     <option value="6">Суббота</option>
                 </select>
+            </div>
+            <div id="viewMonthlyDayGroup" style="margin-top:8px; display:none;">
+                <label for="viewMonthlyDay">Число месяца</label>
+                <select id="viewMonthlyDay">
+                    <option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option><option value="24">24</option><option value="25">25</option><option value="26">26</option><option value="27">27</option><option value="28">28</option><option value="29">29</option><option value="30">30</option><option value="31">31</option>
+                </select>
+                <div style="font-size:11px; color:#9b8db5; margin-top:4px;">Если такого числа нет, задача появится в последний день месяца.</div>
             </div>
         </div>
         <div class="modal-actions">
@@ -2619,11 +2867,13 @@ MAIN_PAGE = '''
                 if (isRepeating) {
                     repeatOptions.classList.add('visible');
                     document.getElementById('viewRepeatType').value = task.repeat_type || 'daily';
-                    if (task.repeat_type === 'weekly') {
-                        document.getElementById('viewWeeklyDayGroup').style.display = 'block';
-                        document.getElementById('viewRepeatDay').value = task.repeat_day || 0;
-                    } else {
-                        document.getElementById('viewWeeklyDayGroup').style.display = 'none';
+                    const isWeeklyKind = task.repeat_type === 'weekly' || task.repeat_type === 'biweekly';
+                    document.getElementById('viewWeeklyDayGroup').style.display = isWeeklyKind ? 'block' : 'none';
+                    document.getElementById('viewMonthlyDayGroup').style.display = task.repeat_type === 'monthly' ? 'block' : 'none';
+                    if (isWeeklyKind) {
+                        document.getElementById('viewRepeatDay').value = task.repeat_day == null ? 1 : task.repeat_day;
+                    } else if (task.repeat_type === 'monthly') {
+                        document.getElementById('viewMonthlyDay').value = task.repeat_day == null ? 1 : task.repeat_day;
                     }
                 } else {
                     repeatOptions.classList.remove('visible');
@@ -2652,8 +2902,10 @@ MAIN_PAGE = '''
         
         if (isRepeating) {
             repeatType = document.getElementById('viewRepeatType').value;
-            if (repeatType === 'weekly') {
+            if (repeatType === 'weekly' || repeatType === 'biweekly') {
                 repeatDay = parseInt(document.getElementById('viewRepeatDay').value);
+            } else if (repeatType === 'monthly') {
+                repeatDay = parseInt(document.getElementById('viewMonthlyDay').value);
             }
         }
         
@@ -2697,17 +2949,19 @@ MAIN_PAGE = '''
         const options = document.getElementById('viewRepeatOptions');
         if (this.checked) {
             options.classList.add('visible');
-            if (document.getElementById('viewRepeatType').value === 'weekly') {
-                document.getElementById('viewWeeklyDayGroup').style.display = 'block';
-            }
+            const type = document.getElementById('viewRepeatType').value;
+            document.getElementById('viewWeeklyDayGroup').style.display = (type === 'weekly' || type === 'biweekly') ? 'block' : 'none';
+            document.getElementById('viewMonthlyDayGroup').style.display = type === 'monthly' ? 'block' : 'none';
         } else {
             options.classList.remove('visible');
             document.getElementById('viewWeeklyDayGroup').style.display = 'none';
+            document.getElementById('viewMonthlyDayGroup').style.display = 'none';
         }
     });
     
     document.getElementById('viewRepeatType').addEventListener('change', function() {
-        document.getElementById('viewWeeklyDayGroup').style.display = this.value === 'weekly' ? 'block' : 'none';
+        document.getElementById('viewWeeklyDayGroup').style.display = (this.value === 'weekly' || this.value === 'biweekly') ? 'block' : 'none';
+        document.getElementById('viewMonthlyDayGroup').style.display = this.value === 'monthly' ? 'block' : 'none';
     });
     
     document.querySelectorAll('.add-task-btn').forEach(btn => {
@@ -2725,6 +2979,7 @@ MAIN_PAGE = '''
             document.getElementById('addTaskRepeat').checked = false;
             document.getElementById('addRepeatOptions').classList.remove('visible');
             document.getElementById('addWeeklyDayGroup').style.display = 'none';
+            document.getElementById('addMonthlyDayGroup').style.display = 'none';
             document.getElementById('addTaskModal').classList.add('open');
             setTimeout(() => document.getElementById('addTaskTitle').focus(), 100);
         });
@@ -2763,8 +3018,10 @@ MAIN_PAGE = '''
         
         if (isRepeating) {
             repeatType = document.getElementById('addRepeatType').value;
-            if (repeatType === 'weekly') {
+            if (repeatType === 'weekly' || repeatType === 'biweekly') {
                 repeatDay = parseInt(document.getElementById('addRepeatDay').value);
+            } else if (repeatType === 'monthly') {
+                repeatDay = parseInt(document.getElementById('addMonthlyDay').value);
             }
         }
         
@@ -2798,17 +3055,19 @@ MAIN_PAGE = '''
         const options = document.getElementById('addRepeatOptions');
         if (this.checked) {
             options.classList.add('visible');
-            if (document.getElementById('addRepeatType').value === 'weekly') {
-                document.getElementById('addWeeklyDayGroup').style.display = 'block';
-            }
+            const type = document.getElementById('addRepeatType').value;
+            document.getElementById('addWeeklyDayGroup').style.display = (type === 'weekly' || type === 'biweekly') ? 'block' : 'none';
+            document.getElementById('addMonthlyDayGroup').style.display = type === 'monthly' ? 'block' : 'none';
         } else {
             options.classList.remove('visible');
             document.getElementById('addWeeklyDayGroup').style.display = 'none';
+            document.getElementById('addMonthlyDayGroup').style.display = 'none';
         }
     });
     
     document.getElementById('addRepeatType').addEventListener('change', function() {
-        document.getElementById('addWeeklyDayGroup').style.display = this.value === 'weekly' ? 'block' : 'none';
+        document.getElementById('addWeeklyDayGroup').style.display = (this.value === 'weekly' || this.value === 'biweekly') ? 'block' : 'none';
+        document.getElementById('addMonthlyDayGroup').style.display = this.value === 'monthly' ? 'block' : 'none';
     });
     
     document.querySelectorAll('.move-cat-btn').forEach(btn => {
@@ -3035,10 +3294,14 @@ FUTURE_PAGE = '''
         <div class="repeat-row"><input type="checkbox" id="futureEditRepeat"><label for="futureEditRepeat" style="margin:0;">🔄 Повторяющаяся задача</label></div>
         <div id="futureRepeatSettings" style="display:none;">
             <label>Тип повторения</label>
-            <select id="futureRepeatType"><option value="daily">📆 Ежедневно</option><option value="weekly">📅 Еженедельно</option></select>
+            <select id="futureRepeatType"><option value="daily">📆 Каждый день</option><option value="weekly">📅 Каждую неделю</option><option value="biweekly">🗓️ Каждые 2 недели</option><option value="monthly">📌 Каждый месяц</option></select>
             <div class="weekly-row" id="futureWeeklyRow">
                 <label>День недели</label>
                 <select id="futureRepeatDay"><option value="0">Воскресенье</option><option value="1">Понедельник</option><option value="2">Вторник</option><option value="3">Среда</option><option value="4">Четверг</option><option value="5">Пятница</option><option value="6">Суббота</option></select>
+            </div>
+            <div class="weekly-row" id="futureMonthlyRow">
+                <label>Число месяца</label>
+                <select id="futureMonthlyDay"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option><option value="24">24</option><option value="25">25</option><option value="26">26</option><option value="27">27</option><option value="28">28</option><option value="29">29</option><option value="30">30</option><option value="31">31</option></select>
             </div>
         </div>
         <div class="modal-actions"><button class="save" id="futureEditSave">💾 Сохранить</button><button class="cancel" id="futureEditCancel">Закрыть</button></div>
@@ -3052,7 +3315,9 @@ FUTURE_PAGE = '''
 
     function syncFutureRepeatUI() {
         document.getElementById('futureRepeatSettings').style.display = repeatCheck.checked ? 'block' : 'none';
-        document.getElementById('futureWeeklyRow').classList.toggle('visible', repeatCheck.checked && repeatType.value === 'weekly');
+        const weeklyKind = repeatType.value === 'weekly' || repeatType.value === 'biweekly';
+        document.getElementById('futureWeeklyRow').classList.toggle('visible', repeatCheck.checked && weeklyKind);
+        document.getElementById('futureMonthlyRow').classList.toggle('visible', repeatCheck.checked && repeatType.value === 'monthly');
     }
     repeatCheck.addEventListener('change', syncFutureRepeatUI);
     repeatType.addEventListener('change', syncFutureRepeatUI);
@@ -3070,8 +3335,9 @@ FUTURE_PAGE = '''
                 document.getElementById('futureEditDeadlineTime').value = task.deadline_time || '';
                 document.getElementById('futureEditCategory').value = task.category || 'personal';
                 repeatCheck.checked = task.repeat_type && task.repeat_type !== 'none';
-                repeatType.value = task.repeat_type === 'weekly' ? 'weekly' : 'daily';
+                repeatType.value = ['daily','weekly','biweekly','monthly'].includes(task.repeat_type) ? task.repeat_type : 'daily';
                 document.getElementById('futureRepeatDay').value = task.repeat_day == null ? '1' : String(task.repeat_day);
+                document.getElementById('futureMonthlyDay').value = task.repeat_day == null ? '1' : String(task.repeat_day);
                 syncFutureRepeatUI();
                 futureModal.classList.add('open');
             }).catch(err => alert(err.message));
@@ -3101,7 +3367,10 @@ FUTURE_PAGE = '''
             deadline_date: document.getElementById('futureEditDeadlineDate').value,
             deadline_time: document.getElementById('futureEditDeadlineTime').value,
             repeat_type: isRepeat ? repeatType.value : 'none',
-            repeat_day: isRepeat && repeatType.value === 'weekly' ? parseInt(document.getElementById('futureRepeatDay').value) : null
+            repeat_day: !isRepeat ? null :
+                ((repeatType.value === 'weekly' || repeatType.value === 'biweekly')
+                    ? parseInt(document.getElementById('futureRepeatDay').value)
+                    : (repeatType.value === 'monthly' ? parseInt(document.getElementById('futureMonthlyDay').value) : null))
         };
         fetch('/api/task/' + taskId, { method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) })
             .then(res => { if (!res.ok) throw new Error('Не удалось сохранить задачу'); location.reload(); })
@@ -3144,196 +3413,123 @@ QUARTER_PAGE = '''
         }
         .container { max-width: 900px; margin: 0 auto; }
         .header {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 16px 24px;
-            margin-bottom: 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 10px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+            background: #fcfaff; border-radius: 12px; padding: 16px 24px;
+            margin-bottom: 20px; display: flex; justify-content: space-between;
+            align-items: center; flex-wrap: wrap; gap: 10px;
+            box-shadow: 0 2px 10px rgba(139,123,181,.08);
         }
-        .header h1 { font-size: 22px; color: #4a3f5e; }
-        .header .user { color: #8b7bb5; font-size: 14px; }
-        .header .btn-back {
-            background: #ede5f5;
-            color: #4a3f5e;
-            border: none;
-            padding: 8px 18px;
-            border-radius: 8px;
-            text-decoration: none;
-            cursor: pointer;
-            touch-action: manipulation;
+        .header h1 { font-size: 22px; }
+        .user { color: #8b7bb5; font-size: 14px; }
+        .btn-back {
+            background: #ede5f5; color: #4a3f5e; border: none; padding: 8px 18px;
+            border-radius: 8px; text-decoration: none; cursor: pointer;
         }
-        .header .btn-back:hover { background: #e0d5ec; }
-        
         .quarter-nav {
-            display: flex;
-            gap: 8px;
-            margin-bottom: 20px;
-            flex-wrap: wrap;
-            justify-content: center;
+            display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; justify-content: center;
         }
-        .quarter-nav .q-link {
-            padding: 8px 16px;
-            border-radius: 8px;
-            text-decoration: none;
-            background: #fcfaff;
-            color: #4a3f5e;
-            border: 1.5px solid #ede5f5;
-            font-size: 14px;
-            transition: 0.2s;
-            touch-action: manipulation;
+        .q-link {
+            padding: 8px 16px; border-radius: 8px; text-decoration: none;
+            background: #fcfaff; color: #4a3f5e; border: 1.5px solid #ede5f5; font-size: 14px;
         }
-        .quarter-nav .q-link:hover { border-color: #8b7bb5; background: #f8f2fd; }
-        .quarter-nav .q-link.current {
-            background: #8b7bb5;
-            color: white;
+        .q-link.current { background: #8b7bb5; color: white; border-color: #8b7bb5; }
+        .q-link.past { opacity: .6; }
+
+        .add-sphere {
+            background: #fcfaff; border-radius: 12px; padding: 16px 20px; margin-bottom: 20px;
+            box-shadow: 0 2px 10px rgba(139,123,181,.08); display: flex; gap: 10px; flex-wrap: wrap;
+        }
+        .add-sphere input, .add-task-form input, .subtask-add input, .modal input, .modal textarea {
+            border: 1.5px solid #e5daef; border-radius: 8px; background: white; color: #4a3f5e;
+            font-family: inherit; font-size: 14px; outline: none;
+        }
+        .add-sphere input:focus, .add-task-form input:focus, .subtask-add input:focus, .modal input:focus, .modal textarea:focus {
             border-color: #8b7bb5;
         }
-        .quarter-nav .q-link.past { opacity: 0.6; }
-        
-        .add-sphere {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 16px 20px;
-            margin-bottom: 20px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            align-items: center;
-        }
-        .add-sphere input {
-            flex: 1;
-            padding: 10px 14px;
-            border: 1.5px solid #ede5f5;
-            border-radius: 8px;
-            font-size: 14px;
-            min-width: 150px;
-            background: white;
-            color: #4a3f5e;
-            -webkit-appearance: none;
-        }
-        .add-sphere input:focus { outline: none; border-color: #8b7bb5; }
-        .add-sphere button {
-            background: #8b7bb5;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            padding: 10px 24px;
+        .add-sphere input { flex: 1; min-width: 160px; padding: 10px 14px; }
+        button { font-family: inherit; }
+        .primary-btn {
+            background: #8b7bb5; color: white; border: none; border-radius: 8px; padding: 9px 18px;
             cursor: pointer;
-            font-size: 14px;
-            touch-action: manipulation;
         }
-        .add-sphere button:hover { background: #7a69a4; }
-        
+
         .sphere {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 18px 20px;
-            margin-bottom: 16px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-            border-left: 5px solid #d5c8e6;
+            background: #fcfaff; border-radius: 12px; padding: 18px 20px; margin-bottom: 16px;
+            box-shadow: 0 2px 10px rgba(139,123,181,.08); border-left: 5px solid #d5c8e6;
         }
         .sphere-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 12px;
-            flex-wrap: wrap;
-            gap: 8px;
+            display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 12px;
         }
-        .sphere-header h3 { font-size: 18px; color: #4a3f5e; }
-        .sphere-header .sphere-actions {
-            display: flex;
-            gap: 6px;
+        .sphere-header h3 { font-size: 18px; }
+        .sphere-actions { display:flex; gap:4px; }
+        .icon-btn, .task-action, .subtask-delete {
+            background: none; border: none; cursor: pointer; border-radius: 6px; padding: 4px 6px;
+            color: #aa9abb;
         }
-        .sphere-header .sphere-actions button {
-            background: none;
-            border: none;
-            color: #b5a7cc;
-            cursor: pointer;
-            font-size: 14px;
-            padding: 4px 8px;
-            border-radius: 6px;
-            transition: 0.2s;
-            touch-action: manipulation;
-        }
-        .sphere-header .sphere-actions button:hover { background: #ede5f5; color: #8b7bb5; }
-        
+        .icon-btn:hover, .task-action:hover, .subtask-delete:hover { background: #eee5f6; color: #75658e; }
+
+        .tasks-container { min-height: 8px; }
         .task-item {
-            background: #faf5ff;
-            border-radius: 8px;
-            padding: 10px 14px;
-            margin-bottom: 8px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 8px;
-            box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
+            background: #faf5ff; border-radius: 9px; padding: 11px 12px; margin-bottom: 8px;
+            box-shadow: 0 1px 4px rgba(139,123,181,.05); border: 1px solid transparent;
+            transition: transform .12s, opacity .12s, border-color .12s;
         }
-        .task-item .task-info { display: flex; align-items: center; gap: 10px; }
-        .task-item .task-info .comment-badge {
-            font-size: 11px;
-            color: #8b7bb5;
-            background: #ede5f5;
-            padding: 1px 8px;
-            border-radius: 10px;
-            cursor: help;
+        .task-item.dragging { opacity: .45; transform: scale(.995); }
+        .task-item.drag-over { border-color: #a998c3; }
+        .task-main {
+            display: flex; justify-content: space-between; gap: 10px; align-items: flex-start;
         }
-        .task-item .task-actions button {
-            background: none;
-            border: none;
-            color: #c5b8d8;
-            cursor: pointer;
-            font-size: 14px;
-            padding: 4px 6px;
-            border-radius: 6px;
-            touch-action: manipulation;
+        .task-left { display: flex; gap: 8px; min-width: 0; flex: 1; }
+        .drag-handle { color: #c0b2d2; cursor: grab; user-select: none; padding-top: 1px; }
+        .task-content { min-width: 0; flex: 1; cursor: pointer; }
+        .task-title { font-size: 14px; line-height: 1.35; word-break: break-word; }
+        .task-comment { font-size: 12px; color: #998bac; margin-top: 3px; white-space: pre-wrap; }
+        .task-deadline { font-size: 11px; color: #9a7a79; margin-top: 4px; }
+        .task-actions { display: flex; gap: 2px; flex-shrink: 0; }
+
+        .subtasks { margin: 8px 0 0 27px; }
+        .subtask {
+            display: flex; align-items: center; gap: 7px; padding: 3px 0; font-size: 12px; color: #655a75;
         }
-        .task-item .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
-        
-        .add-task-form {
-            display: flex;
-            gap: 8px;
-            margin-top: 12px;
-            flex-wrap: wrap;
+        .subtask input[type="checkbox"] { accent-color: #8b7bb5; }
+        .subtask.done .subtask-title { text-decoration: line-through; color: #aaa0b5; }
+        .subtask-title { flex: 1; word-break: break-word; }
+        .subtask-delete { font-size: 11px; padding: 2px 4px; opacity: .65; }
+        .subtask-add { display: flex; gap: 6px; margin-top: 5px; }
+        .subtask-add input { flex: 1; min-width: 80px; padding: 5px 8px; font-size: 12px; }
+        .subtask-add button {
+            border: none; background: #e9e0f2; color: #75658e; border-radius: 7px; padding: 4px 8px; cursor: pointer;
         }
-        .add-task-form input {
-            flex: 1;
-            padding: 8px 12px;
-            border: 1.5px solid #ede5f5;
-            border-radius: 8px;
-            font-size: 13px;
-            min-width: 120px;
-            background: white;
-            color: #4a3f5e;
-            -webkit-appearance: none;
+
+        .add-task-form { display: flex; gap: 8px; margin-top: 12px; }
+        .add-task-form input { flex:1; padding:8px 12px; min-width:100px; }
+        .add-task-form button { padding:8px 14px; }
+        .empty-sphere { color:#b8aac8; font-style:italic; padding:8px 2px 10px; font-size:13px; }
+
+        .modal-overlay {
+            position: fixed; inset: 0; background: rgba(45,36,55,.28); display:none;
+            align-items:center; justify-content:center; padding:16px; z-index:1000;
         }
-        .add-task-form input:focus { outline: none; border-color: #8b7bb5; }
-        .add-task-form button {
-            background: #8b7bb5;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            padding: 8px 16px;
-            cursor: pointer;
-            font-size: 13px;
-            touch-action: manipulation;
+        .modal-overlay.open { display:flex; }
+        .modal {
+            background:#fffdfd; width:100%; max-width:460px; border-radius:14px; padding:20px;
+            box-shadow:0 16px 50px rgba(40,30,55,.18);
         }
-        .add-task-form button:hover { background: #7a69a4; }
-        
-        .empty-sphere { color: #c5b8d8; font-style: italic; padding: 10px 0; }
-        
+        .modal h3 { margin-bottom:14px; font-size:18px; }
+        .modal label { display:block; font-size:12px; color:#817490; margin:10px 0 5px; }
+        .modal input, .modal textarea { width:100%; padding:9px 11px; }
+        .modal textarea { min-height:80px; resize:vertical; }
+        .modal-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:16px; }
+        .modal-actions button { border:none; border-radius:8px; padding:8px 14px; cursor:pointer; }
+        .save-btn { background:#8b7bb5; color:white; }
+        .cancel-btn { background:#ede5f5; color:#4a3f5e; }
+
         @media (max-width: 600px) {
-            .header { flex-direction: column; text-align: center; }
-            .add-sphere { flex-direction: column; }
-            .add-sphere input { width: 100%; }
-            .quarter-nav { justify-content: center; }
+            .header { flex-direction:column; text-align:center; }
+            .add-sphere { flex-direction:column; }
+            .add-sphere input { width:100%; }
+            .task-item { padding:10px; }
+            .subtasks { margin-left:20px; }
+            .drag-handle { font-size:18px; }
         }
     </style>
 </head>
@@ -3344,65 +3540,80 @@ QUARTER_PAGE = '''
         <div>
             <span class="user">👤 {{ username }}</span>
             <a href="/" class="btn-back" style="margin-left:12px;">← Назад</a>
-            <a href="/logout" class="btn-back" style="margin-left:8px; background:#d5c8e6; color:#4a3f5e;">Выйти</a>
+            <a href="/logout" class="btn-back" style="margin-left:8px; background:#d5c8e6;">Выйти</a>
         </div>
     </div>
-    
+
     <div class="quarter-nav">
         {% for q in quarters %}
-        <a href="/quarter/{{ q.id }}" class="q-link 
-            {% if q.id == quarter %}current{% endif %}
-            {% if q.id != quarter and q.id < current_quarter %}past{% endif %}
-        ">
-            {{ q.name }} {{ q.year }}
-            {% if q.current %}⭐{% endif %}
+        <a href="/quarter/{{ q.id }}" class="q-link {% if q.id == quarter %}current{% endif %} {% if q.id != quarter and q.id < current_quarter %}past{% endif %}">
+            {{ q.name }} {{ q.year }}{% if q.current %} ⭐{% endif %}
         </a>
         {% endfor %}
     </div>
-    
+
     <div class="add-sphere">
-        <input type="text" id="sphereName" placeholder="Название сферы (например: Работа, Здоровье...)" autofocus>
-        <button id="addSphereBtn">➕ Добавить сферу</button>
+        <input type="text" id="sphereName" placeholder="Название сферы (например: Работа, Здоровье...)">
+        <button class="primary-btn" id="addSphereBtn">➕ Добавить сферу</button>
     </div>
-    
+
     <div id="spheresContainer">
         {% for sphere in spheres %}
         <div class="sphere" data-sphere-id="{{ sphere.id }}" data-sphere-name="{{ sphere.name }}">
             <div class="sphere-header">
                 <h3>📂 {{ sphere.name }}</h3>
                 <div class="sphere-actions">
-                    <button class="edit-sphere-btn" data-sphere-id="{{ sphere.id }}" data-sphere-name="{{ sphere.name }}" title="Переименовать">✏️</button>
-                    <button class="delete-sphere-btn" data-sphere-id="{{ sphere.id }}" data-sphere-name="{{ sphere.name }}" title="Удалить">🗑️</button>
+                    <button class="icon-btn edit-sphere-btn" data-sphere-id="{{ sphere.id }}" data-sphere-name="{{ sphere.name }}" title="Переименовать">✏️</button>
+                    <button class="icon-btn delete-sphere-btn" data-sphere-id="{{ sphere.id }}" data-sphere-name="{{ sphere.name }}" title="Удалить">🗑️</button>
                 </div>
             </div>
-            <div id="tasks-{{ loop.index }}">
+
+            <div class="tasks-container" data-sphere-id="{{ sphere.id }}">
                 {% for task in sphere.tasks %}
                 <div class="task-item" data-task-id="{{ task.id }}">
-                    <div class="task-info">
-                        <span>{{ task.title }}</span>
-                        {% if task.duration %}
-                        <span style="font-size:11px; color:#b5a7cc; background:#ede5f5; padding:1px 8px; border-radius:10px;">⏱️ {{ task.duration }}</span>
-                        {% endif %}
-                        {% if task.comment and task.comment != '' %}
-                        <span class="comment-badge" title="{{ task.comment }}">💬</span>
-                        {% endif %}
+                    <div class="task-main">
+                        <div class="task-left">
+                            <span class="drag-handle" title="Перетащить">⋮⋮</span>
+                            <div class="task-content">
+                                <div class="task-title">{{ task.title }}</div>
+                                <div class="task-comment" {% if not task.comment %}style="display:none"{% endif %}>{{ task.comment or '' }}</div>
+                                <div class="task-deadline" {% if not task.deadline_date %}style="display:none"{% endif %}>⏰ {{ format_date_ru(task.deadline_date) if task.deadline_date else '' }}</div>
+                            </div>
+                        </div>
+                        <div class="task-actions">
+                            <button class="task-action edit-task-btn" title="Изменить">✏️</button>
+                            <button class="task-action done-btn" title="Готово">✅</button>
+                            <button class="task-action delete-btn" title="Удалить">🗑️</button>
+                        </div>
                     </div>
-                    <div class="task-actions">
-                        <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
-                        <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
+                    <div class="subtasks">
+                        <div class="subtask-list">
+                            {% for subtask in task.subtasks %}
+                            <div class="subtask {% if subtask.is_done %}done{% endif %}" data-subtask-id="{{ subtask.id }}">
+                                <input type="checkbox" class="subtask-check" {% if subtask.is_done %}checked{% endif %}>
+                                <span class="subtask-title">{{ subtask.title }}</span>
+                                <button class="subtask-delete" title="Удалить подзадачу">✕</button>
+                            </div>
+                            {% endfor %}
+                        </div>
+                        <div class="subtask-add">
+                            <input type="text" class="subtask-input" placeholder="+ Подзадача">
+                            <button class="add-subtask-btn" title="Добавить">＋</button>
+                        </div>
                     </div>
                 </div>
                 {% else %}
                 <div class="empty-sphere">Нет задач в этой сфере</div>
                 {% endfor %}
             </div>
+
             <div class="add-task-form">
-                <input type="text" class="taskInput" placeholder="Новая задача..." autofocus>
-                <button class="addTaskBtn" data-sphere="{{ sphere.name }}">➕ Добавить задачу</button>
+                <input type="text" class="taskInput" placeholder="Новая задача...">
+                <button class="primary-btn addTaskBtn" data-sphere="{{ sphere.name }}">➕ Добавить</button>
             </div>
         </div>
         {% else %}
-        <div style="text-align:center; padding:40px; color:#c5b8d8; background:#fcfaff; border-radius:12px;">
+        <div style="text-align:center;padding:40px;color:#b8aac8;background:#fcfaff;border-radius:12px;">
             <p style="font-size:18px;">📭 Нет сфер</p>
             <p style="font-size:14px;">Добавьте первую сферу выше</p>
         </div>
@@ -3410,98 +3621,371 @@ QUARTER_PAGE = '''
     </div>
 </div>
 
+<div class="modal-overlay" id="quarterTaskModal">
+    <div class="modal">
+        <h3>✏️ Изменить задачу</h3>
+        <input type="hidden" id="quarterEditTaskId">
+        <label for="quarterEditTitle">Название</label>
+        <input type="text" id="quarterEditTitle">
+        <label for="quarterEditComment">Комментарий</label>
+        <textarea id="quarterEditComment" placeholder="Комментарий будет виден мелким шрифтом под задачей"></textarea>
+        <label for="quarterEditDeadline">⏰ Дедлайн</label>
+        <input type="date" id="quarterEditDeadline">
+        <div class="modal-actions">
+            <button class="cancel-btn" id="quarterEditCancel">Отмена</button>
+            <button class="save-btn" id="quarterEditSave">Сохранить</button>
+        </div>
+    </div>
+</div>
+
 <script>
-    const quarter = '{{ quarter }}';
-    
-    document.getElementById('addSphereBtn').addEventListener('click', function() {
-        const name = document.getElementById('sphereName').value.trim();
-        if (!name) { alert('Введите название сферы'); return; }
-        
-        fetch('/api/sphere', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: name, quarter: quarter })
+const quarter = '{{ quarter }}';
+const spheresContainer = document.getElementById('spheresContainer');
+let draggedTask = null;
+
+function escapeText(value) {
+    return value == null ? '' : String(value);
+}
+
+function formatDeadline(value) {
+    if (!value) return '';
+    const parts = value.split('-');
+    if (parts.length !== 3) return value;
+    return parts[2] + '.' + parts[1] + '.' + parts[0];
+}
+
+function ensureEmptyState(container) {
+    const hasTasks = Array.from(container.children).some(el => el.classList && el.classList.contains('task-item'));
+    let empty = container.querySelector(':scope > .empty-sphere');
+    if (!hasTasks && !empty) {
+        empty = document.createElement('div');
+        empty.className = 'empty-sphere';
+        empty.textContent = 'Нет задач в этой сфере';
+        container.appendChild(empty);
+    } else if (hasTasks && empty) {
+        empty.remove();
+    }
+}
+
+function buildSubtask(subtask) {
+    const row = document.createElement('div');
+    row.className = 'subtask' + (subtask.is_done ? ' done' : '');
+    row.dataset.subtaskId = subtask.id;
+
+    const check = document.createElement('input');
+    check.type = 'checkbox';
+    check.className = 'subtask-check';
+    check.checked = !!subtask.is_done;
+
+    const title = document.createElement('span');
+    title.className = 'subtask-title';
+    title.textContent = escapeText(subtask.title);
+
+    const del = document.createElement('button');
+    del.className = 'subtask-delete';
+    del.title = 'Удалить подзадачу';
+    del.textContent = '✕';
+
+    row.append(check, title, del);
+    return row;
+}
+
+function buildTask(task) {
+    const card = document.createElement('div');
+    card.className = 'task-item';
+    card.dataset.taskId = task.id;
+
+    const main = document.createElement('div');
+    main.className = 'task-main';
+
+    const left = document.createElement('div');
+    left.className = 'task-left';
+    const handle = document.createElement('span');
+    handle.className = 'drag-handle';
+    handle.title = 'Перетащить';
+    handle.textContent = '⋮⋮';
+
+    const content = document.createElement('div');
+    content.className = 'task-content';
+    const title = document.createElement('div');
+    title.className = 'task-title';
+    title.textContent = escapeText(task.title);
+    const comment = document.createElement('div');
+    comment.className = 'task-comment';
+    comment.textContent = escapeText(task.comment || '');
+    comment.style.display = task.comment ? '' : 'none';
+    const deadline = document.createElement('div');
+    deadline.className = 'task-deadline';
+    deadline.textContent = task.deadline_date ? '⏰ ' + formatDeadline(task.deadline_date) : '';
+    deadline.style.display = task.deadline_date ? '' : 'none';
+    content.append(title, comment, deadline);
+    left.append(handle, content);
+
+    const actions = document.createElement('div');
+    actions.className = 'task-actions';
+    [['✏️','edit-task-btn','Изменить'],['✅','done-btn','Готово'],['🗑️','delete-btn','Удалить']].forEach(([txt,cls,ttl]) => {
+        const b = document.createElement('button');
+        b.className = 'task-action ' + cls;
+        b.title = ttl; b.textContent = txt;
+        actions.appendChild(b);
+    });
+    main.append(left, actions);
+
+    const subtasks = document.createElement('div');
+    subtasks.className = 'subtasks';
+    const list = document.createElement('div');
+    list.className = 'subtask-list';
+    (task.subtasks || []).forEach(st => list.appendChild(buildSubtask(st)));
+    const add = document.createElement('div');
+    add.className = 'subtask-add';
+    const inp = document.createElement('input');
+    inp.type = 'text'; inp.className = 'subtask-input'; inp.placeholder = '+ Подзадача';
+    const addBtn = document.createElement('button');
+    addBtn.className = 'add-subtask-btn'; addBtn.title = 'Добавить'; addBtn.textContent = '＋';
+    add.append(inp, addBtn);
+    subtasks.append(list, add);
+
+    card.append(main, subtasks);
+    return card;
+}
+
+function saveQuarterOrder(container) {
+    const taskIds = Array.from(container.children)
+        .filter(el => el.classList && el.classList.contains('task-item'))
+        .map(el => Number(el.dataset.taskId));
+    if (!taskIds.length) return;
+    fetch('/api/quarter/tasks/reorder', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+            task_ids: taskIds,
+            sphere_id: Number(container.dataset.sphereId),
+            quarter: quarter
         })
-        .then(res => res.json())
-        .then(() => location.reload());
+    }).catch(() => {});
+}
+
+function openQuarterEditor(card) {
+    const taskId = card.dataset.taskId;
+    fetch('/api/task/' + taskId)
+        .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+        .then(task => {
+            document.getElementById('quarterEditTaskId').value = task.id;
+            document.getElementById('quarterEditTitle').value = task.title || '';
+            document.getElementById('quarterEditComment').value = task.comment || '';
+            document.getElementById('quarterEditDeadline').value = task.deadline_date || '';
+            document.getElementById('quarterTaskModal').classList.add('open');
+        })
+        .catch(() => alert('Не удалось открыть задачу'));
+}
+
+document.getElementById('quarterEditCancel').addEventListener('click', () => {
+    document.getElementById('quarterTaskModal').classList.remove('open');
+});
+document.getElementById('quarterTaskModal').addEventListener('click', e => {
+    if (e.target.id === 'quarterTaskModal') e.currentTarget.classList.remove('open');
+});
+document.getElementById('quarterEditSave').addEventListener('click', () => {
+    const taskId = document.getElementById('quarterEditTaskId').value;
+    const title = document.getElementById('quarterEditTitle').value.trim();
+    const comment = document.getElementById('quarterEditComment').value.trim();
+    const deadline = document.getElementById('quarterEditDeadline').value;
+    if (!title) { alert('Введите название'); return; }
+
+    fetch('/api/task/' + taskId + '/quarter_edit', {
+        method:'PUT',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({title:title, comment:comment, deadline_date:deadline})
+    })
+    .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+    .then(data => {
+        const card = document.querySelector('.task-item[data-task-id="' + taskId + '"]');
+        if (card) {
+            card.querySelector('.task-title').textContent = data.task.title || '';
+            const commentEl = card.querySelector('.task-comment');
+            commentEl.textContent = data.task.comment || '';
+            commentEl.style.display = data.task.comment ? '' : 'none';
+            const deadlineEl = card.querySelector('.task-deadline');
+            deadlineEl.textContent = data.task.deadline_date ? '⏰ ' + formatDeadline(data.task.deadline_date) : '';
+            deadlineEl.style.display = data.task.deadline_date ? '' : 'none';
+        }
+        document.getElementById('quarterTaskModal').classList.remove('open');
+    })
+    .catch(() => alert('Не удалось сохранить задачу'));
+});
+
+document.getElementById('addSphereBtn').addEventListener('click', function() {
+    const name = document.getElementById('sphereName').value.trim();
+    if (!name) { alert('Введите название сферы'); return; }
+    fetch('/api/sphere', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({name:name, quarter:quarter})
+    }).then(r => r.json()).then(() => location.reload());
+});
+document.getElementById('sphereName').addEventListener('keydown', e => {
+    if (e.key === 'Enter') document.getElementById('addSphereBtn').click();
+});
+
+document.querySelectorAll('.edit-sphere-btn').forEach(btn => {
+    btn.addEventListener('click', function() {
+        const newName = prompt('Введите новое название сферы:', this.dataset.sphereName);
+        if (!newName || !newName.trim()) return;
+        fetch('/api/sphere/' + this.dataset.sphereId, {
+            method:'PUT', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({name:newName.trim()})
+        }).then(() => location.reload());
     });
-    
-    document.getElementById('sphereName').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') document.getElementById('addSphereBtn').click();
+});
+document.querySelectorAll('.delete-sphere-btn').forEach(btn => {
+    btn.addEventListener('click', function() {
+        if (!confirm('Удалить сферу "' + this.dataset.sphereName + '"? Задачи переедут в "Распределить".')) return;
+        fetch('/api/sphere/' + this.dataset.sphereId, {method:'DELETE'}).then(() => location.reload());
     });
-    
-    document.querySelectorAll('.edit-sphere-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const sphereId = this.dataset.sphereId;
-            const sphereName = this.dataset.sphereName;
-            const newName = prompt('Введите новое название сферы:', sphereName);
-            if (newName && newName.trim()) {
-                fetch('/api/sphere/' + sphereId, {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name: newName.trim() })
-                })
-                .then(res => res.json())
-                .then(() => location.reload());
-            }
-        });
+});
+
+document.querySelectorAll('.addTaskBtn').forEach(btn => {
+    btn.addEventListener('click', function() {
+        const sphereEl = this.closest('.sphere');
+        const input = sphereEl.querySelector('.taskInput');
+        const title = input.value.trim();
+        if (!title) { alert('Введите название задачи'); return; }
+        const tasksContainer = sphereEl.querySelector('.tasks-container');
+
+        fetch('/api/task/quarter', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({title:title, sphere:this.dataset.sphere, quarter:quarter})
+        })
+        .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+        .then(data => {
+            input.value = '';
+            tasksContainer.appendChild(buildTask(data.task));
+            ensureEmptyState(tasksContainer);
+        })
+        .catch(() => alert('Не удалось добавить задачу'));
     });
-    
-    document.querySelectorAll('.delete-sphere-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const sphereId = this.dataset.sphereId;
-            const sphereName = this.dataset.sphereName;
-            if (confirm('Удалить сферу "' + sphereName + '"? Задачи переедут в "Распределить".')) {
-                fetch('/api/sphere/' + sphereId, { method: 'DELETE' })
-                    .then(() => location.reload());
-            }
-        });
+});
+document.querySelectorAll('.taskInput').forEach(input => {
+    input.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') this.closest('.add-task-form').querySelector('.addTaskBtn').click();
     });
-    
-    document.querySelectorAll('.addTaskBtn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const sphere = this.dataset.sphere;
-            const container = this.closest('.sphere');
-            const input = container.querySelector('.taskInput');
-            const title = input.value.trim();
-            
-            if (!title) { alert('Введите название задачи'); return; }
-            
-            fetch('/api/task/quarter', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ title: title, sphere: sphere, quarter: quarter, date: '' })
+});
+
+spheresContainer.addEventListener('click', function(e) {
+    const card = e.target.closest('.task-item');
+    if (!card) return;
+
+    if (e.target.closest('.edit-task-btn') || e.target.closest('.task-content')) {
+        openQuarterEditor(card);
+        return;
+    }
+
+    if (e.target.closest('.done-btn')) {
+        const container = card.closest('.tasks-container');
+        fetch('/api/task/' + card.dataset.taskId + '/done', {method:'POST'})
+            .then(r => {
+                if (!r.ok) throw new Error();
+                card.remove();
+                ensureEmptyState(container);
+                saveQuarterOrder(container);
             })
-            .then(res => res.json())
-            .then(() => location.reload());
-        });
+            .catch(() => alert('Не удалось завершить задачу'));
+        return;
+    }
+
+    if (e.target.closest('.delete-btn')) {
+        if (!confirm('Удалить задачу?')) return;
+        const container = card.closest('.tasks-container');
+        fetch('/api/task/' + card.dataset.taskId, {method:'DELETE'})
+            .then(r => { if (!r.ok) throw new Error(); card.remove(); ensureEmptyState(container); saveQuarterOrder(container); })
+            .catch(() => alert('Не удалось удалить задачу'));
+        return;
+    }
+
+    if (e.target.closest('.add-subtask-btn')) {
+        const input = card.querySelector('.subtask-input');
+        const title = input.value.trim();
+        if (!title) return;
+        fetch('/api/task/' + card.dataset.taskId + '/subtasks', {
+            method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({title:title})
+        })
+        .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+        .then(data => {
+            card.querySelector('.subtask-list').appendChild(buildSubtask(data.subtask));
+            input.value = '';
+        })
+        .catch(() => alert('Не удалось добавить подзадачу'));
+        return;
+    }
+
+    if (e.target.closest('.subtask-delete')) {
+        const row = e.target.closest('.subtask');
+        fetch('/api/subtask/' + row.dataset.subtaskId, {method:'DELETE'})
+            .then(r => { if (!r.ok) throw new Error(); row.remove(); })
+            .catch(() => alert('Не удалось удалить подзадачу'));
+    }
+});
+
+spheresContainer.addEventListener('change', function(e) {
+    if (!e.target.classList.contains('subtask-check')) return;
+    const row = e.target.closest('.subtask');
+    const isDone = e.target.checked;
+    fetch('/api/subtask/' + row.dataset.subtaskId, {
+        method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({is_done:isDone})
+    })
+    .then(r => {
+        if (!r.ok) throw new Error();
+        row.classList.toggle('done', isDone);
+    })
+    .catch(() => {
+        e.target.checked = !isDone;
+        alert('Не удалось обновить подзадачу');
     });
-    
-    document.querySelectorAll('.taskInput').forEach(input => {
-        input.addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                this.closest('.add-task-form').querySelector('.addTaskBtn').click();
-            }
-        });
-    });
-    
-    document.querySelectorAll('.done-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const taskId = this.dataset.taskId;
-            fetch('/api/task/' + taskId + '/done', { method: 'POST' })
-                .then(() => location.reload());
-        });
-    });
-    
-    document.querySelectorAll('.delete-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const taskId = this.dataset.taskId;
-            if (confirm('Удалить задачу?')) {
-                fetch('/api/task/' + taskId, { method: 'DELETE' })
-                    .then(() => location.reload());
-            }
-        });
-    });
+});
+
+spheresContainer.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && e.target.classList.contains('subtask-input')) {
+        e.preventDefault();
+        e.target.closest('.subtask-add').querySelector('.add-subtask-btn').click();
+    }
+});
+
+// Drag & drop внутри одной сферы.
+spheresContainer.addEventListener('mousedown', function(e) {
+    const handle = e.target.closest('.drag-handle');
+    if (!handle) return;
+    const card = handle.closest('.task-item');
+    if (card) card.draggable = true;
+});
+spheresContainer.addEventListener('dragstart', function(e) {
+    const card = e.target.closest('.task-item');
+    if (!card || !card.draggable) { e.preventDefault(); return; }
+    draggedTask = card;
+    card.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+});
+spheresContainer.addEventListener('dragover', function(e) {
+    if (!draggedTask) return;
+    const target = e.target.closest('.task-item');
+    if (!target || target === draggedTask) return;
+    const sourceContainer = draggedTask.closest('.tasks-container');
+    const targetContainer = target.closest('.tasks-container');
+    if (sourceContainer !== targetContainer) return;
+    e.preventDefault();
+    const rect = target.getBoundingClientRect();
+    if (e.clientY < rect.top + rect.height / 2) target.before(draggedTask);
+    else target.after(draggedTask);
+});
+spheresContainer.addEventListener('dragend', function() {
+    if (!draggedTask) return;
+    const container = draggedTask.closest('.tasks-container');
+    draggedTask.classList.remove('dragging');
+    draggedTask.draggable = false;
+    saveQuarterOrder(container);
+    draggedTask = null;
+});
+
+document.querySelectorAll('.tasks-container').forEach(ensureEmptyState);
 </script>
 </body>
 </html>
@@ -4211,6 +4695,15 @@ DONE_PAGE = '''
 </div>
 
 <script>
+    function getCompletedDate(task) {
+        if (task.completed_at_epoch !== null && task.completed_at_epoch !== undefined) {
+            return new Date(Number(task.completed_at_epoch) * 1000);
+        }
+        // Старые записи без epoch трактуем как локальное время устройства,
+        // чтобы не добавлять часовой пояс второй раз.
+        return task.completed_at ? new Date(task.completed_at) : null;
+    }
+
     function loadDoneTasks() {
         fetch('/api/tasks/done')
             .then(res => res.json())
@@ -4224,7 +4717,7 @@ DONE_PAGE = '''
                 const tasksByDate = {};
                 tasks.forEach(task => {
                     if (task.completed_at) {
-                        const completed = new Date(task.completed_at);
+                        const completed = getCompletedDate(task);
                         const dateKey = [completed.getFullYear(), String(completed.getMonth() + 1).padStart(2, '0'), String(completed.getDate()).padStart(2, '0')].join('-');
                         if (!tasksByDate[dateKey]) tasksByDate[dateKey] = [];
                         tasksByDate[dateKey].push(task);
@@ -4250,7 +4743,8 @@ DONE_PAGE = '''
                         const item = document.createElement('div');
                         item.className = 'task-item';
                         item.dataset.taskId = task.id;
-                        const completedTime = task.completed_at ? new Date(task.completed_at).toLocaleTimeString('ru-RU', {hour: '2-digit', minute: '2-digit'}) : 'только что';
+                        const completedDate = getCompletedDate(task);
+                        const completedTime = completedDate ? completedDate.toLocaleTimeString('ru-RU', {hour: '2-digit', minute: '2-digit'}) : 'только что';
                         item.innerHTML = `
                             <div class="task-info">
                                 <span>${task.title}</span>
