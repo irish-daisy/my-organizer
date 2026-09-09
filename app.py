@@ -311,6 +311,18 @@ def index():
         cat = task['category'] if task['category'] in categories else 'later'
         if cat != 'later':
             categories[cat].append(dict(task))
+
+    # Задачи с дедлайном всегда выше задач без дедлайна.
+    # Внутри дедлайнов: сначала более ранняя дата и время; затем сохраняем ручной position.
+    def deadline_sort_key(task):
+        deadline_date = (task.get('deadline_date') or '').strip()
+        deadline_time = (task.get('deadline_time') or '').strip()
+        if not deadline_date:
+            return (1, '9999-12-31', '23:59', task.get('position') or 0, task.get('id') or 0)
+        return (0, deadline_date, deadline_time or '23:59', task.get('position') or 0, task.get('id') or 0)
+
+    for category_tasks in categories.values():
+        category_tasks.sort(key=deadline_sort_key)
     
     current_quarter = get_current_quarter()
     
@@ -375,14 +387,14 @@ def future_page():
 def quarter_page(quarter):
     if 'user_id' not in session:
         return redirect('/login')
-    
+
     user_id = session['user_id']
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    
+
     cur.execute('SELECT * FROM spheres WHERE user_id = %s AND quarter = %s ORDER BY created_at ASC', (user_id, quarter))
     spheres = cur.fetchall()
-    
+
     for sphere in spheres:
         cur.execute('''
             SELECT * FROM tasks
@@ -394,13 +406,28 @@ def quarter_page(quarter):
             cur.execute('''
                 SELECT * FROM subtasks
                 WHERE user_id = %s AND task_id = %s
-                ORDER BY position ASC, created_at ASC, id ASC
+                ORDER BY is_done ASC, position ASC, created_at ASC, id ASC
             ''', (user_id, task['id']))
             task['subtasks'] = cur.fetchall()
         sphere['tasks'] = sphere_tasks
-    
+
+    # Отдельный блок выполненных задач выбранного квартала.
+    cur.execute('''
+        SELECT * FROM tasks
+        WHERE user_id = %s AND quarter = %s AND status = 'done'
+        ORDER BY completed_at_epoch DESC NULLS LAST, completed_at DESC NULLS LAST, id DESC
+    ''', (user_id, quarter))
+    completed_tasks = cur.fetchall()
+    for task in completed_tasks:
+        cur.execute('''
+            SELECT * FROM subtasks
+            WHERE user_id = %s AND task_id = %s
+            ORDER BY is_done ASC, position ASC, created_at ASC, id ASC
+        ''', (user_id, task['id']))
+        task['subtasks'] = cur.fetchall()
+
     conn.close()
-    
+
     quarters = ['Q1', 'Q2', 'Q3', 'Q4']
     current_q = get_current_quarter()
     quarter_data = []
@@ -411,13 +438,14 @@ def quarter_page(quarter):
             'year': get_quarter_year(q),
             'current': (q == current_q)
         })
-    
-    return render_template_string(QUARTER_PAGE, 
+
+    return render_template_string(QUARTER_PAGE,
                                    quarter=quarter,
                                    quarter_name=get_quarter_name(quarter),
                                    quarter_year=get_quarter_year(quarter),
                                    quarters=quarter_data,
                                    spheres=spheres,
+                                   completed_tasks=completed_tasks,
                                    username=session.get('username', 'Пользователь'),
                                    current_quarter=current_q,
                                    format_date_ru=format_date_ru)
@@ -836,6 +864,35 @@ def delete_subtask(subtask_id):
     conn.close()
     return jsonify({'success': True})
 
+
+@app.route('/api/task/<int:task_id>/subtasks/reorder', methods=['POST'])
+def reorder_subtasks(task_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.json or {}
+    subtask_ids = data.get('subtask_ids') or []
+    if not subtask_ids:
+        return jsonify({'error': 'subtask_ids are required'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('SELECT 1 FROM tasks WHERE id = %s AND user_id = %s AND quarter IS NOT NULL',
+                (task_id, session['user_id']))
+    if not cur.fetchone():
+        conn.close()
+        return jsonify({'error': 'Task not found'}), 404
+
+    for position, subtask_id in enumerate(subtask_ids):
+        cur.execute('''
+            UPDATE subtasks SET position = %s
+            WHERE id = %s AND user_id = %s AND task_id = %s
+        ''', (position, subtask_id, session['user_id'], task_id))
+
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
 # --- API: Добавить задачу напрямую в категорию ---
 @app.route('/api/task/direct', methods=['POST'])
 def add_direct_task():
@@ -960,6 +1017,21 @@ def done_task(task_id):
     if not task:
         conn.close()
         return jsonify({'error': 'Task not found'}), 404
+
+    # В квартале крупную задачу можно завершить только после всех её подзадач.
+    if task.get('quarter'):
+        cur.execute('''
+            SELECT COUNT(*) AS remaining
+            FROM subtasks
+            WHERE user_id = %s AND task_id = %s AND is_done = FALSE
+        ''', (session['user_id'], task_id))
+        remaining = cur.fetchone()['remaining']
+        if remaining:
+            conn.close()
+            return jsonify({
+                'error': 'Complete subtasks first',
+                'message': 'Сначала выполните все подзадачи'
+            }), 409
 
     now_utc = get_now_utc()
     now_epoch = get_now_epoch()
@@ -1101,7 +1173,11 @@ def get_tasks_by_date(date_str):
         SELECT * FROM tasks 
         WHERE user_id = %s AND status = %s AND quarter IS NULL 
         AND date = %s
-        ORDER BY position ASC, id ASC
+        ORDER BY
+            CASE WHEN deadline_date IS NULL OR deadline_date = '' THEN 1 ELSE 0 END ASC,
+            deadline_date ASC,
+            CASE WHEN deadline_time IS NULL OR deadline_time = '' THEN '23:59' ELSE deadline_time END ASC,
+            position ASC, id ASC
     ''', (session['user_id'], 'active', date_str))
     tasks = cur.fetchall()
     conn.close()
@@ -1966,6 +2042,21 @@ MAIN_PAGE = '''
         .modal .btn-cancel:hover { background: #e0d5ec; }
         .modal .btn-delete { background: #e74c3c; color: white; }
         .modal .btn-delete:hover { background: #c0392b; }
+        .task-detail-modal { max-width: 680px; max-height: 88vh; display:flex; flex-direction:column; overflow:hidden; }
+        .task-detail-scroll { flex:1; min-height:0; overflow-y:auto; padding-right:4px; }
+        .task-edit-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px 12px; }
+        .task-edit-field label { margin-top:6px; }
+        .task-edit-full { grid-column:1 / -1; }
+        .repeat-summary-btn {
+            width:100%; margin-top:10px; padding:9px 11px; border:1.5px solid #ede5f5; border-radius:8px;
+            background:#faf7fd; color:#6f6282; text-align:left; cursor:pointer; font-size:13px;
+        }
+        .repeat-editor { display:none; margin-top:8px; padding:10px 12px; background:#faf7fd; border-radius:9px; }
+        .repeat-editor.open { display:block; }
+        .task-detail-modal .modal-actions {
+            position:sticky; bottom:0; margin:12px -20px -20px; padding:12px 20px 14px; background:#fcfaff;
+            border-top:1px solid #eee7f5; z-index:2;
+        }
         
         .move-options {
             display: grid;
@@ -2007,6 +2098,9 @@ MAIN_PAGE = '''
             .search-toggle { padding: 6px 7px; font-size: 12px; }
             .header { flex-direction: column; text-align: center; }
             .modal { padding: 18px 16px; }
+            .task-edit-grid { grid-template-columns:1fr; }
+            .task-edit-full { grid-column:auto; }
+            .task-detail-modal .modal-actions { margin:12px -16px -18px; padding:12px 16px 14px; }
             .task-card { padding: 8px 10px; }
             .task-card .task-actions button { padding: 4px 4px; min-width: 28px; min-height: 28px; font-size: 13px; }
             .selection-panel { flex-direction: column; align-items: stretch; }
@@ -2187,68 +2281,88 @@ MAIN_PAGE = '''
 </div>
 
 <div class="modal-overlay" id="viewTaskModal">
-    <div class="modal">
-        <h3 id="viewTaskTitle">📌 Задача</h3>
-        <p class="sub" id="viewTaskCategory"></p>
-        <input type="hidden" id="viewTaskId">
-        <label for="viewTaskTitleInput">Название задачи</label>
-        <input type="text" id="viewTaskTitleInput" style="margin-bottom:8px;">
-        <label for="viewTaskDate">📅 Дата выполнения</label>
-        <input type="date" id="viewTaskDate" style="margin-bottom:8px;">
-        <label for="viewTaskDuration">⏱️ Время выполнения</label>
-        <input type="text" id="viewTaskDuration" placeholder="1 ч" style="margin-bottom:8px;">
-        <label for="viewTaskComment">💬 Комментарий</label>
-        <textarea id="viewTaskComment" placeholder="Дополнительная информация..." style="margin-bottom:8px;"></textarea>
-        
-        <label for="viewDeadlineDate">⏰ Дедлайн (дата)</label>
-        <input type="date" id="viewDeadlineDate" style="margin-bottom:8px;">
-        <label for="viewDeadlineTime">⏰ Дедлайн (время)</label>
-        <input type="time" id="viewDeadlineTime" style="margin-bottom:8px;">
-        
-        <label for="viewTaskCategorySelect">📂 Категория</label>
-        <select id="viewTaskCategorySelect" style="margin-bottom:8px;">
-            <option value="focus">🎯 Фокус</option>
-            <option value="urgent">⚡ До 15 минут</option>
-            <option value="work">💼 Работа</option>
-            <option value="home">🏠 Дом</option>
-            <option value="personal">❤️ Личное</option>
-            <option value="waiting">⏳ Жду ответа</option>
-            <option value="later">🕰️ Позже</option>
-        </select>
-        <div class="checkbox-group" style="margin-top:4px;">
-            <input type="checkbox" id="viewTaskRepeat">
-            <label for="viewTaskRepeat">🔄 Повторяющаяся задача</label>
-        </div>
-        <div class="repeat-options" id="viewRepeatOptions">
-            <label for="viewRepeatType">Тип повторения</label>
-            <select id="viewRepeatType">
-                <option value="daily">📆 Каждый день</option>
-                <option value="weekly">📅 Каждую неделю</option>
-                <option value="biweekly">🗓️ Каждые 2 недели</option>
-                <option value="monthly">📌 Каждый месяц</option>
-            </select>
-            <div id="viewWeeklyDayGroup" style="margin-top:8px; display:none;">
-                <label for="viewRepeatDay">День недели</label>
-                <select id="viewRepeatDay">
-                    <option value="0">Воскресенье</option>
-                    <option value="1">Понедельник</option>
-                    <option value="2">Вторник</option>
-                    <option value="3">Среда</option>
-                    <option value="4">Четверг</option>
-                    <option value="5">Пятница</option>
-                    <option value="6">Суббота</option>
-                </select>
+    <div class="modal task-detail-modal">
+        <div class="task-detail-scroll">
+            <h3 id="viewTaskTitle">📌 Задача</h3>
+            <p class="sub" id="viewTaskCategory"></p>
+            <input type="hidden" id="viewTaskId">
+
+            <div class="task-edit-grid">
+                <div class="task-edit-field task-edit-full">
+                    <label for="viewTaskTitleInput">Название задачи</label>
+                    <input type="text" id="viewTaskTitleInput">
+                </div>
+
+                <div class="task-edit-field">
+                    <label for="viewTaskDate">📅 Дата выполнения</label>
+                    <input type="date" id="viewTaskDate">
+                </div>
+                <div class="task-edit-field">
+                    <label for="viewTaskDuration">⏱️ Время выполнения</label>
+                    <input type="text" id="viewTaskDuration" placeholder="1 ч">
+                </div>
+
+                <div class="task-edit-field">
+                    <label for="viewDeadlineDate">⏰ Дедлайн</label>
+                    <input type="date" id="viewDeadlineDate">
+                </div>
+                <div class="task-edit-field">
+                    <label for="viewDeadlineTime">Время дедлайна</label>
+                    <input type="time" id="viewDeadlineTime">
+                </div>
+
+                <div class="task-edit-field task-edit-full">
+                    <label for="viewTaskCategorySelect">📂 Категория</label>
+                    <select id="viewTaskCategorySelect">
+                        <option value="focus">🎯 Фокус</option>
+                        <option value="urgent">⚡ До 15 минут</option>
+                        <option value="work">💼 Работа</option>
+                        <option value="home">🏠 Дом</option>
+                        <option value="personal">❤️ Личное</option>
+                        <option value="waiting">⏳ Жду ответа</option>
+                        <option value="later">🕰️ Позже</option>
+                    </select>
+                </div>
+
+                <div class="task-edit-field task-edit-full">
+                    <label for="viewTaskComment">💬 Комментарий</label>
+                    <textarea id="viewTaskComment" placeholder="Дополнительная информация..."></textarea>
+                </div>
             </div>
-            <div id="viewMonthlyDayGroup" style="margin-top:8px; display:none;">
-                <label for="viewMonthlyDay">Число месяца</label>
-                <select id="viewMonthlyDay">
-                    <option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option><option value="24">24</option><option value="25">25</option><option value="26">26</option><option value="27">27</option><option value="28">28</option><option value="29">29</option><option value="30">30</option><option value="31">31</option>
-                </select>
-                <div style="font-size:11px; color:#9b8db5; margin-top:4px;">Если такого числа нет, задача появится в последний день месяца.</div>
+
+            <button type="button" class="repeat-summary-btn" id="viewRepeatSummary">🔄 Не повторяется</button>
+            <div class="repeat-editor" id="viewRepeatEditor">
+                <div class="checkbox-group" style="margin-top:0;">
+                    <input type="checkbox" id="viewTaskRepeat">
+                    <label for="viewTaskRepeat">Повторяющаяся задача</label>
+                </div>
+                <div class="repeat-options" id="viewRepeatOptions">
+                    <label for="viewRepeatType">Тип повторения</label>
+                    <select id="viewRepeatType">
+                        <option value="daily">📆 Каждый день</option>
+                        <option value="weekly">📅 Каждую неделю</option>
+                        <option value="biweekly">🗓️ Каждые 2 недели</option>
+                        <option value="monthly">📌 Каждый месяц</option>
+                    </select>
+                    <div id="viewWeeklyDayGroup" style="margin-top:8px; display:none;">
+                        <label for="viewRepeatDay">День недели</label>
+                        <select id="viewRepeatDay">
+                            <option value="0">Воскресенье</option><option value="1">Понедельник</option><option value="2">Вторник</option><option value="3">Среда</option><option value="4">Четверг</option><option value="5">Пятница</option><option value="6">Суббота</option>
+                        </select>
+                    </div>
+                    <div id="viewMonthlyDayGroup" style="margin-top:8px; display:none;">
+                        <label for="viewMonthlyDay">Число месяца</label>
+                        <select id="viewMonthlyDay">
+                            <option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option><option value="24">24</option><option value="25">25</option><option value="26">26</option><option value="27">27</option><option value="28">28</option><option value="29">29</option><option value="30">30</option><option value="31">31</option>
+                        </select>
+                        <div style="font-size:11px; color:#9b8db5; margin-top:4px;">Если такого числа нет, задача появится в последний день месяца.</div>
+                    </div>
+                </div>
             </div>
         </div>
+
         <div class="modal-actions">
-            <button class="btn-save" id="viewTaskSave">💾 Сохранить изменения</button>
+            <button class="btn-save" id="viewTaskSave">💾 Сохранить</button>
             <button class="btn-delete" id="viewTaskDelete">🗑️ Удалить</button>
             <button class="btn-cancel" id="cancelViewBtn">Закрыть</button>
         </div>
@@ -2491,34 +2605,23 @@ MAIN_PAGE = '''
     }
     
     function saveOrder() {
-        const blocks = document.querySelectorAll('.block, .focus-block, .waiting-block');
-        blocks.forEach(block => {
+        const requests = [];
+        document.querySelectorAll('.block, .focus-block, .waiting-block').forEach(block => {
             const container = getTaskContainer(block);
             if (!container) return;
-            const cards = container.querySelectorAll('.task-card');
-            if (cards.length === 0) return;
-            
+            const taskIds = Array.from(container.querySelectorAll('.task-card')).map(card => parseInt(card.dataset.taskId));
             const category = getBlockCategory(block);
-            if (!category) return;
-            
-            const taskIds = [];
-            cards.forEach(card => {
-                taskIds.push(parseInt(card.dataset.taskId));
-            });
-            
-            console.log('Saving order for category:', category, 'taskIds:', taskIds);
-            
-            fetch('/api/tasks/reorder', {
+            if (!category || !taskIds.length) return;
+
+            requests.push(fetch('/api/tasks/reorder', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ task_ids: taskIds, category: category })
-            }).then(res => {
-                console.log('Reorder response:', res.status);
-                return res.json();
-            }).then(data => {
-                console.log('Reorder result:', data);
-            }).catch(err => console.error('Save order error:', err));
+            }));
         });
+
+        // После ручной перестановки снова применяем правило приоритета дедлайнов.
+        if (requests.length) Promise.allSettled(requests).then(() => loadTasks());
     }
     
     function updatePositions(block) {
@@ -2806,8 +2909,23 @@ MAIN_PAGE = '''
         const area = document.getElementById('searchArea');
         const toggle = document.getElementById('searchToggle');
         const input = document.getElementById('taskSearchInput');
-        if (!area || !toggle || !input) return;
-        toggle.addEventListener('click', function() {
+        const results = document.getElementById('searchResults');
+        if (!area || !toggle || !input || !results) return;
+
+        function closeSearch() {
+            clearTimeout(searchTimeout);
+            input.value = '';
+            results.innerHTML = '';
+            results.classList.remove('visible');
+            area.classList.remove('expanded');
+        }
+
+        toggle.addEventListener('click', function(e) {
+            e.stopPropagation();
+            if (area.classList.contains('expanded')) {
+                closeSearch();
+                return;
+            }
             area.classList.add('expanded');
             setTimeout(() => input.focus(), 120);
         });
@@ -2818,14 +2936,15 @@ MAIN_PAGE = '''
         });
         input.addEventListener('keydown', function(e) {
             if (e.key === 'Escape') {
-                this.value = '';
-                document.getElementById('searchResults').classList.remove('visible');
-                area.classList.remove('expanded');
+                closeSearch();
                 toggle.focus();
             }
         });
+        results.addEventListener('click', function(e) {
+            if (e.target.closest('.search-result')) closeSearch();
+        });
         document.addEventListener('click', function(e) {
-            if (!area.contains(e.target)) document.getElementById('searchResults').classList.remove('visible');
+            if (!area.contains(e.target)) closeSearch();
         });
     }
 
@@ -2843,6 +2962,25 @@ MAIN_PAGE = '''
             if (input._flatpickr) return;
             flatpickr(input, { locale: flatpickr.l10ns.ru, dateFormat: 'Y-m-d', altInput: true, altFormat: 'j F Y', allowInput: true, disableMobile: true });
         });
+    }
+
+    function updateViewRepeatSummary() {
+        const summary = document.getElementById('viewRepeatSummary');
+        const repeat = document.getElementById('viewTaskRepeat').checked;
+        if (!repeat) {
+            summary.textContent = '🔄 Не повторяется';
+            return;
+        }
+        const type = document.getElementById('viewRepeatType').value;
+        const labels = {daily:'Каждый день', weekly:'Каждую неделю', biweekly:'Каждые 2 недели', monthly:'Каждый месяц'};
+        let detail = labels[type] || 'Повторяется';
+        if (type === 'weekly' || type === 'biweekly') {
+            const days = ['воскресенье','понедельник','вторник','среда','четверг','пятница','суббота'];
+            detail += ' · ' + days[Number(document.getElementById('viewRepeatDay').value) || 0];
+        } else if (type === 'monthly') {
+            detail += ' · ' + document.getElementById('viewMonthlyDay').value + ' число';
+        }
+        summary.textContent = '🔄 ' + detail;
     }
 
     function viewTask(taskId) {
@@ -2877,10 +3015,13 @@ MAIN_PAGE = '''
                     }
                 } else {
                     repeatOptions.classList.remove('visible');
+                    document.getElementById('viewRepeatType').value = 'daily';
                     document.getElementById('viewWeeklyDayGroup').style.display = 'none';
+                    document.getElementById('viewMonthlyDayGroup').style.display = 'none';
                 }
-                
-                
+
+                document.getElementById('viewRepeatEditor').classList.remove('open');
+                updateViewRepeatSummary();
                 document.getElementById('viewTaskModal').classList.add('open');
             });
     }
@@ -2945,6 +3086,10 @@ MAIN_PAGE = '''
         document.getElementById('viewTaskModal').classList.remove('open');
     });
     
+    document.getElementById('viewRepeatSummary').addEventListener('click', function() {
+        document.getElementById('viewRepeatEditor').classList.toggle('open');
+    });
+
     document.getElementById('viewTaskRepeat').addEventListener('change', function() {
         const options = document.getElementById('viewRepeatOptions');
         if (this.checked) {
@@ -2957,12 +3102,16 @@ MAIN_PAGE = '''
             document.getElementById('viewWeeklyDayGroup').style.display = 'none';
             document.getElementById('viewMonthlyDayGroup').style.display = 'none';
         }
+        updateViewRepeatSummary();
     });
     
     document.getElementById('viewRepeatType').addEventListener('change', function() {
         document.getElementById('viewWeeklyDayGroup').style.display = (this.value === 'weekly' || this.value === 'biweekly') ? 'block' : 'none';
         document.getElementById('viewMonthlyDayGroup').style.display = this.value === 'monthly' ? 'block' : 'none';
+        updateViewRepeatSummary();
     });
+    document.getElementById('viewRepeatDay').addEventListener('change', updateViewRepeatSummary);
+    document.getElementById('viewMonthlyDay').addEventListener('change', updateViewRepeatSummary);
     
     document.querySelectorAll('.add-task-btn').forEach(btn => {
         btn.addEventListener('click', function(e) {
@@ -3489,16 +3638,33 @@ QUARTER_PAGE = '''
         .subtasks { margin: 8px 0 0 27px; }
         .subtask {
             display: flex; align-items: center; gap: 7px; padding: 3px 0; font-size: 12px; color: #655a75;
+            border: 1px solid transparent; border-radius: 5px;
         }
+        .subtask.dragging { opacity: .45; }
+        .subtask-drag { background:none; border:none; color:#c0b2d2; cursor:grab; padding:0 2px; font-size:13px; }
         .subtask input[type="checkbox"] { accent-color: #8b7bb5; }
         .subtask.done .subtask-title { text-decoration: line-through; color: #aaa0b5; }
         .subtask-title { flex: 1; word-break: break-word; }
         .subtask-delete { font-size: 11px; padding: 2px 4px; opacity: .65; }
-        .subtask-add { display: flex; gap: 6px; margin-top: 5px; }
+        .subtask-add { display: none; gap: 6px; margin-top: 5px; }
+        .subtask-add.open { display: flex; }
         .subtask-add input { flex: 1; min-width: 80px; padding: 5px 8px; font-size: 12px; }
         .subtask-add button {
             border: none; background: #e9e0f2; color: #75658e; border-radius: 7px; padding: 4px 8px; cursor: pointer;
         }
+        .add-subtask-toggle { font-weight:700; font-size:16px; line-height:1; }
+        .completed-section {
+            background:#fcfaff; border-radius:12px; padding:18px 20px; margin-top:26px; margin-bottom:16px;
+            box-shadow:0 2px 10px rgba(139,123,181,.08); border-left:5px solid #b8d8c0;
+        }
+        .completed-section h3 { font-size:18px; margin-bottom:12px; }
+        .completed-item { background:#f7faf7; border:1px solid #e4efe6; border-radius:9px; padding:11px 12px; margin-bottom:8px; }
+        .completed-title { font-size:14px; text-decoration:line-through; color:#776e7f; }
+        .completed-meta { font-size:11px; color:#9a90a2; margin-top:3px; }
+        .completed-comment { font-size:12px; color:#998bac; margin-top:4px; white-space:pre-wrap; }
+        .completed-subtasks { margin:7px 0 0 18px; }
+        .completed-subtask { font-size:12px; color:#aaa0b5; text-decoration:line-through; padding:2px 0; }
+        .completed-empty { color:#b8aac8; font-style:italic; padding:8px 2px 10px; font-size:13px; }
 
         .add-task-form { display: flex; gap: 8px; margin-top: 12px; }
         .add-task-form input { flex:1; padding:8px 12px; min-width:100px; }
@@ -3581,6 +3747,7 @@ QUARTER_PAGE = '''
                             </div>
                         </div>
                         <div class="task-actions">
+                            <button class="task-action add-subtask-toggle" title="Добавить подзадачу">＋</button>
                             <button class="task-action edit-task-btn" title="Изменить">✏️</button>
                             <button class="task-action done-btn" title="Готово">✅</button>
                             <button class="task-action delete-btn" title="Удалить">🗑️</button>
@@ -3590,6 +3757,7 @@ QUARTER_PAGE = '''
                         <div class="subtask-list">
                             {% for subtask in task.subtasks %}
                             <div class="subtask {% if subtask.is_done %}done{% endif %}" data-subtask-id="{{ subtask.id }}">
+                                <button class="subtask-drag" title="Перетащить">⋮⋮</button>
                                 <input type="checkbox" class="subtask-check" {% if subtask.is_done %}checked{% endif %}>
                                 <span class="subtask-title">{{ subtask.title }}</span>
                                 <button class="subtask-delete" title="Удалить подзадачу">✕</button>
@@ -3597,8 +3765,8 @@ QUARTER_PAGE = '''
                             {% endfor %}
                         </div>
                         <div class="subtask-add">
-                            <input type="text" class="subtask-input" placeholder="+ Подзадача">
-                            <button class="add-subtask-btn" title="Добавить">＋</button>
+                            <input type="text" class="subtask-input" placeholder="Новая подзадача...">
+                            <button class="add-subtask-btn" title="Добавить">Добавить</button>
                         </div>
                     </div>
                 </div>
@@ -3618,6 +3786,27 @@ QUARTER_PAGE = '''
             <p style="font-size:14px;">Добавьте первую сферу выше</p>
         </div>
         {% endfor %}
+    </div>
+
+    <div class="completed-section" id="completedSection">
+        <h3>✅ Готово</h3>
+        <div id="completedTasks">
+            {% for task in completed_tasks %}
+            <div class="completed-item" data-task-id="{{ task.id }}">
+                <div class="completed-title">{{ task.title }}</div>
+                <div class="completed-meta">{% if task.sphere %}📂 {{ task.sphere }}{% endif %}</div>
+                {% if task.comment %}<div class="completed-comment">{{ task.comment }}</div>{% endif %}
+                {% if task.deadline_date %}<div class="task-deadline">⏰ {{ format_date_ru(task.deadline_date) }}</div>{% endif %}
+                {% if task.subtasks %}
+                <div class="completed-subtasks">
+                    {% for subtask in task.subtasks %}<div class="completed-subtask">✓ {{ subtask.title }}</div>{% endfor %}
+                </div>
+                {% endif %}
+            </div>
+            {% else %}
+            <div class="completed-empty">Здесь появятся выполненные задачи квартала</div>
+            {% endfor %}
+        </div>
     </div>
 </div>
 
@@ -3642,26 +3831,37 @@ QUARTER_PAGE = '''
 const quarter = '{{ quarter }}';
 const spheresContainer = document.getElementById('spheresContainer');
 let draggedTask = null;
-
-function escapeText(value) {
-    return value == null ? '' : String(value);
-}
+let draggedSubtask = null;
 
 function formatDeadline(value) {
     if (!value) return '';
     const parts = value.split('-');
-    if (parts.length !== 3) return value;
-    return parts[2] + '.' + parts[1] + '.' + parts[0];
+    return parts.length === 3 ? parts[2] + '.' + parts[1] + '.' + parts[0] : value;
 }
 
 function ensureEmptyState(container) {
-    const hasTasks = Array.from(container.children).some(el => el.classList && el.classList.contains('task-item'));
-    let empty = container.querySelector(':scope > .empty-sphere');
+    const hasTasks = !!container.querySelector(':scope > .task-item');
+    const empty = container.querySelector(':scope > .empty-sphere');
     if (!hasTasks && !empty) {
-        empty = document.createElement('div');
-        empty.className = 'empty-sphere';
-        empty.textContent = 'Нет задач в этой сфере';
-        container.appendChild(empty);
+        const el = document.createElement('div');
+        el.className = 'empty-sphere';
+        el.textContent = 'Нет задач в этой сфере';
+        container.appendChild(el);
+    } else if (hasTasks && empty) {
+        empty.remove();
+    }
+}
+
+function ensureCompletedEmptyState() {
+    const container = document.getElementById('completedTasks');
+    if (!container) return;
+    const hasTasks = !!container.querySelector('.completed-item');
+    const empty = container.querySelector('.completed-empty');
+    if (!hasTasks && !empty) {
+        const el = document.createElement('div');
+        el.className = 'completed-empty';
+        el.textContent = 'Здесь появятся выполненные задачи квартала';
+        container.appendChild(el);
     } else if (hasTasks && empty) {
         empty.remove();
     }
@@ -3672,6 +3872,11 @@ function buildSubtask(subtask) {
     row.className = 'subtask' + (subtask.is_done ? ' done' : '');
     row.dataset.subtaskId = subtask.id;
 
+    const drag = document.createElement('button');
+    drag.className = 'subtask-drag';
+    drag.title = 'Перетащить';
+    drag.textContent = '⋮⋮';
+
     const check = document.createElement('input');
     check.type = 'checkbox';
     check.className = 'subtask-check';
@@ -3679,14 +3884,14 @@ function buildSubtask(subtask) {
 
     const title = document.createElement('span');
     title.className = 'subtask-title';
-    title.textContent = escapeText(subtask.title);
+    title.textContent = subtask.title || '';
 
     const del = document.createElement('button');
     del.className = 'subtask-delete';
     del.title = 'Удалить подзадачу';
     del.textContent = '✕';
 
-    row.append(check, title, del);
+    row.append(drag, check, title, del);
     return row;
 }
 
@@ -3709,10 +3914,10 @@ function buildTask(task) {
     content.className = 'task-content';
     const title = document.createElement('div');
     title.className = 'task-title';
-    title.textContent = escapeText(task.title);
+    title.textContent = task.title || '';
     const comment = document.createElement('div');
     comment.className = 'task-comment';
-    comment.textContent = escapeText(task.comment || '');
+    comment.textContent = task.comment || '';
     comment.style.display = task.comment ? '' : 'none';
     const deadline = document.createElement('div');
     deadline.className = 'task-deadline';
@@ -3723,11 +3928,12 @@ function buildTask(task) {
 
     const actions = document.createElement('div');
     actions.className = 'task-actions';
-    [['✏️','edit-task-btn','Изменить'],['✅','done-btn','Готово'],['🗑️','delete-btn','Удалить']].forEach(([txt,cls,ttl]) => {
-        const b = document.createElement('button');
-        b.className = 'task-action ' + cls;
-        b.title = ttl; b.textContent = txt;
-        actions.appendChild(b);
+    [['＋','add-subtask-toggle','Добавить подзадачу'],['✏️','edit-task-btn','Изменить'],['✅','done-btn','Готово'],['🗑️','delete-btn','Удалить']].forEach(([txt, cls, ttl]) => {
+        const button = document.createElement('button');
+        button.className = 'task-action ' + cls;
+        button.title = ttl;
+        button.textContent = txt;
+        actions.appendChild(button);
     });
     main.append(left, actions);
 
@@ -3738,36 +3944,101 @@ function buildTask(task) {
     (task.subtasks || []).forEach(st => list.appendChild(buildSubtask(st)));
     const add = document.createElement('div');
     add.className = 'subtask-add';
-    const inp = document.createElement('input');
-    inp.type = 'text'; inp.className = 'subtask-input'; inp.placeholder = '+ Подзадача';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'subtask-input';
+    input.placeholder = 'Новая подзадача...';
     const addBtn = document.createElement('button');
-    addBtn.className = 'add-subtask-btn'; addBtn.title = 'Добавить'; addBtn.textContent = '＋';
-    add.append(inp, addBtn);
+    addBtn.className = 'add-subtask-btn';
+    addBtn.textContent = 'Добавить';
+    add.append(input, addBtn);
     subtasks.append(list, add);
 
     card.append(main, subtasks);
+    normalizeSubtasks(card, false);
     return card;
 }
 
+function buildCompletedFromCard(card) {
+    const item = document.createElement('div');
+    item.className = 'completed-item';
+    item.dataset.taskId = card.dataset.taskId;
+
+    const title = document.createElement('div');
+    title.className = 'completed-title';
+    title.textContent = card.querySelector('.task-title')?.textContent || '';
+    item.appendChild(title);
+
+    const sphere = card.closest('.sphere')?.dataset.sphereName || '';
+    if (sphere) {
+        const meta = document.createElement('div');
+        meta.className = 'completed-meta';
+        meta.textContent = '📂 ' + sphere;
+        item.appendChild(meta);
+    }
+
+    const comment = card.querySelector('.task-comment')?.textContent || '';
+    if (comment) {
+        const c = document.createElement('div');
+        c.className = 'completed-comment';
+        c.textContent = comment;
+        item.appendChild(c);
+    }
+
+    const deadline = card.querySelector('.task-deadline')?.textContent || '';
+    if (deadline) {
+        const d = document.createElement('div');
+        d.className = 'task-deadline';
+        d.textContent = deadline;
+        item.appendChild(d);
+    }
+
+    const rows = card.querySelectorAll('.subtask');
+    if (rows.length) {
+        const list = document.createElement('div');
+        list.className = 'completed-subtasks';
+        rows.forEach(row => {
+            const st = document.createElement('div');
+            st.className = 'completed-subtask';
+            st.textContent = '✓ ' + (row.querySelector('.subtask-title')?.textContent || '');
+            list.appendChild(st);
+        });
+        item.appendChild(list);
+    }
+    return item;
+}
+
+function normalizeSubtasks(card, persist = true) {
+    const list = card.querySelector('.subtask-list');
+    if (!list) return;
+    const rows = Array.from(list.querySelectorAll(':scope > .subtask'));
+    rows.filter(row => !row.classList.contains('done')).forEach(row => list.appendChild(row));
+    rows.filter(row => row.classList.contains('done')).forEach(row => list.appendChild(row));
+    if (persist && rows.length) saveSubtaskOrder(card);
+}
+
 function saveQuarterOrder(container) {
-    const taskIds = Array.from(container.children)
-        .filter(el => el.classList && el.classList.contains('task-item'))
-        .map(el => Number(el.dataset.taskId));
+    const taskIds = Array.from(container.querySelectorAll(':scope > .task-item')).map(el => Number(el.dataset.taskId));
     if (!taskIds.length) return;
     fetch('/api/quarter/tasks/reorder', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({
-            task_ids: taskIds,
-            sphere_id: Number(container.dataset.sphereId),
-            quarter: quarter
-        })
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({task_ids: taskIds, sphere_id: Number(container.dataset.sphereId), quarter})
+    }).catch(() => {});
+}
+
+function saveSubtaskOrder(card) {
+    const ids = Array.from(card.querySelectorAll('.subtask-list > .subtask')).map(el => Number(el.dataset.subtaskId));
+    if (!ids.length) return;
+    fetch('/api/task/' + card.dataset.taskId + '/subtasks/reorder', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({subtask_ids: ids})
     }).catch(() => {});
 }
 
 function openQuarterEditor(card) {
-    const taskId = card.dataset.taskId;
-    fetch('/api/task/' + taskId)
+    fetch('/api/task/' + card.dataset.taskId)
         .then(r => { if (!r.ok) throw new Error(); return r.json(); })
         .then(task => {
             document.getElementById('quarterEditTaskId').value = task.id;
@@ -3777,6 +4048,36 @@ function openQuarterEditor(card) {
             document.getElementById('quarterTaskModal').classList.add('open');
         })
         .catch(() => alert('Не удалось открыть задачу'));
+}
+
+function closeSubtaskForms(exceptCard = null) {
+    document.querySelectorAll('.subtask-add.open').forEach(form => {
+        if (!exceptCard || !exceptCard.contains(form)) {
+            form.classList.remove('open');
+            form.querySelector('.subtask-input').value = '';
+        }
+    });
+}
+
+function submitSubtask(card) {
+    const form = card.querySelector('.subtask-add');
+    const input = form.querySelector('.subtask-input');
+    const title = input.value.trim();
+    if (!title) return;
+
+    fetch('/api/task/' + card.dataset.taskId + '/subtasks', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({title})
+    })
+    .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+    .then(data => {
+        card.querySelector('.subtask-list').appendChild(buildSubtask(data.subtask));
+        input.value = '';
+        form.classList.remove('open');
+        normalizeSubtasks(card);
+    })
+    .catch(() => alert('Не удалось добавить подзадачу'));
 }
 
 document.getElementById('quarterEditCancel').addEventListener('click', () => {
@@ -3795,7 +4096,7 @@ document.getElementById('quarterEditSave').addEventListener('click', () => {
     fetch('/api/task/' + taskId + '/quarter_edit', {
         method:'PUT',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({title:title, comment:comment, deadline_date:deadline})
+        body:JSON.stringify({title, comment, deadline_date:deadline})
     })
     .then(r => { if (!r.ok) throw new Error(); return r.json(); })
     .then(data => {
@@ -3814,25 +4115,23 @@ document.getElementById('quarterEditSave').addEventListener('click', () => {
     .catch(() => alert('Не удалось сохранить задачу'));
 });
 
+// Редкие действия со сферами оставляем с перезагрузкой страницы.
 document.getElementById('addSphereBtn').addEventListener('click', function() {
     const name = document.getElementById('sphereName').value.trim();
     if (!name) { alert('Введите название сферы'); return; }
     fetch('/api/sphere', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({name:name, quarter:quarter})
-    }).then(r => r.json()).then(() => location.reload());
+        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name, quarter})
+    }).then(r => { if (!r.ok) throw new Error(); return r.json(); }).then(() => location.reload()).catch(() => alert('Не удалось добавить сферу'));
 });
 document.getElementById('sphereName').addEventListener('keydown', e => {
     if (e.key === 'Enter') document.getElementById('addSphereBtn').click();
 });
-
 document.querySelectorAll('.edit-sphere-btn').forEach(btn => {
     btn.addEventListener('click', function() {
         const newName = prompt('Введите новое название сферы:', this.dataset.sphereName);
         if (!newName || !newName.trim()) return;
         fetch('/api/sphere/' + this.dataset.sphereId, {
-            method:'PUT', headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({name:newName.trim()})
+            method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:newName.trim()})
         }).then(() => location.reload());
     });
 });
@@ -3843,24 +4142,26 @@ document.querySelectorAll('.delete-sphere-btn').forEach(btn => {
     });
 });
 
+// Задачи добавляются без полной перезагрузки.
 document.querySelectorAll('.addTaskBtn').forEach(btn => {
     btn.addEventListener('click', function() {
         const sphereEl = this.closest('.sphere');
         const input = sphereEl.querySelector('.taskInput');
         const title = input.value.trim();
         if (!title) { alert('Введите название задачи'); return; }
-        const tasksContainer = sphereEl.querySelector('.tasks-container');
+        const container = sphereEl.querySelector('.tasks-container');
 
         fetch('/api/task/quarter', {
             method:'POST',
             headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({title:title, sphere:this.dataset.sphere, quarter:quarter})
+            body:JSON.stringify({title, sphere:this.dataset.sphere, quarter})
         })
         .then(r => { if (!r.ok) throw new Error(); return r.json(); })
         .then(data => {
             input.value = '';
-            tasksContainer.appendChild(buildTask(data.task));
-            ensureEmptyState(tasksContainer);
+            container.appendChild(buildTask(data.task));
+            ensureEmptyState(container);
+            saveQuarterOrder(container);
         })
         .catch(() => alert('Не удалось добавить задачу'));
     });
@@ -3880,16 +4181,37 @@ spheresContainer.addEventListener('click', function(e) {
         return;
     }
 
+    if (e.target.closest('.add-subtask-toggle')) {
+        const form = card.querySelector('.subtask-add');
+        const opening = !form.classList.contains('open');
+        closeSubtaskForms(card);
+        form.classList.toggle('open', opening);
+        if (opening) setTimeout(() => form.querySelector('.subtask-input').focus(), 0);
+        return;
+    }
+
+    if (e.target.closest('.add-subtask-btn')) {
+        submitSubtask(card);
+        return;
+    }
+
     if (e.target.closest('.done-btn')) {
         const container = card.closest('.tasks-container');
         fetch('/api/task/' + card.dataset.taskId + '/done', {method:'POST'})
-            .then(r => {
-                if (!r.ok) throw new Error();
+            .then(async r => {
+                const data = await r.json().catch(() => ({}));
+                if (!r.ok) throw new Error(data.message || 'Не удалось завершить задачу');
+                return data;
+            })
+            .then(() => {
+                const completed = buildCompletedFromCard(card);
                 card.remove();
                 ensureEmptyState(container);
                 saveQuarterOrder(container);
+                document.getElementById('completedTasks').prepend(completed);
+                ensureCompletedEmptyState();
             })
-            .catch(() => alert('Не удалось завершить задачу'));
+            .catch(err => alert(err.message));
         return;
     }
 
@@ -3897,31 +4219,24 @@ spheresContainer.addEventListener('click', function(e) {
         if (!confirm('Удалить задачу?')) return;
         const container = card.closest('.tasks-container');
         fetch('/api/task/' + card.dataset.taskId, {method:'DELETE'})
-            .then(r => { if (!r.ok) throw new Error(); card.remove(); ensureEmptyState(container); saveQuarterOrder(container); })
+            .then(r => {
+                if (!r.ok) throw new Error();
+                card.remove();
+                ensureEmptyState(container);
+                saveQuarterOrder(container);
+            })
             .catch(() => alert('Не удалось удалить задачу'));
-        return;
-    }
-
-    if (e.target.closest('.add-subtask-btn')) {
-        const input = card.querySelector('.subtask-input');
-        const title = input.value.trim();
-        if (!title) return;
-        fetch('/api/task/' + card.dataset.taskId + '/subtasks', {
-            method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({title:title})
-        })
-        .then(r => { if (!r.ok) throw new Error(); return r.json(); })
-        .then(data => {
-            card.querySelector('.subtask-list').appendChild(buildSubtask(data.subtask));
-            input.value = '';
-        })
-        .catch(() => alert('Не удалось добавить подзадачу'));
         return;
     }
 
     if (e.target.closest('.subtask-delete')) {
         const row = e.target.closest('.subtask');
         fetch('/api/subtask/' + row.dataset.subtaskId, {method:'DELETE'})
-            .then(r => { if (!r.ok) throw new Error(); row.remove(); })
+            .then(r => {
+                if (!r.ok) throw new Error();
+                row.remove();
+                saveSubtaskOrder(card);
+            })
             .catch(() => alert('Не удалось удалить подзадачу'));
     }
 });
@@ -3929,13 +4244,16 @@ spheresContainer.addEventListener('click', function(e) {
 spheresContainer.addEventListener('change', function(e) {
     if (!e.target.classList.contains('subtask-check')) return;
     const row = e.target.closest('.subtask');
+    const card = e.target.closest('.task-item');
     const isDone = e.target.checked;
+
     fetch('/api/subtask/' + row.dataset.subtaskId, {
         method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({is_done:isDone})
     })
     .then(r => {
         if (!r.ok) throw new Error();
         row.classList.toggle('done', isDone);
+        normalizeSubtasks(card);
     })
     .catch(() => {
         e.target.checked = !isDone;
@@ -3944,27 +4262,66 @@ spheresContainer.addEventListener('change', function(e) {
 });
 
 spheresContainer.addEventListener('keydown', function(e) {
-    if (e.key === 'Enter' && e.target.classList.contains('subtask-input')) {
+    if (!e.target.classList.contains('subtask-input')) return;
+    if (e.key === 'Enter') {
         e.preventDefault();
-        e.target.closest('.subtask-add').querySelector('.add-subtask-btn').click();
+        submitSubtask(e.target.closest('.task-item'));
+    } else if (e.key === 'Escape') {
+        e.target.value = '';
+        e.target.closest('.subtask-add').classList.remove('open');
     }
 });
 
-// Drag & drop внутри одной сферы.
+document.addEventListener('click', function(e) {
+    if (!e.target.closest('.task-item')) closeSubtaskForms();
+});
+
+// Drag & drop крупных задач внутри одной сферы.
 spheresContainer.addEventListener('mousedown', function(e) {
     const handle = e.target.closest('.drag-handle');
     if (!handle) return;
     const card = handle.closest('.task-item');
     if (card) card.draggable = true;
 });
+
+// Drag & drop подзадач — только внутри той же задачи и той же группы статуса.
+spheresContainer.addEventListener('mousedown', function(e) {
+    const handle = e.target.closest('.subtask-drag');
+    if (!handle) return;
+    const row = handle.closest('.subtask');
+    if (row) row.draggable = true;
+});
+
 spheresContainer.addEventListener('dragstart', function(e) {
+    const subtask = e.target.closest('.subtask');
+    if (subtask && subtask.draggable) {
+        draggedSubtask = subtask;
+        subtask.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        return;
+    }
+
     const card = e.target.closest('.task-item');
     if (!card || !card.draggable) { e.preventDefault(); return; }
     draggedTask = card;
     card.classList.add('dragging');
     e.dataTransfer.effectAllowed = 'move';
 });
+
 spheresContainer.addEventListener('dragover', function(e) {
+    if (draggedSubtask) {
+        const target = e.target.closest('.subtask');
+        if (!target || target === draggedSubtask) return;
+        const sameCard = draggedSubtask.closest('.task-item') === target.closest('.task-item');
+        const sameState = draggedSubtask.classList.contains('done') === target.classList.contains('done');
+        if (!sameCard || !sameState) return;
+        e.preventDefault();
+        const rect = target.getBoundingClientRect();
+        if (e.clientY < rect.top + rect.height / 2) target.before(draggedSubtask);
+        else target.after(draggedSubtask);
+        return;
+    }
+
     if (!draggedTask) return;
     const target = e.target.closest('.task-item');
     if (!target || target === draggedTask) return;
@@ -3976,16 +4333,29 @@ spheresContainer.addEventListener('dragover', function(e) {
     if (e.clientY < rect.top + rect.height / 2) target.before(draggedTask);
     else target.after(draggedTask);
 });
+
 spheresContainer.addEventListener('dragend', function() {
-    if (!draggedTask) return;
-    const container = draggedTask.closest('.tasks-container');
-    draggedTask.classList.remove('dragging');
-    draggedTask.draggable = false;
-    saveQuarterOrder(container);
-    draggedTask = null;
+    if (draggedSubtask) {
+        const card = draggedSubtask.closest('.task-item');
+        draggedSubtask.classList.remove('dragging');
+        draggedSubtask.draggable = false;
+        saveSubtaskOrder(card);
+        draggedSubtask = null;
+        return;
+    }
+
+    if (draggedTask) {
+        const container = draggedTask.closest('.tasks-container');
+        draggedTask.classList.remove('dragging');
+        draggedTask.draggable = false;
+        saveQuarterOrder(container);
+        draggedTask = null;
+    }
 });
 
+document.querySelectorAll('.task-item').forEach(card => normalizeSubtasks(card, false));
 document.querySelectorAll('.tasks-container').forEach(ensureEmptyState);
+ensureCompletedEmptyState();
 </script>
 </body>
 </html>
