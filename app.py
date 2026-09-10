@@ -2053,6 +2053,10 @@ MAIN_PAGE = '''
         }
         .repeat-editor { display:none; margin-top:8px; padding:10px 12px; background:#faf7fd; border-radius:9px; }
         .repeat-editor.open { display:block; }
+        .task-comment-section { margin-top:10px; }
+        .task-comment-section label { margin-top:0; }
+        .unsaved-modal { max-width:420px; }
+        .unsaved-modal .sub { margin:8px 0 4px; line-height:1.45; }
         .task-detail-modal .modal-actions {
             position:sticky; bottom:0; margin:12px -20px -20px; padding:12px 20px 14px; background:#fcfaff;
             border-top:1px solid #eee7f5; z-index:2;
@@ -2324,10 +2328,6 @@ MAIN_PAGE = '''
                     </select>
                 </div>
 
-                <div class="task-edit-field task-edit-full">
-                    <label for="viewTaskComment">💬 Комментарий</label>
-                    <textarea id="viewTaskComment" placeholder="Дополнительная информация..."></textarea>
-                </div>
             </div>
 
             <button type="button" class="repeat-summary-btn" id="viewRepeatSummary">🔄 Не повторяется</button>
@@ -2359,12 +2359,29 @@ MAIN_PAGE = '''
                     </div>
                 </div>
             </div>
+
+            <div class="task-comment-section">
+                <label for="viewTaskComment">💬 Комментарий</label>
+                <textarea id="viewTaskComment" placeholder="Дополнительная информация..."></textarea>
+            </div>
         </div>
 
         <div class="modal-actions">
             <button class="btn-save" id="viewTaskSave">💾 Сохранить</button>
             <button class="btn-delete" id="viewTaskDelete">🗑️ Удалить</button>
             <button class="btn-cancel" id="cancelViewBtn">Закрыть</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal-overlay" id="unsavedTaskModal" style="z-index:1100;">
+    <div class="modal unsaved-modal">
+        <h3>Есть несохранённые изменения</h3>
+        <p class="sub">Сохранить изменения перед закрытием задачи?</p>
+        <div class="modal-actions">
+            <button class="btn-save" id="unsavedTaskSave">💾 Сохранить</button>
+            <button class="btn-delete" id="unsavedTaskDiscard">Сбросить</button>
+            <button class="btn-cancel" id="unsavedTaskContinue">Вернуться</button>
         </div>
     </div>
 </div>
@@ -2391,6 +2408,7 @@ MAIN_PAGE = '''
 
 <script>
     let currentViewTaskId = null;
+    let initialViewTaskState = null;
     let moveTaskId = null;
     let currentViewDate = '{{ view_date }}';
     let draggedTaskId = null;
@@ -2964,6 +2982,51 @@ MAIN_PAGE = '''
         });
     }
 
+    function getViewTaskState() {
+        const isRepeating = document.getElementById('viewTaskRepeat').checked;
+        const repeatType = isRepeating ? document.getElementById('viewRepeatType').value : 'none';
+        let repeatDay = null;
+        if (isRepeating && (repeatType === 'weekly' || repeatType === 'biweekly')) {
+            repeatDay = document.getElementById('viewRepeatDay').value;
+        } else if (isRepeating && repeatType === 'monthly') {
+            repeatDay = document.getElementById('viewMonthlyDay').value;
+        }
+        return {
+            title: document.getElementById('viewTaskTitleInput').value,
+            date: document.getElementById('viewTaskDate').value,
+            duration: document.getElementById('viewTaskDuration').value,
+            deadline_date: document.getElementById('viewDeadlineDate').value,
+            deadline_time: document.getElementById('viewDeadlineTime').value,
+            category: document.getElementById('viewTaskCategorySelect').value,
+            repeat_type: repeatType,
+            repeat_day: repeatDay,
+            comment: document.getElementById('viewTaskComment').value
+        };
+    }
+
+    function rememberViewTaskState() {
+        initialViewTaskState = JSON.stringify(getViewTaskState());
+    }
+
+    function isViewTaskDirty() {
+        return initialViewTaskState !== null && JSON.stringify(getViewTaskState()) !== initialViewTaskState;
+    }
+
+    function closeViewTaskModal() {
+        document.getElementById('viewTaskModal').classList.remove('open');
+        document.getElementById('unsavedTaskModal').classList.remove('open');
+        initialViewTaskState = null;
+    }
+
+    function requestCloseViewTask() {
+        if (!document.getElementById('viewTaskModal').classList.contains('open')) return;
+        if (!isViewTaskDirty()) {
+            closeViewTaskModal();
+            return;
+        }
+        document.getElementById('unsavedTaskModal').classList.add('open');
+    }
+
     function updateViewRepeatSummary() {
         const summary = document.getElementById('viewRepeatSummary');
         const repeat = document.getElementById('viewTaskRepeat').checked;
@@ -3022,11 +3085,12 @@ MAIN_PAGE = '''
 
                 document.getElementById('viewRepeatEditor').classList.remove('open');
                 updateViewRepeatSummary();
+                rememberViewTaskState();
                 document.getElementById('viewTaskModal').classList.add('open');
             });
     }
     
-    document.getElementById('viewTaskSave').addEventListener('click', function() {
+    function saveViewTask() {
         const taskId = document.getElementById('viewTaskId').value;
         const title = document.getElementById('viewTaskTitleInput').value.trim();
         const date = document.getElementById('viewTaskDate').value;
@@ -3038,9 +3102,12 @@ MAIN_PAGE = '''
         const isRepeating = document.getElementById('viewTaskRepeat').checked;
         let repeatType = 'none';
         let repeatDay = null;
-        
-        if (!title) { alert('Введите название'); return; }
-        
+
+        if (!title) {
+            alert('Введите название');
+            return Promise.resolve(false);
+        }
+
         if (isRepeating) {
             repeatType = document.getElementById('viewRepeatType').value;
             if (repeatType === 'weekly' || repeatType === 'biweekly') {
@@ -3049,41 +3116,71 @@ MAIN_PAGE = '''
                 repeatDay = parseInt(document.getElementById('viewMonthlyDay').value);
             }
         }
-        
-        fetch('/api/task/' + taskId, {
+
+        return fetch('/api/task/' + taskId, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-                title: title, 
-                date: date, 
-                duration: duration, 
+            body: JSON.stringify({
+                title: title,
+                date: date,
+                duration: duration,
                 comment: comment,
-                category: category, 
-                repeat_type: repeatType, 
+                category: category,
+                repeat_type: repeatType,
                 repeat_day: repeatDay,
                 deadline_date: deadline_date,
                 deadline_time: deadline_time
             })
         })
-        .then(res => res.json())
+        .then(res => {
+            if (!res.ok) throw new Error('Не удалось сохранить задачу');
+            return res.json();
+        })
         .then(() => {
-            document.getElementById('viewTaskModal').classList.remove('open');
+            rememberViewTaskState();
+            closeViewTaskModal();
             loadTasks();
+            return true;
+        })
+        .catch(err => {
+            alert(err.message || 'Не удалось сохранить задачу');
+            return false;
         });
-    });
-    
+    }
+
+    document.getElementById('viewTaskSave').addEventListener('click', saveViewTask);
+
     document.getElementById('viewTaskDelete').addEventListener('click', function() {
         if (currentViewTaskId && confirm('Удалить задачу навсегда?')) {
             fetch('/api/task/' + currentViewTaskId, { method: 'DELETE' })
                 .then(() => {
-                    document.getElementById('viewTaskModal').classList.remove('open');
+                    closeViewTaskModal();
                     loadTasks();
                 });
         }
     });
     
-    document.getElementById('cancelViewBtn').addEventListener('click', function() {
-        document.getElementById('viewTaskModal').classList.remove('open');
+    document.getElementById('cancelViewBtn').addEventListener('click', requestCloseViewTask);
+
+    document.getElementById('viewTaskModal').addEventListener('click', function(e) {
+        if (e.target === this) requestCloseViewTask();
+    });
+
+    document.getElementById('unsavedTaskSave').addEventListener('click', function() {
+        document.getElementById('unsavedTaskModal').classList.remove('open');
+        saveViewTask();
+    });
+
+    document.getElementById('unsavedTaskDiscard').addEventListener('click', function() {
+        closeViewTaskModal();
+    });
+
+    document.getElementById('unsavedTaskContinue').addEventListener('click', function() {
+        document.getElementById('unsavedTaskModal').classList.remove('open');
+    });
+
+    document.getElementById('unsavedTaskModal').addEventListener('click', function(e) {
+        if (e.target === this) this.classList.remove('open');
     });
     
     document.getElementById('viewRepeatSummary').addEventListener('click', function() {
@@ -3627,43 +3724,48 @@ QUARTER_PAGE = '''
         .task-main {
             display: flex; justify-content: space-between; gap: 10px; align-items: flex-start;
         }
-        .task-left { display: flex; gap: 8px; min-width: 0; flex: 1; }
-        .drag-handle { color: #c0b2d2; cursor: grab; user-select: none; padding-top: 1px; }
-        .task-content { min-width: 0; flex: 1; cursor: pointer; }
-        .task-title { font-size: 14px; line-height: 1.35; word-break: break-word; }
-        .task-comment { font-size: 12px; color: #998bac; margin-top: 3px; white-space: pre-wrap; }
-        .task-deadline { font-size: 11px; color: #9a7a79; margin-top: 4px; }
+        .task-left { display: flex; gap: 8px; min-width: 0; flex: 1; align-items: flex-start; }
+        .drag-handle { color: #c0b2d2; cursor: grab; user-select: none; padding-top: 2px; }
+        .task-content { min-width: 0; flex: 1; }
+        .task-title-row { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+        .task-title { font-size: 16px; line-height: 1.4; font-weight: 500; word-break: break-word; cursor: pointer; }
+        .task-title:hover, .subtask-title:hover { color: #7d6b98; }
+        .task-comment { font-size: 13px; color: #998bac; margin-top: 3px; white-space: pre-wrap; }
+        .task-deadline { font-size: 12px; color: #9a7a79; margin-top: 4px; }
         .task-actions { display: flex; gap: 2px; flex-shrink: 0; }
 
         .subtasks { margin: 8px 0 0 27px; }
         .subtask {
-            display: flex; align-items: center; gap: 7px; padding: 3px 0; font-size: 12px; color: #655a75;
+            display: flex; align-items: center; gap: 7px; padding: 4px 0; font-size: 14px; line-height: 1.35; color: #655a75;
             border: 1px solid transparent; border-radius: 5px;
         }
         .subtask.dragging { opacity: .45; }
-        .subtask-drag { background:none; border:none; color:#c0b2d2; cursor:grab; padding:0 2px; font-size:13px; }
-        .subtask input[type="checkbox"] { accent-color: #8b7bb5; }
+        .subtask-drag { background:none; border:none; color:#c0b2d2; cursor:grab; padding:0 2px; font-size:15px; }
+        .subtask input[type="checkbox"] { accent-color: #8b7bb5; width: 15px; height: 15px; }
         .subtask.done .subtask-title { text-decoration: line-through; color: #aaa0b5; }
-        .subtask-title { flex: 1; word-break: break-word; }
-        .subtask-delete { font-size: 11px; padding: 2px 4px; opacity: .65; }
+        .subtask-title { flex: 1; word-break: break-word; cursor: pointer; }
+        .subtask-title-input { flex:1; min-width:80px; padding:4px 7px; font-size:14px; border:1.5px solid #d8cae7; border-radius:7px; color:#4a3f5e; font-family:inherit; outline:none; }
+        .subtask-title-input:focus { border-color:#8b7bb5; }
+        .subtask-delete { font-size: 12px; padding: 2px 4px; opacity: .65; }
         .subtask-add { display: none; gap: 6px; margin-top: 5px; }
         .subtask-add.open { display: flex; }
-        .subtask-add input { flex: 1; min-width: 80px; padding: 5px 8px; font-size: 12px; }
+        .subtask-add input { flex: 1; min-width: 80px; padding: 6px 9px; font-size: 13px; }
         .subtask-add button {
             border: none; background: #e9e0f2; color: #75658e; border-radius: 7px; padding: 4px 8px; cursor: pointer;
         }
-        .add-subtask-toggle { font-weight:700; font-size:16px; line-height:1; }
+        .add-subtask-toggle { font-weight:700; font-size:18px; line-height:1; padding:0 4px; color:#9b8aae; }
+        .add-subtask-toggle:hover { background:#eee5f6; color:#75658e; }
         .completed-section {
             background:#fcfaff; border-radius:12px; padding:18px 20px; margin-top:26px; margin-bottom:16px;
             box-shadow:0 2px 10px rgba(139,123,181,.08); border-left:5px solid #b8d8c0;
         }
         .completed-section h3 { font-size:18px; margin-bottom:12px; }
         .completed-item { background:#f7faf7; border:1px solid #e4efe6; border-radius:9px; padding:11px 12px; margin-bottom:8px; }
-        .completed-title { font-size:14px; text-decoration:line-through; color:#776e7f; }
+        .completed-title { font-size:15px; text-decoration:line-through; color:#776e7f; }
         .completed-meta { font-size:11px; color:#9a90a2; margin-top:3px; }
         .completed-comment { font-size:12px; color:#998bac; margin-top:4px; white-space:pre-wrap; }
         .completed-subtasks { margin:7px 0 0 18px; }
-        .completed-subtask { font-size:12px; color:#aaa0b5; text-decoration:line-through; padding:2px 0; }
+        .completed-subtask { font-size:13px; color:#aaa0b5; text-decoration:line-through; padding:2px 0; }
         .completed-empty { color:#b8aac8; font-style:italic; padding:8px 2px 10px; font-size:13px; }
 
         .add-task-form { display: flex; gap: 8px; margin-top: 12px; }
@@ -3741,14 +3843,15 @@ QUARTER_PAGE = '''
                         <div class="task-left">
                             <span class="drag-handle" title="Перетащить">⋮⋮</span>
                             <div class="task-content">
-                                <div class="task-title">{{ task.title }}</div>
+                                <div class="task-title-row">
+                                    <div class="task-title" title="Нажмите, чтобы изменить задачу">{{ task.title }}</div>
+                                    <button class="task-action add-subtask-toggle" title="Добавить подзадачу">＋</button>
+                                </div>
                                 <div class="task-comment" {% if not task.comment %}style="display:none"{% endif %}>{{ task.comment or '' }}</div>
                                 <div class="task-deadline" {% if not task.deadline_date %}style="display:none"{% endif %}>⏰ {{ format_date_ru(task.deadline_date) if task.deadline_date else '' }}</div>
                             </div>
                         </div>
                         <div class="task-actions">
-                            <button class="task-action add-subtask-toggle" title="Добавить подзадачу">＋</button>
-                            <button class="task-action edit-task-btn" title="Изменить">✏️</button>
                             <button class="task-action done-btn" title="Готово">✅</button>
                             <button class="task-action delete-btn" title="Удалить">🗑️</button>
                         </div>
@@ -3912,9 +4015,17 @@ function buildTask(task) {
 
     const content = document.createElement('div');
     content.className = 'task-content';
+    const titleRow = document.createElement('div');
+    titleRow.className = 'task-title-row';
     const title = document.createElement('div');
     title.className = 'task-title';
+    title.title = 'Нажмите, чтобы изменить задачу';
     title.textContent = task.title || '';
+    const addSubtaskToggle = document.createElement('button');
+    addSubtaskToggle.className = 'task-action add-subtask-toggle';
+    addSubtaskToggle.title = 'Добавить подзадачу';
+    addSubtaskToggle.textContent = '＋';
+    titleRow.append(title, addSubtaskToggle);
     const comment = document.createElement('div');
     comment.className = 'task-comment';
     comment.textContent = task.comment || '';
@@ -3923,12 +4034,12 @@ function buildTask(task) {
     deadline.className = 'task-deadline';
     deadline.textContent = task.deadline_date ? '⏰ ' + formatDeadline(task.deadline_date) : '';
     deadline.style.display = task.deadline_date ? '' : 'none';
-    content.append(title, comment, deadline);
+    content.append(titleRow, comment, deadline);
     left.append(handle, content);
 
     const actions = document.createElement('div');
     actions.className = 'task-actions';
-    [['＋','add-subtask-toggle','Добавить подзадачу'],['✏️','edit-task-btn','Изменить'],['✅','done-btn','Готово'],['🗑️','delete-btn','Удалить']].forEach(([txt, cls, ttl]) => {
+    [['✅','done-btn','Готово'],['🗑️','delete-btn','Удалить']].forEach(([txt, cls, ttl]) => {
         const button = document.createElement('button');
         button.className = 'task-action ' + cls;
         button.title = ttl;
@@ -4035,6 +4146,61 @@ function saveSubtaskOrder(card) {
         headers: {'Content-Type':'application/json'},
         body: JSON.stringify({subtask_ids: ids})
     }).catch(() => {});
+}
+
+function startSubtaskEdit(row) {
+    const titleEl = row.querySelector('.subtask-title');
+    if (!titleEl || row.querySelector('.subtask-title-input')) return;
+
+    const originalTitle = titleEl.textContent;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'subtask-title-input';
+    input.value = originalTitle;
+    titleEl.style.display = 'none';
+    titleEl.after(input);
+    input.focus();
+    input.select();
+
+    let finished = false;
+    function cleanup() {
+        input.remove();
+        titleEl.style.display = '';
+    }
+    function cancel() {
+        if (finished) return;
+        finished = true;
+        cleanup();
+    }
+    function save() {
+        if (finished) return;
+        const newTitle = input.value.trim();
+        if (!newTitle || newTitle === originalTitle) {
+            cancel();
+            return;
+        }
+        finished = true;
+        fetch('/api/subtask/' + row.dataset.subtaskId, {
+            method:'PUT',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({title:newTitle})
+        })
+        .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+        .then(data => {
+            titleEl.textContent = data.subtask.title || newTitle;
+            cleanup();
+        })
+        .catch(() => {
+            cleanup();
+            alert('Не удалось изменить подзадачу');
+        });
+    }
+
+    input.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') { e.preventDefault(); save(); }
+        else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+    });
+    input.addEventListener('blur', save);
 }
 
 function openQuarterEditor(card) {
@@ -4176,7 +4342,12 @@ spheresContainer.addEventListener('click', function(e) {
     const card = e.target.closest('.task-item');
     if (!card) return;
 
-    if (e.target.closest('.edit-task-btn') || e.target.closest('.task-content')) {
+    if (e.target.closest('.subtask-title')) {
+        startSubtaskEdit(e.target.closest('.subtask'));
+        return;
+    }
+
+    if (e.target.closest('.task-title')) {
         openQuarterEditor(card);
         return;
     }
