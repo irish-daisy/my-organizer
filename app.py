@@ -95,9 +95,13 @@ def init_db():
             title TEXT NOT NULL,
             is_done BOOLEAN DEFAULT FALSE,
             position INTEGER DEFAULT 0,
+            comment TEXT DEFAULT '',
+            deadline_date TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    cur.execute("ALTER TABLE subtasks ADD COLUMN IF NOT EXISTS comment TEXT DEFAULT ''")
+    cur.execute("ALTER TABLE subtasks ADD COLUMN IF NOT EXISTS deadline_date TEXT DEFAULT ''")
 
     conn.commit()
     conn.close()
@@ -254,6 +258,20 @@ def format_deadline(deadline_date, deadline_time, current_date):
     
     return ''
 
+def active_task_order_key(task):
+    """Sort active tasks inside a block. Focus keeps manual order; other blocks prioritize deadlines."""
+    position = task.get('position') or 0
+    task_id = task.get('id') or 0
+    if task.get('category') == 'focus':
+        return (0, '', '', position, task_id)
+
+    deadline_date = (task.get('deadline_date') or '').strip()
+    deadline_time = (task.get('deadline_time') or '').strip()
+    if not deadline_date:
+        return (2, '9999-12-31', '23:59', position, task_id)
+    return (1, deadline_date, deadline_time or '23:59', position, task_id)
+
+
 def move_overdue_tasks_to_backlog(user_id):
     """Переносит ВСЕ невыполненные просроченные задачи на сегодня."""
     conn = get_db_connection()
@@ -312,17 +330,10 @@ def index():
         if cat != 'later':
             categories[cat].append(dict(task))
 
-    # Задачи с дедлайном всегда выше задач без дедлайна.
-    # Внутри дедлайнов: сначала более ранняя дата и время; затем сохраняем ручной position.
-    def deadline_sort_key(task):
-        deadline_date = (task.get('deadline_date') or '').strip()
-        deadline_time = (task.get('deadline_time') or '').strip()
-        if not deadline_date:
-            return (1, '9999-12-31', '23:59', task.get('position') or 0, task.get('id') or 0)
-        return (0, deadline_date, deadline_time or '23:59', task.get('position') or 0, task.get('id') or 0)
-
+    # Во всех обычных блоках дедлайны выше задач без дедлайна.
+    # В «Фокусе» сохраняем только ручной порядок — иначе drag&drop визуально откатывается назад.
     for category_tasks in categories.values():
-        category_tasks.sort(key=deadline_sort_key)
+        category_tasks.sort(key=active_task_order_key)
     
     current_quarter = get_current_quarter()
     
@@ -815,28 +826,55 @@ def add_subtask(task_id):
     return jsonify({'success': True, 'subtask': subtask})
 
 
-@app.route('/api/subtask/<int:subtask_id>', methods=['PUT'])
+@app.route('/api/subtask/<int:subtask_id>', methods=['GET', 'PUT'])
 def update_subtask(subtask_id):
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
-    data = request.json or {}
 
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    if request.method == 'GET':
+        cur.execute('SELECT * FROM subtasks WHERE id = %s AND user_id = %s',
+                    (subtask_id, session['user_id']))
+        subtask = cur.fetchone()
+        conn.close()
+        if not subtask:
+            return jsonify({'error': 'Subtask not found'}), 404
+        return jsonify(dict(subtask))
+
+    data = request.json or {}
     fields = []
     values = []
+
     if 'title' in data:
         title = str(data.get('title') or '').strip()
         if not title:
+            conn.close()
             return jsonify({'error': 'Title is required'}), 400
         fields.append('title = %s')
         values.append(title)
     if 'is_done' in data:
         fields.append('is_done = %s')
         values.append(bool(data.get('is_done')))
+    if 'comment' in data:
+        fields.append('comment = %s')
+        values.append(str(data.get('comment') or '').strip())
+    if 'deadline_date' in data:
+        deadline_date = str(data.get('deadline_date') or '').strip()
+        if deadline_date:
+            try:
+                datetime.strptime(deadline_date, '%Y-%m-%d')
+            except ValueError:
+                conn.close()
+                return jsonify({'error': 'Invalid deadline date'}), 400
+        fields.append('deadline_date = %s')
+        values.append(deadline_date)
+
     if not fields:
+        conn.close()
         return jsonify({'error': 'Nothing to update'}), 400
 
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
     values.extend([subtask_id, session['user_id']])
     cur.execute(f"""
         UPDATE subtasks SET {", ".join(fields)}
@@ -1045,16 +1083,26 @@ def done_task(task_id):
         ''', ('done', now_utc, now_epoch, task_id))
     else:
         completion_date = datetime.now().date()
+        # Если будущую повторяющуюся задачу закрыли заранее, следующий экземпляр
+        # должен идти ПОСЛЕ запланированной даты, а не снова появляться в том же будущем дне.
+        schedule_anchor = completion_date
+        try:
+            scheduled_date = datetime.strptime(task.get('date') or '', '%Y-%m-%d').date()
+            if scheduled_date > schedule_anchor:
+                schedule_anchor = scheduled_date
+        except (ValueError, TypeError):
+            pass
+
         default_cat = task.get('default_category') or 'personal'
 
         if repeat_type == 'daily':
-            new_date = completion_date + timedelta(days=1)
+            new_date = schedule_anchor + timedelta(days=1)
         elif repeat_type == 'weekly' and task.get('repeat_day') is not None:
-            new_date = next_weekday_after(completion_date, task['repeat_day'])
+            new_date = next_weekday_after(schedule_anchor, task['repeat_day'])
         elif repeat_type == 'biweekly' and task.get('repeat_day') is not None:
-            new_date = next_biweekly_date(task.get('date'), completion_date, task['repeat_day'])
+            new_date = next_biweekly_date(task.get('date'), schedule_anchor, task['repeat_day'])
         elif repeat_type == 'monthly' and task.get('repeat_day') is not None:
-            new_date = next_monthly_date(task.get('date'), completion_date, task['repeat_day'])
+            new_date = next_monthly_date(task.get('date'), schedule_anchor, task['repeat_day'])
         else:
             # Повреждённые старые данные: завершаем задачу без создания нового повтора.
             cur.execute('''
@@ -1173,16 +1221,15 @@ def get_tasks_by_date(date_str):
         SELECT * FROM tasks 
         WHERE user_id = %s AND status = %s AND quarter IS NULL 
         AND date = %s
-        ORDER BY
-            CASE WHEN deadline_date IS NULL OR deadline_date = '' THEN 1 ELSE 0 END ASC,
-            deadline_date ASC,
-            CASE WHEN deadline_time IS NULL OR deadline_time = '' THEN '23:59' ELSE deadline_time END ASC,
-            position ASC, id ASC
+        ORDER BY position ASC, id ASC
     ''', (session['user_id'], 'active', date_str))
-    tasks = cur.fetchall()
+    tasks = [dict(task) for task in cur.fetchall()]
     conn.close()
-    
-    return jsonify([dict(task) for task in tasks])
+
+    # Клиент раскладывает общий ответ по блокам. Глобальная сортировка не мешает:
+    # внутри каждого блока относительный порядок задаёт active_task_order_key.
+    tasks.sort(key=lambda task: ((task.get('category') or ''),) + active_task_order_key(task))
+    return jsonify(tasks)
 
 # --- API: Поиск среди активных задач ---
 @app.route('/api/tasks/search')
@@ -2043,7 +2090,7 @@ MAIN_PAGE = '''
         .modal .btn-delete { background: #e74c3c; color: white; }
         .modal .btn-delete:hover { background: #c0392b; }
         .task-detail-modal { max-width: 680px; max-height: 88vh; display:flex; flex-direction:column; overflow:hidden; }
-        .task-detail-scroll { flex:1; min-height:0; overflow-y:auto; padding-right:4px; }
+        .task-detail-scroll { flex:1; min-height:0; overflow-y:auto; padding-right:4px; padding-bottom:18px; }
         .task-edit-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px 12px; }
         .task-edit-field label { margin-top:6px; }
         .task-edit-full { grid-column:1 / -1; }
@@ -2053,7 +2100,8 @@ MAIN_PAGE = '''
         }
         .repeat-editor { display:none; margin-top:8px; padding:10px 12px; background:#faf7fd; border-radius:9px; }
         .repeat-editor.open { display:block; }
-        .task-comment-section { margin-top:10px; }
+        .add-repeat-editor { margin-top:10px; }
+        .task-comment-section { margin-top:12px; margin-bottom:8px; }
         .task-comment-section label { margin-top:0; }
         .unsaved-modal { max-width:420px; }
         .unsaved-modal .sub { margin:8px 0 4px; line-height:1.45; }
@@ -2227,54 +2275,73 @@ MAIN_PAGE = '''
 </div>
 
 <div class="modal-overlay" id="addTaskModal">
-    <div class="modal">
-        <h3>➕ Новая задача</h3>
-        <p class="sub" id="addTaskModalSub">Добавьте задачу в категорию</p>
-        <input type="hidden" id="addTaskCategory">
-        <label for="addTaskTitle">Название задачи</label>
-        <input type="text" id="addTaskTitle" placeholder="Что нужно сделать?" autofocus>
-        <label for="addTaskDate">📅 Дата выполнения</label>
-        <input type="date" id="addTaskDate" value="{{ view_date }}">
-        <label for="addTaskDuration">⏱️ Время выполнения</label>
-        <input type="text" id="addTaskDuration" placeholder="1 ч">
-        <label for="addTaskComment">💬 Комментарий</label>
-        <textarea id="addTaskComment" placeholder="Дополнительная информация..."></textarea>
-        
-        <label for="addDeadlineDate">⏰ Дедлайн (дата)</label>
-        <input type="date" id="addDeadlineDate" value="">
-        <label for="addDeadlineTime">⏰ Дедлайн (время)</label>
-        <input type="time" id="addDeadlineTime" value="">
-        
-        <div class="checkbox-group">
-            <input type="checkbox" id="addTaskRepeat">
-            <label for="addTaskRepeat">🔄 Повторяющаяся задача</label>
-        </div>
-        <div class="repeat-options" id="addRepeatOptions">
-            <label for="addRepeatType">Тип повторения</label>
-            <select id="addRepeatType">
-                <option value="daily">📆 Каждый день</option>
-                <option value="weekly">📅 Каждую неделю</option>
-                <option value="biweekly">🗓️ Каждые 2 недели</option>
-                <option value="monthly">📌 Каждый месяц</option>
-            </select>
-            <div id="addWeeklyDayGroup" style="margin-top:8px; display:none;">
-                <label for="addRepeatDay">День недели</label>
-                <select id="addRepeatDay">
-                    <option value="0">Воскресенье</option>
-                    <option value="1">Понедельник</option>
-                    <option value="2">Вторник</option>
-                    <option value="3">Среда</option>
-                    <option value="4">Четверг</option>
-                    <option value="5">Пятница</option>
-                    <option value="6">Суббота</option>
-                </select>
+    <div class="modal task-detail-modal">
+        <div class="task-detail-scroll">
+            <h3>➕ Новая задача</h3>
+            <p class="sub" id="addTaskModalSub">Добавьте задачу в категорию</p>
+            <input type="hidden" id="addTaskCategory">
+
+            <div class="task-edit-grid">
+                <div class="task-edit-field task-edit-full">
+                    <label for="addTaskTitle">Название задачи</label>
+                    <input type="text" id="addTaskTitle" placeholder="Что нужно сделать?" autofocus>
+                </div>
+                <div class="task-edit-field">
+                    <label for="addTaskDate">📅 Дата выполнения</label>
+                    <input type="date" id="addTaskDate" value="{{ view_date }}">
+                </div>
+                <div class="task-edit-field">
+                    <label for="addTaskDuration">⏱️ Время выполнения</label>
+                    <input type="text" id="addTaskDuration" placeholder="1 ч">
+                </div>
+                <div class="task-edit-field">
+                    <label for="addDeadlineDate">⏰ Дедлайн</label>
+                    <input type="date" id="addDeadlineDate" value="">
+                </div>
+                <div class="task-edit-field">
+                    <label for="addDeadlineTime">Время дедлайна</label>
+                    <input type="time" id="addDeadlineTime" value="">
+                </div>
             </div>
-            <div id="addMonthlyDayGroup" style="margin-top:8px; display:none;">
-                <label for="addMonthlyDay">Число месяца</label>
-                <select id="addMonthlyDay">
-                    <option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option><option value="24">24</option><option value="25">25</option><option value="26">26</option><option value="27">27</option><option value="28">28</option><option value="29">29</option><option value="30">30</option><option value="31">31</option>
-                </select>
-                <div style="font-size:11px; color:#9b8db5; margin-top:4px;">Если такого числа нет, задача появится в последний день месяца.</div>
+
+            <div class="repeat-editor open add-repeat-editor">
+                <div class="checkbox-group" style="margin-top:0;">
+                    <input type="checkbox" id="addTaskRepeat">
+                    <label for="addTaskRepeat">🔄 Повторяющаяся задача</label>
+                </div>
+                <div class="repeat-options" id="addRepeatOptions">
+                    <label for="addRepeatType">Тип повторения</label>
+                    <select id="addRepeatType">
+                        <option value="daily">📆 Каждый день</option>
+                        <option value="weekly">📅 Каждую неделю</option>
+                        <option value="biweekly">🗓️ Каждые 2 недели</option>
+                        <option value="monthly">📌 Каждый месяц</option>
+                    </select>
+                    <div id="addWeeklyDayGroup" style="margin-top:8px; display:none;">
+                        <label for="addRepeatDay">День недели</label>
+                        <select id="addRepeatDay">
+                            <option value="0">Воскресенье</option>
+                            <option value="1">Понедельник</option>
+                            <option value="2">Вторник</option>
+                            <option value="3">Среда</option>
+                            <option value="4">Четверг</option>
+                            <option value="5">Пятница</option>
+                            <option value="6">Суббота</option>
+                        </select>
+                    </div>
+                    <div id="addMonthlyDayGroup" style="margin-top:8px; display:none;">
+                        <label for="addMonthlyDay">Число месяца</label>
+                        <select id="addMonthlyDay">
+                            <option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option><option value="24">24</option><option value="25">25</option><option value="26">26</option><option value="27">27</option><option value="28">28</option><option value="29">29</option><option value="30">30</option><option value="31">31</option>
+                        </select>
+                        <div style="font-size:11px; color:#9b8db5; margin-top:4px;">Если такого числа нет, задача появится в последний день месяца.</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="task-comment-section">
+                <label for="addTaskComment">💬 Комментарий</label>
+                <textarea id="addTaskComment" placeholder="Дополнительная информация..."></textarea>
             </div>
         </div>
         <div class="modal-actions">
@@ -2817,7 +2884,13 @@ MAIN_PAGE = '''
         div.querySelector('.done-btn').addEventListener('click', (e) => {
             e.stopPropagation();
             fetch('/api/task/' + task.id + '/done', { method: 'POST' })
-                .then(() => { loadTasks(); });
+                .then(async res => {
+                    const data = await res.json().catch(() => ({}));
+                    if (!res.ok) throw new Error(data.message || 'Не удалось завершить задачу');
+                    return data;
+                })
+                .then(() => { loadTasks(); })
+                .catch(err => alert(err.message));
         });
         
         const focusBtn = div.querySelector('.move-to-focus-btn');
@@ -3626,7 +3699,13 @@ FUTURE_PAGE = '''
     document.querySelectorAll('.done-btn').forEach(btn => {
         btn.addEventListener('click', function(e) {
             e.stopPropagation();
-            fetch('/api/task/' + this.dataset.taskId + '/done', { method: 'POST' }).then(() => location.reload());
+            fetch('/api/task/' + this.dataset.taskId + '/done', { method: 'POST' })
+                .then(async res => {
+                    const data = await res.json().catch(() => ({}));
+                    if (!res.ok) throw new Error(data.message || 'Не удалось завершить задачу');
+                    location.reload();
+                })
+                .catch(err => alert(err.message));
         });
     });
     document.querySelectorAll('.delete-btn').forEach(btn => {
@@ -3736,16 +3815,18 @@ QUARTER_PAGE = '''
 
         .subtasks { margin: 8px 0 0 27px; }
         .subtask {
-            display: flex; align-items: center; gap: 7px; padding: 4px 0; font-size: 14px; line-height: 1.35; color: #655a75;
+            display: flex; align-items: flex-start; gap: 7px; padding: 5px 0; font-size: 14px; line-height: 1.35; color: #655a75;
             border: 1px solid transparent; border-radius: 5px;
         }
         .subtask.dragging { opacity: .45; }
         .subtask-drag { background:none; border:none; color:#c0b2d2; cursor:grab; padding:0 2px; font-size:15px; }
         .subtask input[type="checkbox"] { accent-color: #8b7bb5; width: 15px; height: 15px; }
         .subtask.done .subtask-title { text-decoration: line-through; color: #aaa0b5; }
-        .subtask-title { flex: 1; word-break: break-word; cursor: pointer; }
-        .subtask-title-input { flex:1; min-width:80px; padding:4px 7px; font-size:14px; border:1.5px solid #d8cae7; border-radius:7px; color:#4a3f5e; font-family:inherit; outline:none; }
-        .subtask-title-input:focus { border-color:#8b7bb5; }
+        .subtask-content { flex:1; min-width:0; }
+        .subtask-title { word-break: break-word; cursor: pointer; font-size:14px; }
+        .subtask-comment { font-size:12px; color:#998bac; margin-top:2px; white-space:pre-wrap; }
+        .subtask-deadline { font-size:11px; color:#9a7a79; margin-top:2px; }
+        .subtask.done .subtask-comment, .subtask.done .subtask-deadline { color:#b7adbf; }
         .subtask-delete { font-size: 12px; padding: 2px 4px; opacity: .65; }
         .subtask-add { display: none; gap: 6px; margin-top: 5px; }
         .subtask-add.open { display: flex; }
@@ -3765,7 +3846,8 @@ QUARTER_PAGE = '''
         .completed-meta { font-size:11px; color:#9a90a2; margin-top:3px; }
         .completed-comment { font-size:12px; color:#998bac; margin-top:4px; white-space:pre-wrap; }
         .completed-subtasks { margin:7px 0 0 18px; }
-        .completed-subtask { font-size:13px; color:#aaa0b5; text-decoration:line-through; padding:2px 0; }
+        .completed-subtask { font-size:13px; color:#aaa0b5; padding:2px 0; }
+        .completed-subtask-title { text-decoration:line-through; }
         .completed-empty { color:#b8aac8; font-style:italic; padding:8px 2px 10px; font-size:13px; }
 
         .add-task-form { display: flex; gap: 8px; margin-top: 12px; }
@@ -3862,7 +3944,11 @@ QUARTER_PAGE = '''
                             <div class="subtask {% if subtask.is_done %}done{% endif %}" data-subtask-id="{{ subtask.id }}">
                                 <button class="subtask-drag" title="Перетащить">⋮⋮</button>
                                 <input type="checkbox" class="subtask-check" {% if subtask.is_done %}checked{% endif %}>
-                                <span class="subtask-title">{{ subtask.title }}</span>
+                                <div class="subtask-content">
+                                    <div class="subtask-title" title="Нажмите, чтобы изменить подзадачу">{{ subtask.title }}</div>
+                                    <div class="subtask-comment" {% if not subtask.comment %}style="display:none"{% endif %}>{{ subtask.comment or '' }}</div>
+                                    <div class="subtask-deadline" {% if not subtask.deadline_date %}style="display:none"{% endif %}>⏰ {{ format_date_ru(subtask.deadline_date) if subtask.deadline_date else '' }}</div>
+                                </div>
                                 <button class="subtask-delete" title="Удалить подзадачу">✕</button>
                             </div>
                             {% endfor %}
@@ -3902,7 +3988,13 @@ QUARTER_PAGE = '''
                 {% if task.deadline_date %}<div class="task-deadline">⏰ {{ format_date_ru(task.deadline_date) }}</div>{% endif %}
                 {% if task.subtasks %}
                 <div class="completed-subtasks">
-                    {% for subtask in task.subtasks %}<div class="completed-subtask">✓ {{ subtask.title }}</div>{% endfor %}
+                    {% for subtask in task.subtasks %}
+                    <div class="completed-subtask">
+                        <div class="completed-subtask-title">✓ {{ subtask.title }}</div>
+                        {% if subtask.comment %}<div style="font-size:11px;text-decoration:none;color:#aaa0b5;margin-left:14px;">{{ subtask.comment }}</div>{% endif %}
+                        {% if subtask.deadline_date %}<div style="font-size:10px;text-decoration:none;color:#b7adbf;margin-left:14px;">⏰ {{ format_date_ru(subtask.deadline_date) }}</div>{% endif %}
+                    </div>
+                    {% endfor %}
                 </div>
                 {% endif %}
             </div>
@@ -3926,6 +4018,23 @@ QUARTER_PAGE = '''
         <div class="modal-actions">
             <button class="cancel-btn" id="quarterEditCancel">Отмена</button>
             <button class="save-btn" id="quarterEditSave">Сохранить</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal-overlay" id="subtaskEditModal">
+    <div class="modal">
+        <h3>✏️ Изменить подзадачу</h3>
+        <input type="hidden" id="subtaskEditId">
+        <label for="subtaskEditTitle">Название</label>
+        <input type="text" id="subtaskEditTitle">
+        <label for="subtaskEditComment">Комментарий</label>
+        <textarea id="subtaskEditComment" placeholder="Комментарий будет виден под подзадачей"></textarea>
+        <label for="subtaskEditDeadline">⏰ Дедлайн</label>
+        <input type="date" id="subtaskEditDeadline">
+        <div class="modal-actions">
+            <button class="cancel-btn" id="subtaskEditCancel">Отмена</button>
+            <button class="save-btn" id="subtaskEditSave">Сохранить</button>
         </div>
     </div>
 </div>
@@ -3970,6 +4079,21 @@ function ensureCompletedEmptyState() {
     }
 }
 
+function applySubtaskData(row, subtask) {
+    const title = row.querySelector('.subtask-title');
+    const comment = row.querySelector('.subtask-comment');
+    const deadline = row.querySelector('.subtask-deadline');
+    if (title) title.textContent = subtask.title || '';
+    if (comment) {
+        comment.textContent = subtask.comment || '';
+        comment.style.display = subtask.comment ? '' : 'none';
+    }
+    if (deadline) {
+        deadline.textContent = subtask.deadline_date ? '⏰ ' + formatDeadline(subtask.deadline_date) : '';
+        deadline.style.display = subtask.deadline_date ? '' : 'none';
+    }
+}
+
 function buildSubtask(subtask) {
     const row = document.createElement('div');
     row.className = 'subtask' + (subtask.is_done ? ' done' : '');
@@ -3985,16 +4109,28 @@ function buildSubtask(subtask) {
     check.className = 'subtask-check';
     check.checked = !!subtask.is_done;
 
-    const title = document.createElement('span');
+    const content = document.createElement('div');
+    content.className = 'subtask-content';
+
+    const title = document.createElement('div');
     title.className = 'subtask-title';
-    title.textContent = subtask.title || '';
+    title.title = 'Нажмите, чтобы изменить подзадачу';
+
+    const comment = document.createElement('div');
+    comment.className = 'subtask-comment';
+
+    const deadline = document.createElement('div');
+    deadline.className = 'subtask-deadline';
+
+    content.append(title, comment, deadline);
 
     const del = document.createElement('button');
     del.className = 'subtask-delete';
     del.title = 'Удалить подзадачу';
     del.textContent = '✕';
 
-    row.append(drag, check, title, del);
+    row.append(drag, check, content, del);
+    applySubtaskData(row, subtask);
     return row;
 }
 
@@ -4111,7 +4247,27 @@ function buildCompletedFromCard(card) {
         rows.forEach(row => {
             const st = document.createElement('div');
             st.className = 'completed-subtask';
-            st.textContent = '✓ ' + (row.querySelector('.subtask-title')?.textContent || '');
+
+            const stTitle = document.createElement('div');
+            stTitle.className = 'completed-subtask-title';
+            stTitle.textContent = '✓ ' + (row.querySelector('.subtask-title')?.textContent || '');
+            st.appendChild(stTitle);
+
+            const stCommentText = row.querySelector('.subtask-comment')?.textContent || '';
+            if (stCommentText) {
+                const stComment = document.createElement('div');
+                stComment.style.cssText = 'font-size:11px;text-decoration:none;color:#aaa0b5;margin-left:14px;';
+                stComment.textContent = stCommentText;
+                st.appendChild(stComment);
+            }
+
+            const stDeadlineText = row.querySelector('.subtask-deadline')?.textContent || '';
+            if (stDeadlineText) {
+                const stDeadline = document.createElement('div');
+                stDeadline.style.cssText = 'font-size:10px;text-decoration:none;color:#b7adbf;margin-left:14px;';
+                stDeadline.textContent = stDeadlineText;
+                st.appendChild(stDeadline);
+            }
             list.appendChild(st);
         });
         item.appendChild(list);
@@ -4148,59 +4304,18 @@ function saveSubtaskOrder(card) {
     }).catch(() => {});
 }
 
-function startSubtaskEdit(row) {
-    const titleEl = row.querySelector('.subtask-title');
-    if (!titleEl || row.querySelector('.subtask-title-input')) return;
-
-    const originalTitle = titleEl.textContent;
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.className = 'subtask-title-input';
-    input.value = originalTitle;
-    titleEl.style.display = 'none';
-    titleEl.after(input);
-    input.focus();
-    input.select();
-
-    let finished = false;
-    function cleanup() {
-        input.remove();
-        titleEl.style.display = '';
-    }
-    function cancel() {
-        if (finished) return;
-        finished = true;
-        cleanup();
-    }
-    function save() {
-        if (finished) return;
-        const newTitle = input.value.trim();
-        if (!newTitle || newTitle === originalTitle) {
-            cancel();
-            return;
-        }
-        finished = true;
-        fetch('/api/subtask/' + row.dataset.subtaskId, {
-            method:'PUT',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({title:newTitle})
-        })
+function openSubtaskEditor(row) {
+    const subtaskId = row.dataset.subtaskId;
+    fetch('/api/subtask/' + subtaskId)
         .then(r => { if (!r.ok) throw new Error(); return r.json(); })
-        .then(data => {
-            titleEl.textContent = data.subtask.title || newTitle;
-            cleanup();
+        .then(subtask => {
+            document.getElementById('subtaskEditId').value = subtask.id;
+            document.getElementById('subtaskEditTitle').value = subtask.title || '';
+            document.getElementById('subtaskEditComment').value = subtask.comment || '';
+            document.getElementById('subtaskEditDeadline').value = subtask.deadline_date || '';
+            document.getElementById('subtaskEditModal').classList.add('open');
         })
-        .catch(() => {
-            cleanup();
-            alert('Не удалось изменить подзадачу');
-        });
-    }
-
-    input.addEventListener('keydown', function(e) {
-        if (e.key === 'Enter') { e.preventDefault(); save(); }
-        else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
-    });
-    input.addEventListener('blur', save);
+        .catch(() => alert('Не удалось открыть подзадачу'));
 }
 
 function openQuarterEditor(card) {
@@ -4281,6 +4396,34 @@ document.getElementById('quarterEditSave').addEventListener('click', () => {
     .catch(() => alert('Не удалось сохранить задачу'));
 });
 
+
+document.getElementById('subtaskEditCancel').addEventListener('click', () => {
+    document.getElementById('subtaskEditModal').classList.remove('open');
+});
+document.getElementById('subtaskEditModal').addEventListener('click', e => {
+    if (e.target.id === 'subtaskEditModal') e.currentTarget.classList.remove('open');
+});
+document.getElementById('subtaskEditSave').addEventListener('click', () => {
+    const subtaskId = document.getElementById('subtaskEditId').value;
+    const title = document.getElementById('subtaskEditTitle').value.trim();
+    const comment = document.getElementById('subtaskEditComment').value.trim();
+    const deadline = document.getElementById('subtaskEditDeadline').value;
+    if (!title) { alert('Введите название'); return; }
+
+    fetch('/api/subtask/' + subtaskId, {
+        method:'PUT',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({title, comment, deadline_date:deadline})
+    })
+    .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+    .then(data => {
+        const row = document.querySelector('.subtask[data-subtask-id="' + subtaskId + '"]');
+        if (row) applySubtaskData(row, data.subtask);
+        document.getElementById('subtaskEditModal').classList.remove('open');
+    })
+    .catch(() => alert('Не удалось сохранить подзадачу'));
+});
+
 // Редкие действия со сферами оставляем с перезагрузкой страницы.
 document.getElementById('addSphereBtn').addEventListener('click', function() {
     const name = document.getElementById('sphereName').value.trim();
@@ -4343,7 +4486,7 @@ spheresContainer.addEventListener('click', function(e) {
     if (!card) return;
 
     if (e.target.closest('.subtask-title')) {
-        startSubtaskEdit(e.target.closest('.subtask'));
+        openSubtaskEditor(e.target.closest('.subtask'));
         return;
     }
 
