@@ -66,6 +66,7 @@ def init_db():
     # Мягкая миграция старых баз: добавляем новые поля без потери данных.
     cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline_date TEXT")
     cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline_time TEXT")
+    cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS repeat_deadline_time TEXT DEFAULT ''")
     cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completed_at_epoch BIGINT")
 
     cur.execute('''
@@ -265,8 +266,13 @@ def active_task_order_key(task):
     if task.get('category') == 'focus':
         return (0, '', '', position, task_id)
 
-    deadline_date = (task.get('deadline_date') or '').strip()
-    deadline_time = (task.get('deadline_time') or '').strip()
+    repeat_deadline_time = (task.get('repeat_deadline_time') or '').strip()
+    if (task.get('repeat_type') or 'none') != 'none' and repeat_deadline_time and task.get('date'):
+        deadline_date = (task.get('date') or '').strip()
+        deadline_time = repeat_deadline_time
+    else:
+        deadline_date = (task.get('deadline_date') or '').strip()
+        deadline_time = (task.get('deadline_time') or '').strip()
     if not deadline_date:
         return (2, '9999-12-31', '23:59', position, task_id)
     return (1, deadline_date, deadline_time or '23:59', position, task_id)
@@ -947,6 +953,7 @@ def add_direct_task():
     comment = data.get('comment', '')
     deadline_date = data.get('deadline_date', '')
     deadline_time = data.get('deadline_time', '')
+    repeat_deadline_time = data.get('repeat_deadline_time', '') if repeat_type != 'none' else ''
     
     if not title:
         return jsonify({'error': 'Title is required'}), 400
@@ -954,9 +961,9 @@ def add_direct_task():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute('''
-        INSERT INTO tasks (user_id, title, category, default_category, date, duration, repeat_type, repeat_day, status, comment, deadline_date, deadline_time)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ''', (session['user_id'], title, category, category, date, duration, repeat_type, repeat_day, 'active', comment, deadline_date, deadline_time))
+        INSERT INTO tasks (user_id, title, category, default_category, date, duration, repeat_type, repeat_day, status, comment, deadline_date, deadline_time, repeat_deadline_time)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (session['user_id'], title, category, category, date, duration, repeat_type, repeat_day, 'active', comment, deadline_date, deadline_time, repeat_deadline_time))
     conn.commit()
     conn.close()
     
@@ -978,6 +985,7 @@ def update_task(task_id):
     comment = data.get('comment', '')
     deadline_date = data.get('deadline_date', '')
     deadline_time = data.get('deadline_time', '')
+    repeat_deadline_time = data.get('repeat_deadline_time', '') if repeat_type != 'none' else ''
     
     if not title:
         return jsonify({'error': 'Title is required'}), 400
@@ -993,17 +1001,17 @@ def update_task(task_id):
             UPDATE tasks SET 
                 title = %s, category = %s, default_category = %s, date = %s, duration = %s, 
                 repeat_type = %s, repeat_day = %s, comment = %s,
-                deadline_date = %s, deadline_time = %s
+                deadline_date = %s, deadline_time = %s, repeat_deadline_time = %s
             WHERE id = %s AND user_id = %s
-        ''', (title, category, category, date, duration, repeat_type, repeat_day, comment, deadline_date, deadline_time, task_id, session['user_id']))
+        ''', (title, category, category, date, duration, repeat_type, repeat_day, comment, deadline_date, deadline_time, repeat_deadline_time, task_id, session['user_id']))
     else:
         cur.execute('''
             UPDATE tasks SET 
                 title = %s, category = %s, date = %s, duration = %s, 
                 repeat_type = %s, repeat_day = %s, comment = %s,
-                deadline_date = %s, deadline_time = %s
+                deadline_date = %s, deadline_time = %s, repeat_deadline_time = %s
             WHERE id = %s AND user_id = %s
-        ''', (title, category, date, duration, repeat_type, repeat_day, comment, deadline_date, deadline_time, task_id, session['user_id']))
+        ''', (title, category, date, duration, repeat_type, repeat_day, comment, deadline_date, deadline_time, repeat_deadline_time, task_id, session['user_id']))
     
     conn.commit()
     conn.close()
@@ -1129,7 +1137,8 @@ def done_task(task_id):
             task.get('date'), task.get('duration'), 'none', None, 'done',
             task.get('quarter'), task.get('sphere'), task.get('later_group'),
             task.get('sphere_id'), now_utc, now_epoch, task.get('comment'),
-            task.get('deadline_date', ''), task.get('deadline_time', ''),
+            (task.get('date') if task.get('repeat_deadline_time') else task.get('deadline_date', '')),
+            (task.get('repeat_deadline_time') or task.get('deadline_time', '')),
             task.get('position', 0)
         ))
 
@@ -2094,6 +2103,12 @@ MAIN_PAGE = '''
         .task-edit-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px 12px; }
         .task-edit-field label { margin-top:6px; }
         .task-edit-full { grid-column:1 / -1; }
+        .duration-entry, .time-entry { display:flex; align-items:center; gap:6px; }
+        .duration-entry input[type=number] { flex:1; min-width:0; }
+        .duration-entry select { width:86px; flex:0 0 86px; }
+        .time-entry input[type=text] { width:58px; flex:0 0 58px; text-align:center; padding-left:8px; padding-right:8px; }
+        .time-entry .time-sep { color:#8b7bb5; font-weight:700; }
+        .repeat-deadline-help { font-size:11px; color:#9b8db5; margin-top:4px; }
         .repeat-summary-btn {
             width:100%; margin-top:10px; padding:9px 11px; border:1.5px solid #ede5f5; border-radius:8px;
             background:#faf7fd; color:#6f6282; text-align:left; cursor:pointer; font-size:13px;
@@ -2291,16 +2306,25 @@ MAIN_PAGE = '''
                     <input type="date" id="addTaskDate" value="{{ view_date }}">
                 </div>
                 <div class="task-edit-field">
-                    <label for="addTaskDuration">⏱️ Время выполнения</label>
-                    <input type="text" id="addTaskDuration" placeholder="1 ч">
+                    <label for="addTaskDurationValue">⏱️ Время выполнения</label>
+                    <div class="duration-entry">
+                        <input type="number" id="addTaskDurationValue" min="0" step="1" placeholder="15">
+                        <select id="addTaskDurationUnit"><option value="мин">мин</option><option value="ч">ч</option></select>
+                        <input type="hidden" id="addTaskDuration" value="">
+                    </div>
                 </div>
                 <div class="task-edit-field">
                     <label for="addDeadlineDate">⏰ Дедлайн</label>
                     <input type="date" id="addDeadlineDate" value="">
                 </div>
                 <div class="task-edit-field">
-                    <label for="addDeadlineTime">Время дедлайна</label>
-                    <input type="time" id="addDeadlineTime" value="">
+                    <label for="addDeadlineHour">Время дедлайна</label>
+                    <div class="time-entry">
+                        <input type="text" id="addDeadlineHour" inputmode="numeric" maxlength="2" placeholder="чч" autocomplete="off">
+                        <span class="time-sep">:</span>
+                        <input type="text" id="addDeadlineMinute" inputmode="numeric" maxlength="2" placeholder="мм" autocomplete="off">
+                        <input type="hidden" id="addDeadlineTime" value="">
+                    </div>
                 </div>
             </div>
 
@@ -2336,6 +2360,16 @@ MAIN_PAGE = '''
                         </select>
                         <div style="font-size:11px; color:#9b8db5; margin-top:4px;">Если такого числа нет, задача появится в последний день месяца.</div>
                     </div>
+                    <div style="margin-top:10px;">
+                        <label for="addRepeatDeadlineHour">⏰ Выполнить до</label>
+                        <div class="time-entry">
+                            <input type="text" id="addRepeatDeadlineHour" inputmode="numeric" maxlength="2" placeholder="чч" autocomplete="off">
+                            <span class="time-sep">:</span>
+                            <input type="text" id="addRepeatDeadlineMinute" inputmode="numeric" maxlength="2" placeholder="мм" autocomplete="off">
+                            <input type="hidden" id="addRepeatDeadlineTime" value="">
+                        </div>
+                        <div class="repeat-deadline-help">Этот дедлайн по времени будет применяться к каждому повторению.</div>
+                    </div>
                 </div>
             </div>
 
@@ -2369,8 +2403,12 @@ MAIN_PAGE = '''
                     <input type="date" id="viewTaskDate">
                 </div>
                 <div class="task-edit-field">
-                    <label for="viewTaskDuration">⏱️ Время выполнения</label>
-                    <input type="text" id="viewTaskDuration" placeholder="1 ч">
+                    <label for="viewTaskDurationValue">⏱️ Время выполнения</label>
+                    <div class="duration-entry">
+                        <input type="number" id="viewTaskDurationValue" min="0" step="1" placeholder="15">
+                        <select id="viewTaskDurationUnit"><option value="мин">мин</option><option value="ч">ч</option></select>
+                        <input type="hidden" id="viewTaskDuration" value="">
+                    </div>
                 </div>
 
                 <div class="task-edit-field">
@@ -2378,8 +2416,13 @@ MAIN_PAGE = '''
                     <input type="date" id="viewDeadlineDate">
                 </div>
                 <div class="task-edit-field">
-                    <label for="viewDeadlineTime">Время дедлайна</label>
-                    <input type="time" id="viewDeadlineTime">
+                    <label for="viewDeadlineHour">Время дедлайна</label>
+                    <div class="time-entry">
+                        <input type="text" id="viewDeadlineHour" inputmode="numeric" maxlength="2" placeholder="чч" autocomplete="off">
+                        <span class="time-sep">:</span>
+                        <input type="text" id="viewDeadlineMinute" inputmode="numeric" maxlength="2" placeholder="мм" autocomplete="off">
+                        <input type="hidden" id="viewDeadlineTime" value="">
+                    </div>
                 </div>
 
                 <div class="task-edit-field task-edit-full">
@@ -2423,6 +2466,16 @@ MAIN_PAGE = '''
                             <option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option><option value="24">24</option><option value="25">25</option><option value="26">26</option><option value="27">27</option><option value="28">28</option><option value="29">29</option><option value="30">30</option><option value="31">31</option>
                         </select>
                         <div style="font-size:11px; color:#9b8db5; margin-top:4px;">Если такого числа нет, задача появится в последний день месяца.</div>
+                    </div>
+                    <div style="margin-top:10px;">
+                        <label for="viewRepeatDeadlineHour">⏰ Выполнить до</label>
+                        <div class="time-entry">
+                            <input type="text" id="viewRepeatDeadlineHour" inputmode="numeric" maxlength="2" placeholder="чч" autocomplete="off">
+                            <span class="time-sep">:</span>
+                            <input type="text" id="viewRepeatDeadlineMinute" inputmode="numeric" maxlength="2" placeholder="мм" autocomplete="off">
+                            <input type="hidden" id="viewRepeatDeadlineTime" value="">
+                        </div>
+                        <div class="repeat-deadline-help">Этот дедлайн по времени будет применяться к каждому повторению.</div>
                     </div>
                 </div>
             </div>
@@ -2482,6 +2535,110 @@ MAIN_PAGE = '''
     let dragSourceBlock = null;
     let selectedTasks = new Set();
     let dragTimeout = null;
+
+    function syncDurationEntry(valueId, unitId, hiddenId) {
+        const valueEl = document.getElementById(valueId);
+        const unitEl = document.getElementById(unitId);
+        const hiddenEl = document.getElementById(hiddenId);
+        if (!valueEl || !unitEl || !hiddenEl) return;
+        const raw = valueEl.value.trim();
+        hiddenEl.value = raw ? (raw + ' ' + unitEl.value) : '';
+    }
+
+    function setDurationEntry(valueId, unitId, hiddenId, storedValue) {
+        const valueEl = document.getElementById(valueId);
+        const unitEl = document.getElementById(unitId);
+        if (!valueEl || !unitEl) return;
+        const text = String(storedValue || '').trim();
+        const match = text.match(/^([0-9]+(?:[.,][0-9]+)?)\\s*(.*)$/);
+        if (!match) {
+            valueEl.value = '';
+            unitEl.value = 'мин';
+            document.getElementById(hiddenId).value = text;
+            return;
+        }
+        valueEl.value = match[1].replace(',', '.');
+        const unitText = (match[2] || '').toLowerCase();
+        unitEl.value = /(^|\\s)(ч|час|часа|часов|h|hr|hour)/.test(unitText) ? 'ч' : 'мин';
+        syncDurationEntry(valueId, unitId, hiddenId);
+    }
+
+    function initDurationEntry(valueId, unitId, hiddenId) {
+        const valueEl = document.getElementById(valueId);
+        const unitEl = document.getElementById(unitId);
+        if (!valueEl || !unitEl) return;
+        valueEl.addEventListener('input', () => syncDurationEntry(valueId, unitId, hiddenId));
+        unitEl.addEventListener('change', () => syncDurationEntry(valueId, unitId, hiddenId));
+    }
+
+    function syncTimeEntry(hourId, minuteId, hiddenId) {
+        const hourEl = document.getElementById(hourId);
+        const minuteEl = document.getElementById(minuteId);
+        const hiddenEl = document.getElementById(hiddenId);
+        if (!hourEl || !minuteEl || !hiddenEl) return;
+        const hour = hourEl.value.trim();
+        const minute = minuteEl.value.trim();
+        if (hour !== '' && minute !== '') {
+            hiddenEl.value = hour.padStart(2, '0') + ':' + minute.padStart(2, '0');
+        } else {
+            hiddenEl.value = '';
+        }
+    }
+
+    function setTimeEntry(hourId, minuteId, hiddenId, value) {
+        const hourEl = document.getElementById(hourId);
+        const minuteEl = document.getElementById(minuteId);
+        if (!hourEl || !minuteEl) return;
+        const match = String(value || '').match(/^(\\d{1,2}):(\\d{1,2})$/);
+        hourEl.value = match ? match[1].padStart(2, '0') : '';
+        minuteEl.value = match ? match[2].padStart(2, '0') : '';
+        syncTimeEntry(hourId, minuteId, hiddenId);
+    }
+
+    function initTimeEntry(hourId, minuteId, hiddenId) {
+        const hourEl = document.getElementById(hourId);
+        const minuteEl = document.getElementById(minuteId);
+        if (!hourEl || !minuteEl) return;
+        const clean = el => { el.value = el.value.replace(/\\D/g, '').slice(0, 2); };
+        hourEl.addEventListener('input', () => {
+            clean(hourEl);
+            if (hourEl.value.length === 1 && Number(hourEl.value) > 2) {
+                hourEl.value = '0' + hourEl.value;
+                minuteEl.focus();
+                minuteEl.select();
+            } else if (hourEl.value.length === 2) {
+                let hour = Math.min(23, Number(hourEl.value || 0));
+                hourEl.value = String(hour).padStart(2, '0');
+                minuteEl.focus();
+                minuteEl.select();
+            }
+            syncTimeEntry(hourId, minuteId, hiddenId);
+        });
+        minuteEl.addEventListener('input', () => {
+            clean(minuteEl);
+            if (minuteEl.value.length === 2) {
+                let minute = Math.min(59, Number(minuteEl.value || 0));
+                minuteEl.value = String(minute).padStart(2, '0');
+            }
+            syncTimeEntry(hourId, minuteId, hiddenId);
+        });
+        [hourEl, minuteEl].forEach(el => el.addEventListener('blur', () => {
+            if (el.value !== '') el.value = String(Math.max(0, Number(el.value || 0))).padStart(2, '0');
+            syncTimeEntry(hourId, minuteId, hiddenId);
+        }));
+        hourEl.addEventListener('keydown', e => {
+            if (e.key === ':' || e.key === 'ArrowRight') { e.preventDefault(); minuteEl.focus(); minuteEl.select(); }
+        });
+    }
+
+    function initStructuredTaskInputs() {
+        initDurationEntry('addTaskDurationValue', 'addTaskDurationUnit', 'addTaskDuration');
+        initDurationEntry('viewTaskDurationValue', 'viewTaskDurationUnit', 'viewTaskDuration');
+        initTimeEntry('addDeadlineHour', 'addDeadlineMinute', 'addDeadlineTime');
+        initTimeEntry('viewDeadlineHour', 'viewDeadlineMinute', 'viewDeadlineTime');
+        initTimeEntry('addRepeatDeadlineHour', 'addRepeatDeadlineMinute', 'addRepeatDeadlineTime');
+        initTimeEntry('viewRepeatDeadlineHour', 'viewRepeatDeadlineMinute', 'viewRepeatDeadlineTime');
+    }
     
     document.addEventListener('DOMContentLoaded', function() {
         initDragDrop();
@@ -2489,6 +2646,7 @@ MAIN_PAGE = '''
         updateSelectionPanel();
         initTaskSearch();
         initDatePickers();
+        initStructuredTaskInputs();
     });
     
     function toggleTaskSelection(taskId) {
@@ -2845,8 +3003,12 @@ MAIN_PAGE = '''
         }
         
         let deadlineHtml = '';
-        if (task.deadline_date) {
-            const deadlineText = getDeadlineText(task.deadline_date, task.deadline_time);
+        const effectiveDeadlineDate = (task.repeat_type && task.repeat_type !== 'none' && task.repeat_deadline_time && task.date)
+            ? task.date : task.deadline_date;
+        const effectiveDeadlineTime = (task.repeat_type && task.repeat_type !== 'none' && task.repeat_deadline_time)
+            ? task.repeat_deadline_time : task.deadline_time;
+        if (effectiveDeadlineDate) {
+            const deadlineText = getDeadlineText(effectiveDeadlineDate, effectiveDeadlineTime);
             if (deadlineText) {
                 deadlineHtml = '<span class="deadline-badge">' + deadlineText + '</span>';
             }
@@ -3073,6 +3235,7 @@ MAIN_PAGE = '''
             category: document.getElementById('viewTaskCategorySelect').value,
             repeat_type: repeatType,
             repeat_day: repeatDay,
+            repeat_deadline_time: isRepeating ? document.getElementById('viewRepeatDeadlineTime').value : '',
             comment: document.getElementById('viewTaskComment').value
         };
     }
@@ -3116,6 +3279,8 @@ MAIN_PAGE = '''
         } else if (type === 'monthly') {
             detail += ' · ' + document.getElementById('viewMonthlyDay').value + ' число';
         }
+        const repeatDeadline = document.getElementById('viewRepeatDeadlineTime').value;
+        if (repeatDeadline) detail += ' · до ' + repeatDeadline;
         summary.textContent = '🔄 ' + detail;
     }
 
@@ -3128,10 +3293,11 @@ MAIN_PAGE = '''
                 document.getElementById('viewTaskTitle').textContent = '📌 ' + task.title;
                 document.getElementById('viewTaskTitleInput').value = task.title || '';
                 setDateInputValue('viewTaskDate', task.date || '');
-                document.getElementById('viewTaskDuration').value = task.duration || '';
+                setDurationEntry('viewTaskDurationValue', 'viewTaskDurationUnit', 'viewTaskDuration', task.duration || '');
                 document.getElementById('viewTaskComment').value = task.comment || '';
                 setDateInputValue('viewDeadlineDate', task.deadline_date || '');
-                document.getElementById('viewDeadlineTime').value = task.deadline_time || '';
+                setTimeEntry('viewDeadlineHour', 'viewDeadlineMinute', 'viewDeadlineTime', task.deadline_time || '');
+                setTimeEntry('viewRepeatDeadlineHour', 'viewRepeatDeadlineMinute', 'viewRepeatDeadlineTime', task.repeat_deadline_time || '');
                 document.getElementById('viewTaskCategorySelect').value = task.category || 'later';
                 
                 const isRepeating = task.repeat_type && task.repeat_type !== 'none';
@@ -3175,6 +3341,7 @@ MAIN_PAGE = '''
         const isRepeating = document.getElementById('viewTaskRepeat').checked;
         let repeatType = 'none';
         let repeatDay = null;
+        let repeatDeadlineTime = '';
 
         if (!title) {
             alert('Введите название');
@@ -3188,6 +3355,7 @@ MAIN_PAGE = '''
             } else if (repeatType === 'monthly') {
                 repeatDay = parseInt(document.getElementById('viewMonthlyDay').value);
             }
+            repeatDeadlineTime = document.getElementById('viewRepeatDeadlineTime').value;
         }
 
         return fetch('/api/task/' + taskId, {
@@ -3201,6 +3369,7 @@ MAIN_PAGE = '''
                 category: category,
                 repeat_type: repeatType,
                 repeat_day: repeatDay,
+                repeat_deadline_time: repeatDeadlineTime,
                 deadline_date: deadline_date,
                 deadline_time: deadline_time
             })
@@ -3282,6 +3451,8 @@ MAIN_PAGE = '''
     });
     document.getElementById('viewRepeatDay').addEventListener('change', updateViewRepeatSummary);
     document.getElementById('viewMonthlyDay').addEventListener('change', updateViewRepeatSummary);
+    document.getElementById('viewRepeatDeadlineHour').addEventListener('input', () => setTimeout(updateViewRepeatSummary, 0));
+    document.getElementById('viewRepeatDeadlineMinute').addEventListener('input', () => setTimeout(updateViewRepeatSummary, 0));
     
     document.querySelectorAll('.add-task-btn').forEach(btn => {
         btn.addEventListener('click', function(e) {
@@ -3291,10 +3462,11 @@ MAIN_PAGE = '''
             document.getElementById('addTaskModalSub').textContent = 'Добавьте задачу в категорию: ' + getCategoryName(category);
             document.getElementById('addTaskTitle').value = '';
             setDateInputValue('addTaskDate', currentViewDate);
-            document.getElementById('addTaskDuration').value = '';
+            setDurationEntry('addTaskDurationValue', 'addTaskDurationUnit', 'addTaskDuration', '');
             document.getElementById('addTaskComment').value = '';
             setDateInputValue('addDeadlineDate', '');
-            document.getElementById('addDeadlineTime').value = '';
+            setTimeEntry('addDeadlineHour', 'addDeadlineMinute', 'addDeadlineTime', '');
+            setTimeEntry('addRepeatDeadlineHour', 'addRepeatDeadlineMinute', 'addRepeatDeadlineTime', '');
             document.getElementById('addTaskRepeat').checked = false;
             document.getElementById('addRepeatOptions').classList.remove('visible');
             document.getElementById('addWeeklyDayGroup').style.display = 'none';
@@ -3332,6 +3504,7 @@ MAIN_PAGE = '''
         const isRepeating = document.getElementById('addTaskRepeat').checked;
         let repeatType = 'none';
         let repeatDay = null;
+        let repeatDeadlineTime = '';
         
         if (!title) { alert('Введите название'); return; }
         
@@ -3342,6 +3515,7 @@ MAIN_PAGE = '''
             } else if (repeatType === 'monthly') {
                 repeatDay = parseInt(document.getElementById('addMonthlyDay').value);
             }
+            repeatDeadlineTime = document.getElementById('addRepeatDeadlineTime').value;
         }
         
         fetch('/api/task/direct', {
@@ -3355,6 +3529,7 @@ MAIN_PAGE = '''
                 comment: comment, 
                 repeat_type: repeatType, 
                 repeat_day: repeatDay,
+                repeat_deadline_time: repeatDeadlineTime,
                 deadline_date: deadline_date,
                 deadline_time: deadline_time
             })
@@ -3546,6 +3721,12 @@ FUTURE_PAGE = '''
         .repeat-row input { width:auto; }
         .weekly-row { display:none; }
         .weekly-row.visible { display:block; }
+        .duration-entry, .time-entry { display:flex; align-items:center; gap:6px; }
+        .duration-entry input[type=number] { flex:1; min-width:0; }
+        .duration-entry select { width:86px; flex:0 0 86px; }
+        .time-entry input[type=text] { width:58px; flex:0 0 58px; text-align:center; }
+        .time-entry .time-sep { color:#8b7bb5; font-weight:700; }
+        .repeat-deadline-help { font-size:11px; color:#9b8db5; margin-top:4px; }
         
         @media (max-width: 600px) {
             .header { flex-direction: column; text-align: center; }
@@ -3599,10 +3780,12 @@ FUTURE_PAGE = '''
         <input type="hidden" id="futureEditId">
         <label>Название задачи</label><input type="text" id="futureEditTitle">
         <label>📅 Дата выполнения</label><input type="date" id="futureEditDate">
-        <label>⏱️ Время выполнения</label><input type="text" id="futureEditDuration" placeholder="1 ч">
+        <label>⏱️ Время выполнения</label>
+        <div class="duration-entry"><input type="number" id="futureEditDurationValue" min="0" step="1" placeholder="15"><select id="futureEditDurationUnit"><option value="мин">мин</option><option value="ч">ч</option></select><input type="hidden" id="futureEditDuration"></div>
         <label>💬 Комментарий</label><textarea id="futureEditComment"></textarea>
         <label>⏰ Дедлайн (дата)</label><input type="date" id="futureEditDeadlineDate">
-        <label>⏰ Дедлайн (время)</label><input type="time" id="futureEditDeadlineTime">
+        <label>⏰ Дедлайн (время)</label>
+        <div class="time-entry"><input type="text" id="futureDeadlineHour" inputmode="numeric" maxlength="2" placeholder="чч" autocomplete="off"><span class="time-sep">:</span><input type="text" id="futureDeadlineMinute" inputmode="numeric" maxlength="2" placeholder="мм" autocomplete="off"><input type="hidden" id="futureEditDeadlineTime"></div>
         <label>📂 Категория</label>
         <select id="futureEditCategory">
             <option value="focus">🎯 Фокус</option><option value="urgent">⚡ До 15 минут</option>
@@ -3622,6 +3805,11 @@ FUTURE_PAGE = '''
                 <label>Число месяца</label>
                 <select id="futureMonthlyDay"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option><option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option><option value="24">24</option><option value="25">25</option><option value="26">26</option><option value="27">27</option><option value="28">28</option><option value="29">29</option><option value="30">30</option><option value="31">31</option></select>
             </div>
+            <div style="margin-top:10px;">
+                <label>⏰ Выполнить до</label>
+                <div class="time-entry"><input type="text" id="futureRepeatDeadlineHour" inputmode="numeric" maxlength="2" placeholder="чч" autocomplete="off"><span class="time-sep">:</span><input type="text" id="futureRepeatDeadlineMinute" inputmode="numeric" maxlength="2" placeholder="мм" autocomplete="off"><input type="hidden" id="futureRepeatDeadlineTime"></div>
+                <div class="repeat-deadline-help">Применяется к каждому повторению.</div>
+            </div>
         </div>
         <div class="modal-actions"><button class="save" id="futureEditSave">💾 Сохранить</button><button class="cancel" id="futureEditCancel">Закрыть</button></div>
     </div>
@@ -3631,6 +3819,58 @@ FUTURE_PAGE = '''
     const futureModal = document.getElementById('futureEditModal');
     const repeatCheck = document.getElementById('futureEditRepeat');
     const repeatType = document.getElementById('futureRepeatType');
+
+    function futureSyncDuration() {
+        const value = document.getElementById('futureEditDurationValue').value.trim();
+        document.getElementById('futureEditDuration').value = value ? value + ' ' + document.getElementById('futureEditDurationUnit').value : '';
+    }
+    function futureSetDuration(value) {
+        const text = String(value || '').trim();
+        const match = text.match(/^([0-9]+(?:[.,][0-9]+)?)\\s*(.*)$/);
+        if (!match) {
+            document.getElementById('futureEditDurationValue').value = '';
+            document.getElementById('futureEditDurationUnit').value = 'мин';
+            document.getElementById('futureEditDuration').value = text;
+            return;
+        }
+        document.getElementById('futureEditDurationValue').value = match[1].replace(',', '.');
+        const unitText = (match[2] || '').toLowerCase();
+        document.getElementById('futureEditDurationUnit').value = /(^|\\s)(ч|час|часа|часов|h|hr|hour)/.test(unitText) ? 'ч' : 'мин';
+        futureSyncDuration();
+    }
+    document.getElementById('futureEditDurationValue').addEventListener('input', futureSyncDuration);
+    document.getElementById('futureEditDurationUnit').addEventListener('change', futureSyncDuration);
+
+    function futureSyncTime(hourId, minuteId, hiddenId) {
+        const h = document.getElementById(hourId).value.trim();
+        const m = document.getElementById(minuteId).value.trim();
+        document.getElementById(hiddenId).value = (h !== '' && m !== '') ? h.padStart(2,'0') + ':' + m.padStart(2,'0') : '';
+    }
+    function futureSetTime(hourId, minuteId, hiddenId, value) {
+        const match = String(value || '').match(/^(\\d{1,2}):(\\d{1,2})$/);
+        document.getElementById(hourId).value = match ? match[1].padStart(2,'0') : '';
+        document.getElementById(minuteId).value = match ? match[2].padStart(2,'0') : '';
+        futureSyncTime(hourId, minuteId, hiddenId);
+    }
+    function futureInitTime(hourId, minuteId, hiddenId) {
+        const hourEl = document.getElementById(hourId);
+        const minuteEl = document.getElementById(minuteId);
+        const clean = el => { el.value = el.value.replace(/\\D/g, '').slice(0,2); };
+        hourEl.addEventListener('input', () => {
+            clean(hourEl);
+            if (hourEl.value.length === 1 && Number(hourEl.value) > 2) { hourEl.value = '0' + hourEl.value; minuteEl.focus(); minuteEl.select(); }
+            else if (hourEl.value.length === 2) { hourEl.value = String(Math.min(23, Number(hourEl.value || 0))).padStart(2,'0'); minuteEl.focus(); minuteEl.select(); }
+            futureSyncTime(hourId, minuteId, hiddenId);
+        });
+        minuteEl.addEventListener('input', () => {
+            clean(minuteEl);
+            if (minuteEl.value.length === 2) minuteEl.value = String(Math.min(59, Number(minuteEl.value || 0))).padStart(2,'0');
+            futureSyncTime(hourId, minuteId, hiddenId);
+        });
+        [hourEl, minuteEl].forEach(el => el.addEventListener('blur', () => { if (el.value !== '') el.value = String(Number(el.value || 0)).padStart(2,'0'); futureSyncTime(hourId, minuteId, hiddenId); }));
+    }
+    futureInitTime('futureDeadlineHour','futureDeadlineMinute','futureEditDeadlineTime');
+    futureInitTime('futureRepeatDeadlineHour','futureRepeatDeadlineMinute','futureRepeatDeadlineTime');
 
     function syncFutureRepeatUI() {
         document.getElementById('futureRepeatSettings').style.display = repeatCheck.checked ? 'block' : 'none';
@@ -3648,10 +3888,11 @@ FUTURE_PAGE = '''
                 document.getElementById('futureEditId').value = task.id;
                 document.getElementById('futureEditTitle').value = task.title || '';
                 document.getElementById('futureEditDate').value = task.date || '';
-                document.getElementById('futureEditDuration').value = task.duration || '';
+                futureSetDuration(task.duration || '');
                 document.getElementById('futureEditComment').value = task.comment || '';
                 document.getElementById('futureEditDeadlineDate').value = task.deadline_date || '';
-                document.getElementById('futureEditDeadlineTime').value = task.deadline_time || '';
+                futureSetTime('futureDeadlineHour','futureDeadlineMinute','futureEditDeadlineTime', task.deadline_time || '');
+                futureSetTime('futureRepeatDeadlineHour','futureRepeatDeadlineMinute','futureRepeatDeadlineTime', task.repeat_deadline_time || '');
                 document.getElementById('futureEditCategory').value = task.category || 'personal';
                 repeatCheck.checked = task.repeat_type && task.repeat_type !== 'none';
                 repeatType.value = ['daily','weekly','biweekly','monthly'].includes(task.repeat_type) ? task.repeat_type : 'daily';
@@ -3686,6 +3927,7 @@ FUTURE_PAGE = '''
             deadline_date: document.getElementById('futureEditDeadlineDate').value,
             deadline_time: document.getElementById('futureEditDeadlineTime').value,
             repeat_type: isRepeat ? repeatType.value : 'none',
+            repeat_deadline_time: isRepeat ? document.getElementById('futureRepeatDeadlineTime').value : '',
             repeat_day: !isRepeat ? null :
                 ((repeatType.value === 'weekly' || repeatType.value === 'biweekly')
                     ? parseInt(document.getElementById('futureRepeatDay').value)
@@ -4719,31 +4961,19 @@ LATER_PAGE = '''
         }
         .header .btn-back:hover { background: #e0d5ec; }
         
-        .later-layout {
-            display: flex;
-            gap: 20px;
-            align-items: flex-start;
+        .later-layout { display: block; }
+        .later-inbox {
+            background:#fcfaff; border-radius:12px; padding:16px 20px;
+            box-shadow:0 2px 10px rgba(139,123,181,.08);
         }
-        
-        .left-panel {
-            flex: 1;
-            min-width: 280px;
-        }
-        .right-panel {
-            flex: 1;
-            min-width: 280px;
+        .later-inbox-title { font-size:14px; font-weight:700; color:#6f6282; margin-bottom:10px; }
+        .groups-area { margin-top:20px; }
+        .groups-grid {
+            display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:16px; align-items:start;
         }
         
         .add-task {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 16px 20px;
-            margin-bottom: 20px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            align-items: center;
+            display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:12px;
         }
         .add-task input {
             flex: 1;
@@ -4770,28 +5000,32 @@ LATER_PAGE = '''
         .add-task button:hover { background: #7a69a4; }
         
         .task-list {
-            background: #fcfaff;
-            border-radius: 12px;
-            padding: 18px 20px;
-            box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
+            display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:8px;
+            max-height:132px; overflow-y:auto; padding:2px 4px 2px 2px;
+            scrollbar-width:thin; scrollbar-color:#d5c8e6 transparent;
         }
+        .task-list::-webkit-scrollbar { width:7px; }
+        .task-list::-webkit-scrollbar-thumb { background:#d5c8e6; border-radius:10px; }
         .task-item {
             background: #faf5ff;
             border-radius: 8px;
-            padding: 12px 16px;
-            margin-bottom: 8px;
+            padding: 10px 14px;
+            margin-bottom: 0;
+            height:58px;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            flex-wrap: wrap;
+            flex-wrap: nowrap;
             gap: 8px;
             box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
         }
         .task-item .task-info {
-            display: flex;
-            align-items: center;
-            gap: 10px;
+            display:flex; align-items:center; gap:10px; min-width:0; flex:1;
         }
+        .task-item .task-info .task-title {
+            min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+        }
+        .task-item .task-actions { flex-shrink:0; white-space:nowrap; }
         .task-item .task-info .task-duration {
             font-size: 11px;
             color: #b5a7cc;
@@ -4820,12 +5054,13 @@ LATER_PAGE = '''
         .task-item .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
         
         .empty-list { color: #c5b8d8; text-align: center; padding: 30px; }
+        #laterTasks > .empty-list { grid-column:1 / -1; }
         
         .group-section {
             background: #fcfaff;
             border-radius: 12px;
             padding: 18px 20px;
-            margin-bottom: 16px;
+            margin-bottom: 0;
             box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
         }
         .group-header {
@@ -4980,9 +5215,9 @@ LATER_PAGE = '''
         }
         .group-picker .picker-cancel { background: #ede5f5; color: #4a3f5e; }
         
-        @media (max-width: 900px) {
-            .later-layout { flex-direction: column; }
-            .left-panel, .right-panel { flex: 1 1 100%; }
+        @media (max-width: 760px) {
+            .groups-grid { grid-template-columns:1fr; }
+            .task-list { grid-template-columns:1fr; max-height:264px; }
         }
     </style>
 </head>
@@ -4998,7 +5233,8 @@ LATER_PAGE = '''
     </div>
     
     <div class="later-layout">
-        <div class="left-panel">
+        <div class="later-inbox">
+            <div class="later-inbox-title">Новые задачи</div>
             <div class="add-task">
                 <input type="text" id="laterTaskInput" placeholder="Новая задача в общий список..." autofocus>
                 <button id="addLaterBtn">➕ Добавить</button>
@@ -5007,7 +5243,7 @@ LATER_PAGE = '''
                 {% for task in tasks %}
                 <div class="task-item" data-task-id="{{ task.id }}">
                     <div class="task-info">
-                        <span>{{ task.title }}</span>
+                        <span class="task-title" title="{{ task.title }}">{{ task.title }}</span>
                         {% if task.duration %}
                         <span class="task-duration">⏱️ {{ task.duration }}</span>
                         {% endif %}
@@ -5027,12 +5263,12 @@ LATER_PAGE = '''
             </div>
         </div>
         
-        <div class="right-panel">
+        <div class="groups-area">
             <div class="add-group">
                 <input type="text" id="newGroupInput" placeholder="Название группы (например: Идеи, Проекты...)">
                 <button id="addGroupBtn">➕ Создать группу</button>
             </div>
-            
+            <div class="groups-grid">
             {% for group in groups %}
             <div class="group-section" data-group="{{ group.name }}">
                 <div class="group-header">
@@ -5064,6 +5300,7 @@ LATER_PAGE = '''
                 </div>
             </div>
             {% endfor %}
+            </div>
         </div>
     </div>
 </div>
