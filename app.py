@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 import os
 os.environ['TZ'] = 'Europe/Moscow'
-from flask import Flask, request, render_template_string, redirect, session, jsonify
+from flask import Flask, request, render_template_string, redirect, session, jsonify, Response
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta, timezone
 from calendar import monthrange
+import base64
 
 app = Flask(__name__)
 # В продакшене обязательно задайте SECRET_KEY в переменных окружения.
@@ -104,6 +105,18 @@ def init_db():
     cur.execute("ALTER TABLE subtasks ADD COLUMN IF NOT EXISTS comment TEXT DEFAULT ''")
     cur.execute("ALTER TABLE subtasks ADD COLUMN IF NOT EXISTS deadline_date TEXT DEFAULT ''")
 
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS weekly_goals (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            week_start DATE NOT NULL,
+            title TEXT NOT NULL,
+            is_done BOOLEAN NOT NULL DEFAULT FALSE,
+            position INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_weekly_goals_user_week ON weekly_goals (user_id, week_start, position, id)')
     conn.commit()
     conn.close()
 
@@ -294,6 +307,110 @@ def move_overdue_tasks_to_backlog(user_id):
     
     conn.commit()
     conn.close()
+
+
+# Small standalone favicon plus a PNG touch icon; no additional static files required.
+FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180">
+<rect width="180" height="180" rx="34" fill="#f1eaf9"/>
+<path d="M37 69 L57 88 L91 48 M77 110 L98 128 L146 74" fill="none" stroke="#745b9b" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>"""
+APPLE_ICON_BYTES = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAALQAAAC0CAIAAACyr5FlAAADXUlEQVR42u3dPXLbMBCAUZqjc/oOOYCrHMB3yPHSpUyXQjMeFxJHAQEQu/u+Lj8NiDcgSFvQ25/ffzfpUbtLIDgEh+AQHIJDcAgOwSE4BIcEh+AQHIJDcAgOwSE4BIfgkOAQHIJDcAgOwSE4BIfgEBwSHIJDcAgOwSE4BIfgEByCQ3W7uQRf/fzx6/sfPz7frRx6IOPh31Trzdnnxwgqrx87GSf/AxxFZRT3sZMhOASHZQMOMuBYQkbZp9mdDMHRKMNLMJFRGIetBhy2GnDYasBBBhxkwEEGHB5c4fDgmr/bVRM2bjI8uAZbOab9+q6tRjAczyasuw8yguE4nrCOPsgIhuOVCevig4zYG9LjqZ0/T0FlzPxY3r7mmD2eXLuvXwtH8zjr3FCm7etXxNEwTjKG+hiLo2EaXh8nGaN9DF85BvkgI/yj7IT1g4zwG9I2Hx23YF5pLL0hbZueymeqXD7SqU8r533Yaswc4+xH2TM+yJg8xmuOfZq2YJIRaeWYOWdkhMQxYebICIxj6NjICI/jPkJvIJZ9Pl/iB299fVTQNmeMe7LRuqEkxNFlzGSkxXFy5GQkx9E8fjJK4Ciyo1xfxrbsZ2X/61qEwxRCxrbyB6lfvCJkVMRxfF3u/5RexrXF+DKe79c09I4k0LKx+aYmMqLeVsiAg4xFd9lwkAEHGXCQAQcZcJSRsWZwLNGab/bgcEN52q3aVI2eiTQytvSvz59N1aApySRjK/uVGiM2jMlkbJW/UqOvj3wytuLfmtDLR0oZnlaOzg8qLgOOs0tI7mOG4Jg6zbF+jQ2Odh+JbyiZcTRPw7gjciP+6mvalWOojwoy3FZaHmGKyEiO4+SsPERQR0b+laOvj1IytjqfWznzpHqf42oytlIfapr8wioBjkIb0pmzleMUiVpPKw7HhePKmct08kzF9xwOx7Uhnb1FzXdaVek3pB2nM+U5ZtVfn3eZ1Kwn3PnZytmpTXz2IRzJJxiOy3zkVuVMsPZHmPTrjZWjccor3IngaJn4InsUt5Wj+8vH53uaI1DhkNuK4BAcgkNwCA7BITgkOASH4BAcgkNwCA7BITgEhwSH4BAcgkNwCA7BITgEh+CQ4BAcgkNwCA7BITgEh+AQHIJDgkNwCA7BITgEh8L0D+Y3tWREgszMAAAAAElFTkSuQmCC")
+
+@app.route('/favicon.svg')
+def favicon_svg():
+    return Response(FAVICON_SVG, mimetype='image/svg+xml', headers={'Cache-Control': 'public, max-age=86400'})
+
+@app.route('/apple-touch-icon.png')
+def apple_touch_icon():
+    return Response(APPLE_ICON_BYTES, mimetype='image/png', headers={'Cache-Control': 'public, max-age=86400'})
+
+
+def validate_goal_week(raw_week):
+    """Accept only a Monday in YYYY-MM-DD format, including archived weeks."""
+    try:
+        week = datetime.strptime(str(raw_week), '%Y-%m-%d').date()
+    except (ValueError, TypeError):
+        return None
+    return week if week.weekday() == 0 else None
+
+
+def current_goal_week():
+    today = get_now_msk().date()
+    return today - timedelta(days=today.weekday())
+
+
+@app.route('/api/weekly-goals', methods=['GET', 'POST'])
+def weekly_goals_api():
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {} if request.method == 'POST' else {}
+    week = validate_goal_week(data.get('week') if request.method == 'POST' else request.args.get('week'))
+    if request.method == 'GET' and not request.args.get('week'):
+        week = current_goal_week()
+    if request.method == 'POST' and not data.get('week'):
+        week = current_goal_week()
+    if week is None:
+        return jsonify({'error': 'Укажите понедельник в формате ГГГГ-ММ-ДД'}), 400
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if request.method == 'GET':
+                cur.execute('''SELECT id, title, is_done, position FROM weekly_goals
+                    WHERE user_id=%s AND week_start=%s ORDER BY position, id''', (session['user_id'], week))
+                goals = [dict(goal) for goal in cur.fetchall()]
+                return jsonify({'week': week.isoformat(), 'goals': goals})
+            title = str(data.get('title') or '').strip()
+            if not title or len(title) > 500:
+                return jsonify({'error': 'Введите цель (до 500 символов)'}), 400
+            cur.execute('''INSERT INTO weekly_goals (user_id, week_start, title, position)
+                VALUES (%s, %s, %s,
+                    COALESCE((SELECT MAX(position) + 1 FROM weekly_goals WHERE user_id=%s AND week_start=%s), 0))
+                RETURNING id, title, is_done, position''',
+                (session['user_id'], week, title, session['user_id'], week))
+            goal = dict(cur.fetchone())
+        conn.commit()
+        return jsonify(goal), 201
+    finally:
+        conn.close()
+
+
+@app.route('/api/weekly-goals/<int:goal_id>', methods=['PUT', 'DELETE'])
+def weekly_goal_item_api(goal_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if request.method == 'DELETE':
+                cur.execute('DELETE FROM weekly_goals WHERE id=%s AND user_id=%s RETURNING id', (goal_id, session['user_id']))
+                if not cur.fetchone():
+                    return jsonify({'error': 'Цель не найдена'}), 404
+                conn.commit()
+                return jsonify({'success': True})
+            updates = []
+            values = []
+            if 'title' in data:
+                title = str(data['title'] or '').strip()
+                if not title or len(title) > 500:
+                    return jsonify({'error': 'Введите цель (до 500 символов)'}), 400
+                updates.append('title=%s'); values.append(title)
+            if 'is_done' in data:
+                if not isinstance(data['is_done'], bool):
+                    return jsonify({'error': 'Ожидалось значение true/false'}), 400
+                updates.append('is_done=%s'); values.append(data['is_done'])
+            if not updates:
+                return jsonify({'error': 'Нет изменений'}), 400
+            values.extend([goal_id, session['user_id']])
+            cur.execute('UPDATE weekly_goals SET ' + ', '.join(updates) +
+                ' WHERE id=%s AND user_id=%s RETURNING id, title, is_done, position', values)
+            goal = cur.fetchone()
+            if not goal:
+                return jsonify({'error': 'Цель не найдена'}), 404
+        conn.commit()
+        return jsonify(dict(goal))
+    finally:
+        conn.close()
 
 # --- ГЛАВНАЯ СТРАНИЦА ---
 @app.route('/')
@@ -1483,6 +1600,8 @@ LOGIN_PAGE = '''
 <html>
 <head>
     <meta charset="UTF-8">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Вход</title>
     <style>
@@ -1521,6 +1640,8 @@ REGISTER_PAGE = '''
 <html>
 <head>
     <meta charset="UTF-8">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Регистрация</title>
     <style>
@@ -1562,7 +1683,9 @@ MAIN_PAGE = '''
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Мой органайзер</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -1770,6 +1893,39 @@ MAIN_PAGE = '''
         }
         .move-date-input .btn-cancel-move:hover { background: #e0d5ec; }
         
+        .weekly-goals-block {
+            background:#fcfaff; border:2px solid #e2d5f2; border-radius:14px;
+            padding:18px 20px; margin-bottom:16px;
+            box-shadow:0 2px 12px rgba(139,123,181,.06);
+        }
+        .weekly-goals-head { display:flex; align-items:center; justify-content:space-between;
+            flex-wrap:wrap; gap:10px; margin-bottom:12px; }
+        .weekly-goals-head h2 { font-size:18px; }
+        .weekly-week-nav { display:flex; align-items:center; gap:6px; color:#8b7bb5; font-size:12px; }
+        .weekly-week-nav button { background:#f0e8fa; border:0; border-radius:8px; color:#6e5a8b;
+            padding:6px 10px; cursor:pointer; }
+        .weekly-goals-grid, #focusTasks { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+        #focusTasks .task-card { min-width:0; margin:0; align-items:flex-start; gap:5px; }
+        #focusTasks .task-info { min-width:0; overflow-wrap:anywhere; }
+        #focusTasks .task-actions { align-self:flex-end; }
+        .weekly-goal { background:#faf5ff; border-radius:10px; padding:10px 12px;
+            display:flex; align-items:flex-start; gap:8px; min-width:0; overflow-wrap:anywhere; }
+        .weekly-goal input { flex:none; width:17px; height:17px; accent-color:#8b7bb5; margin-top:1px; }
+        .weekly-goal-title { flex:1; min-width:0; font-size:14px; line-height:1.4; cursor:pointer; }
+        .weekly-goal.done .weekly-goal-title { color:#aaa0b5; text-decoration:line-through; }
+        .weekly-goal button { background:none; border:0; color:#a99cba; cursor:pointer;
+            padding:3px 6px; border-radius:6px; }
+        .weekly-goal-form { display:flex; gap:8px; margin-top:12px; }
+        .weekly-goal-form input { flex:1; min-width:0; padding:9px 12px; border-radius:8px;
+            border:1.5px solid #e5daef; background:white; color:#4a3f5e; font:inherit; }
+        .weekly-goal-form button { padding:8px 14px; border:0; border-radius:8px;
+            background:#8b7bb5; color:white; cursor:pointer; }
+        .weekly-goals-empty { grid-column:1/-1; color:#b5a7cc; font-size:13px; padding:10px 0; }
+        .category-select { border:1px solid #e2d8ee; border-radius:7px; padding:5px 8px;
+            background:#f8f4fc; color:#806f98; cursor:pointer; font-size:11px; white-space:nowrap; }
+        .category-head-actions { display:flex; align-items:center; gap:6px; margin-left:auto; }
+        .category-select:hover, .category-select:focus-visible { background:#e9def5; }
+
         .focus-block {
             background: #fcfaff;
             border-radius: 14px;
@@ -2219,6 +2375,19 @@ MAIN_PAGE = '''
         
         @media (max-width: 768px) {
             body { padding: 10px; }
+            .date-nav { flex-direction:column; align-items:stretch; gap:4px; }
+            .date-center { position:static; transform:none; width:100%; margin:0 auto; }
+            .search-area { align-self:flex-end; }
+            .task-card .task-actions button, .waiting-task .task-actions button,
+            .add-task-btn, .waiting-block .add-task-btn, .category-select,
+            .weekly-goal button { min-width:40px; min-height:40px; }
+            .task-card { touch-action:pan-y; }
+            .task-card .drag-handle { touch-action:none; display:inline-flex; align-items:center; justify-content:center; min-width:40px; min-height:40px; }
+            .task-card .task-checkbox { width:20px; height:20px; }
+            .modal-overlay { padding:8px; }
+            .modal { max-height:calc(100dvh - 16px); overflow-y:auto; }
+            .modal input, .modal textarea, .modal select { font-size:16px; }
+
             .app-container { flex-direction: column; }
             .right-column { flex: 1 1 100%; flex-direction: row; flex-wrap: wrap; }
             .right-column .sidebar-card { flex: 1; min-width: 120px; }
@@ -2236,12 +2405,14 @@ MAIN_PAGE = '''
             .task-edit-full { grid-column:auto; }
             .task-detail-modal .modal-actions { margin:12px -16px -18px; padding:12px 16px 14px; }
             .task-card { padding: 8px 10px; }
-            .task-card .task-actions button { padding: 4px 4px; min-width: 28px; min-height: 28px; font-size: 13px; }
+            .task-card .task-actions button { padding: 4px 4px; min-width: 40px; min-height: 40px; font-size: 13px; }
             .selection-panel { flex-direction: column; align-items: stretch; }
             .selection-panel .btn-group { justify-content: center; }
             .move-date-input { flex-direction: column; align-items: stretch; }
         }
         @media (max-width: 480px) {
+            .weekly-goals-block, .focus-block { padding:12px; }
+            .weekly-goals-head h2 { font-size:16px; }
             .block-grid { grid-template-columns: 1fr; }
             .date-nav .date-label { font-size: 12px; min-width: 80px; }
             .search-area.expanded .search-box { width: 140px; }
@@ -2251,6 +2422,9 @@ MAIN_PAGE = '''
             .right-column .sidebar-card { min-width: 100px; }
             .right-column .waiting-block { min-width: 100px; }
             .right-column .sidebar-card .big-btn { font-size: 13px; padding: 10px; }
+        }
+        @media (max-width: 360px) {
+            .weekly-goals-grid, #focusTasks { grid-template-columns:1fr; }
         }
     </style>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -2315,10 +2489,30 @@ MAIN_PAGE = '''
             </div>
         </div>
 
+        <section class="weekly-goals-block" id="weeklyGoalsBlock" aria-labelledby="weeklyGoalsTitle">
+            <div class="weekly-goals-head">
+                <h2 id="weeklyGoalsTitle">🌟 Цели на неделю <span id="weeklyGoalsCount" style="color:#8b7bb5;font-size:12px;font-weight:400"></span></h2>
+                <div class="weekly-week-nav">
+                    <button type="button" id="weeklyPrev" title="Предыдущая неделя" aria-label="Предыдущая неделя">◀</button>
+                    <span id="weeklyRange"></span>
+                    <button type="button" id="weeklyNext" title="Следующая неделя" aria-label="Следующая неделя">▶</button>
+                    <button type="button" id="weeklyCurrent" title="Текущая неделя">Сегодня</button>
+                </div>
+            </div>
+            <div class="weekly-goals-grid" id="weeklyGoalsList" aria-live="polite"></div>
+            <form class="weekly-goal-form" id="weeklyGoalForm">
+                <input id="weeklyGoalTitle" maxlength="500" placeholder="Новая цель на неделю..." aria-label="Новая цель на неделю" required>
+                <button type="submit">＋ Добавить</button>
+            </form>
+        </section>
+
         <div class="focus-block" id="focusBlock">
             <div class="block-header">
-                🎯 Фокус
-                <span class="count" id="focusCount">0</span>
+                <span>🎯 Фокус</span>
+                <span class="category-head-actions">
+                    <span class="count" id="focusCount">0</span>
+                    <button type="button" class="category-select" data-select-category="focus" aria-pressed="false">Выбрать все</button>
+                </span>
             </div>
             <div id="focusTasks"></div>
             <div class="empty-block" id="focusEmpty">Нет задач в фокусе</div>
@@ -2326,22 +2520,22 @@ MAIN_PAGE = '''
 
         <div class="block-grid" id="blockGrid">
             <div class="block block-urgent" id="block-urgent">
-                <div class="block-header">⚡ До 15 минут <span class="count" id="count-urgent">0</span></div>
+                <div class="block-header"><span>⚡ До 15 минут</span><span class="category-head-actions"><span class="count" id="count-urgent">0</span><button type="button" class="category-select" data-select-category="urgent" aria-pressed="false">Выбрать все</button></span></div>
                 <div id="tasks-urgent"></div>
                 <button class="add-task-btn" data-category="urgent">+</button>
             </div>
             <div class="block block-work" id="block-work">
-                <div class="block-header">💼 Работа <span class="count" id="count-work">0</span></div>
+                <div class="block-header"><span>💼 Работа</span><span class="category-head-actions"><span class="count" id="count-work">0</span><button type="button" class="category-select" data-select-category="work" aria-pressed="false">Выбрать все</button></span></div>
                 <div id="tasks-work"></div>
                 <button class="add-task-btn" data-category="work">+</button>
             </div>
             <div class="block block-home" id="block-home">
-                <div class="block-header">🏠 Дом <span class="count" id="count-home">0</span></div>
+                <div class="block-header"><span>🏠 Дом</span><span class="category-head-actions"><span class="count" id="count-home">0</span><button type="button" class="category-select" data-select-category="home" aria-pressed="false">Выбрать все</button></span></div>
                 <div id="tasks-home"></div>
                 <button class="add-task-btn" data-category="home">+</button>
             </div>
             <div class="block block-personal" id="block-personal">
-                <div class="block-header">❤️ Личное <span class="count" id="count-personal">0</span></div>
+                <div class="block-header"><span>❤️ Личное</span><span class="category-head-actions"><span class="count" id="count-personal">0</span><button type="button" class="category-select" data-select-category="personal" aria-pressed="false">Выбрать все</button></span></div>
                 <div id="tasks-personal"></div>
                 <button class="add-task-btn" data-category="personal">+</button>
             </div>
@@ -2359,8 +2553,8 @@ MAIN_PAGE = '''
         <!-- Блок "Жду ответа" перенесен в правую колонку -->
         <div class="waiting-block" id="block-waiting">
             <div class="block-header">
-                ⏳ Жду ответа
-                <span class="count" id="count-waiting">0</span>
+                <span>⏳ Жду ответа</span>
+                <span class="category-head-actions"><span class="count" id="count-waiting">0</span><button type="button" class="category-select" data-select-category="waiting" aria-pressed="false">Выбрать все</button></span>
             </div>
             <div id="tasks-waiting"></div>
             <button class="add-task-btn" data-category="waiting" title="Добавить задачу">+</button>
@@ -2726,7 +2920,123 @@ MAIN_PAGE = '''
         initTimeEntry('viewRepeatDeadlineHour', 'viewRepeatDeadlineMinute', 'viewRepeatDeadlineTime');
     }
     
+
+    // Weekly goals are independent from daily tasks and stored for each Monday–Sunday week.
+    function mondayOfDate(date) {
+        const result = new Date(date.getFullYear(), date.getMonth(), date.getDate(), 12);
+        result.setDate(result.getDate() - (result.getDay() + 6) % 7);
+        return result;
+    }
+    function isoLocalDate(date) {
+        return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
+    }
+    let displayedGoalWeek = mondayOfDate(new Date());
+    let weeklyRequestNumber = 0;
+    async function weeklyJson(url, options) {
+        const response = await fetch(url, options);
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error || 'Не удалось выполнить действие');
+        return body;
+    }
+    async function loadWeekGoals() {
+        const requestNumber = ++weeklyRequestNumber;
+        const week = isoLocalDate(displayedGoalWeek);
+        const ending = new Date(displayedGoalWeek.getFullYear(), displayedGoalWeek.getMonth(), displayedGoalWeek.getDate() + 6, 12);
+        document.getElementById('weeklyRange').textContent =
+            displayedGoalWeek.toLocaleDateString('ru-RU', {day:'numeric',month:'short'}) + ' – ' +
+            ending.toLocaleDateString('ru-RU', {day:'numeric',month:'short'});
+        try {
+            const data = await weeklyJson('/api/weekly-goals?week=' + week);
+            if (requestNumber !== weeklyRequestNumber) return;
+            const list = document.getElementById('weeklyGoalsList');
+            list.replaceChildren();
+            const goals = data.goals || [];
+            document.getElementById('weeklyGoalsCount').textContent =
+                goals.filter(goal => goal.is_done).length + ' / ' + goals.length;
+            if (!goals.length) {
+                const empty = document.createElement('div');
+                empty.className = 'weekly-goals-empty';
+                empty.textContent = 'На эту неделю целей пока нет';
+                list.append(empty);
+            }
+            goals.forEach(goal => {
+                const card = document.createElement('div');
+                card.className = 'weekly-goal' + (goal.is_done ? ' done' : '');
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox'; checkbox.checked = goal.is_done;
+                checkbox.setAttribute('aria-label', 'Выполнить цель: ' + goal.title);
+                const title = document.createElement('span');
+                title.className = 'weekly-goal-title'; title.textContent = goal.title;
+                title.title = 'Нажмите, чтобы изменить цель';
+                const remove = document.createElement('button');
+                remove.type = 'button'; remove.textContent = '✕';
+                remove.title = 'Удалить цель'; remove.setAttribute('aria-label','Удалить цель');
+                checkbox.addEventListener('change', async () => {
+                    checkbox.disabled = true;
+                    try {
+                        await weeklyJson('/api/weekly-goals/' + goal.id, {
+                            method:'PUT', headers:{'Content-Type':'application/json'},
+                            body:JSON.stringify({is_done:checkbox.checked})
+                        });
+                        await loadWeekGoals();
+                    } catch (error) { checkbox.checked = !checkbox.checked; checkbox.disabled = false; alert(error.message); }
+                });
+                title.addEventListener('click', async () => {
+                    const updated = prompt('Изменить цель:', goal.title);
+                    if (updated === null || updated.trim() === goal.title) return;
+                    if (!updated.trim()) { alert('Название цели не может быть пустым'); return; }
+                    try {
+                        await weeklyJson('/api/weekly-goals/' + goal.id, {
+                            method:'PUT', headers:{'Content-Type':'application/json'},
+                            body:JSON.stringify({title:updated.trim()})
+                        });
+                        await loadWeekGoals();
+                    } catch (error) { alert(error.message); }
+                });
+                remove.addEventListener('click', async () => {
+                    if (!confirm('Удалить эту цель?')) return;
+                    try {
+                        await weeklyJson('/api/weekly-goals/' + goal.id, {method:'DELETE'});
+                        await loadWeekGoals();
+                    } catch (error) { alert(error.message); }
+                });
+                card.append(checkbox,title,remove);
+                list.append(card);
+            });
+        } catch (error) {
+            if (requestNumber === weeklyRequestNumber) {
+                document.getElementById('weeklyGoalsList').textContent = 'Не удалось загрузить цели: ' + error.message;
+            }
+        }
+    }
+    document.getElementById('weeklyGoalForm').addEventListener('submit', async event => {
+        event.preventDefault();
+        const input = document.getElementById('weeklyGoalTitle');
+        const title = input.value.trim();
+        if (!title) return;
+        const week = isoLocalDate(displayedGoalWeek);
+        try {
+            input.disabled = true;
+            await weeklyJson('/api/weekly-goals', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({title,week})
+            });
+            input.value = '';
+            await loadWeekGoals();
+        } catch (error) { alert(error.message); }
+        finally { input.disabled = false; input.focus(); }
+    });
+    document.getElementById('weeklyPrev').addEventListener('click', () => {
+        displayedGoalWeek.setDate(displayedGoalWeek.getDate() - 7); loadWeekGoals();
+    });
+    document.getElementById('weeklyNext').addEventListener('click', () => {
+        displayedGoalWeek.setDate(displayedGoalWeek.getDate() + 7); loadWeekGoals();
+    });
+    document.getElementById('weeklyCurrent').addEventListener('click', () => {
+        displayedGoalWeek = mondayOfDate(new Date()); loadWeekGoals();
+    });
     document.addEventListener('DOMContentLoaded', function() {
+        loadWeekGoals();
         initDragDrop();
         updateEmptyBlocks();
         updateSelectionPanel();
@@ -2755,6 +3065,34 @@ MAIN_PAGE = '''
         updateSelectionPanel();
     }
     
+    function toggleCategorySelection(category) {
+        const containerId = category === 'focus' ? 'focusTasks' : 'tasks-' + category;
+        const container = document.getElementById(containerId);
+        if (!container) return;
+        const ids = [...container.querySelectorAll('.task-checkbox')].map(cb => Number(cb.dataset.taskId));
+        if (!ids.length) return;
+        const allSelected = ids.every(id => selectedTasks.has(id));
+        ids.forEach(id => allSelected ? selectedTasks.delete(id) : selectedTasks.add(id));
+        updateSelectionPanel();
+        updateCheckboxes();
+    }
+
+    document.querySelectorAll('[data-select-category]').forEach(button => {
+        button.addEventListener('click', () => toggleCategorySelection(button.dataset.selectCategory));
+    });
+
+    function updateCategorySelectionButtons() {
+        document.querySelectorAll('[data-select-category]').forEach(button => {
+            const category = button.dataset.selectCategory;
+            const container = document.getElementById(category === 'focus' ? 'focusTasks' : 'tasks-' + category);
+            const ids = container ? [...container.querySelectorAll('.task-checkbox')].map(cb => Number(cb.dataset.taskId)) : [];
+            const allSelected = ids.length > 0 && ids.every(id => selectedTasks.has(id));
+            button.textContent = allSelected ? 'Снять выбор' : 'Выбрать все';
+            button.setAttribute('aria-pressed', String(allSelected));
+            button.disabled = ids.length === 0;
+        });
+    }
+
     function clearAllSelection() {
         selectedTasks.clear();
         updateSelectionPanel();
@@ -2772,6 +3110,7 @@ MAIN_PAGE = '''
         const panel = document.getElementById('selectionPanel');
         const info = document.getElementById('selectionInfo');
         const count = selectedTasks.size;
+        updateCategorySelectionButtons();
         if (count > 0) {
             panel.classList.add('active');
             info.textContent = '✅ Выбрано: ' + count + ' задач';
@@ -2836,7 +3175,8 @@ MAIN_PAGE = '''
             card.removeEventListener('dragenter', handleDragEnter);
             card.removeEventListener('dragleave', handleDragLeave);
             card.removeEventListener('drop', handleDrop);
-            card.removeEventListener('touchstart', handleTouchStart);
+            const oldHandle = card.querySelector('.drag-handle');
+            if (oldHandle) oldHandle.removeEventListener('touchstart', handleTouchStart);
             card.removeEventListener('touchmove', handleTouchMove);
             card.removeEventListener('touchend', handleTouchEnd);
             
@@ -2846,7 +3186,8 @@ MAIN_PAGE = '''
             card.addEventListener('dragenter', handleDragEnter);
             card.addEventListener('dragleave', handleDragLeave);
             card.addEventListener('drop', handleDrop);
-            card.addEventListener('touchstart', handleTouchStart, { passive: true });
+            const handle = card.querySelector('.drag-handle');
+            if (handle) handle.addEventListener('touchstart', handleTouchStart, { passive: true });
             card.addEventListener('touchmove', handleTouchMove, { passive: false });
             card.addEventListener('touchend', handleTouchEnd, { passive: true });
         });
@@ -2992,8 +3333,8 @@ MAIN_PAGE = '''
     function handleTouchStart(e) {
         const touch = e.touches[0];
         touchDragData = {
-            taskId: this.dataset.taskId,
-            card: this,
+            taskId: this.closest('.task-card').dataset.taskId,
+            card: this.closest('.task-card'),
             startX: touch.clientX,
             startY: touch.clientY,
             block: this.closest('.block, .waiting-block, .focus-block')
@@ -3087,12 +3428,12 @@ MAIN_PAGE = '''
         
         let durationHtml = '';
         if (task.duration) {
-            durationHtml = '<span class="task-duration">⏱️ ' + task.duration + '</span>';
+            durationHtml = '<span class="task-duration">⏱️ ' + escapeHtml(task.duration) + '</span>';
         }
         
         let commentHtml = '';
         if (task.comment && task.comment.trim() !== '') {
-            commentHtml = '<span class="comment-badge" title="' + task.comment.replace(/"/g, '&quot;') + '">💬</span>';
+            commentHtml = '<span class="comment-badge" title="' + escapeHtml(task.comment) + '">💬</span>';
         }
         
         let deadlineHtml = '';
@@ -3103,14 +3444,14 @@ MAIN_PAGE = '''
         if (effectiveDeadlineDate) {
             const deadlineText = getDeadlineText(effectiveDeadlineDate, effectiveDeadlineTime);
             if (deadlineText) {
-                deadlineHtml = '<span class="deadline-badge">' + deadlineText + '</span>';
+                deadlineHtml = '<span class="deadline-badge">' + escapeHtml(deadlineText) + '</span>';
             }
         }
         
         div.innerHTML = `
             <div class="task-info" data-task-id="${task.id}">
                 <input type="checkbox" class="task-checkbox" data-task-id="${task.id}" ${isChecked ? 'checked' : ''}>
-                <span>${task.title}</span>
+                <span>${escapeHtml(task.title)}</span>
                 ${durationHtml}
                 ${commentHtml}
                 ${deadlineHtml}
@@ -3701,6 +4042,8 @@ FUTURE_PAGE = '''
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>📅 Будущие — Мой органайзер</title>
     <style>
@@ -4069,6 +4412,8 @@ QUARTER_PAGE = '''
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{ quarter_name }} {{ quarter_year }} — Мой органайзер</title>
     <style>
@@ -4149,7 +4494,7 @@ QUARTER_PAGE = '''
             display: flex; justify-content: space-between; gap: 10px; align-items: flex-start;
         }
         .task-left { display: flex; gap: 8px; min-width: 0; flex: 1; align-items: flex-start; }
-        .drag-handle { color: #c0b2d2; cursor: grab; user-select: none; padding-top: 2px; }
+        .drag-handle { color: #c0b2d2; cursor: grab; user-select: none; padding-top: 2px; touch-action:none; }
         .task-content { min-width: 0; flex: 1; }
         .task-title-row { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
         .task-title { font-size: 16px; line-height: 1.4; font-weight: 500; word-break: break-word; cursor: pointer; }
@@ -4164,7 +4509,7 @@ QUARTER_PAGE = '''
             border: 1px solid transparent; border-radius: 5px;
         }
         .subtask.dragging { opacity: .45; }
-        .subtask-drag { background:none; border:none; color:#c0b2d2; cursor:grab; padding:0 2px; font-size:15px; }
+        .subtask-drag { background:none; border:none; color:#c0b2d2; cursor:grab; padding:0 2px; font-size:15px; touch-action:none; }
         .subtask input[type="checkbox"] { accent-color: #8b7bb5; width: 15px; height: 15px; }
         .subtask.done .subtask-title { text-decoration: line-through; color: #aaa0b5; }
         .subtask-content { flex:1; min-width:0; }
@@ -4219,6 +4564,11 @@ QUARTER_PAGE = '''
         .cancel-btn { background:#ede5f5; color:#4a3f5e; }
 
         @media (max-width: 600px) {
+            .icon-btn, .task-action, .subtask-delete, .subtask-drag, .add-subtask-toggle, .drag-handle { min-width:40px; min-height:40px; }
+            .subtask input[type="checkbox"] { width:20px; height:20px; flex:none; }
+            .modal-overlay { padding:8px; }
+            .modal { max-height:calc(100dvh - 16px); overflow-y:auto; }
+            .modal input, .modal textarea, .add-sphere input, .taskInput, .subtask-input { font-size:16px; }
             .header { flex-direction:column; text-align:center; }
             .add-sphere { flex-direction:column; }
             .add-sphere input { width:100%; }
@@ -5012,6 +5362,53 @@ spheresContainer.addEventListener('dragend', function() {
     }
 });
 
+
+// A short drag by the grip on touch screens; text, checkboxes, and scrolling elsewhere stay usable.
+let mobileQuarterDrag = null;
+spheresContainer.addEventListener('touchstart', e => {
+    const grip = e.target.closest('.subtask-drag, .drag-handle');
+    if (!grip) return;
+    const element = grip.classList.contains('subtask-drag') ? grip.closest('.subtask') : grip.closest('.task-item');
+    if (!element) return;
+    const touch = e.changedTouches[0];
+    mobileQuarterDrag = { element, x:touch.clientX, y:touch.clientY,
+        subtask:grip.classList.contains('subtask-drag') };
+    element.classList.add('dragging');
+}, {passive:true});
+spheresContainer.addEventListener('touchmove', e => {
+    if (!mobileQuarterDrag) return;
+    e.preventDefault();
+}, {passive:false});
+spheresContainer.addEventListener('touchend', e => {
+    if (!mobileQuarterDrag) return;
+    const {element, subtask} = mobileQuarterDrag;
+    element.classList.remove('dragging');
+    mobileQuarterDrag = null;
+    const touch = e.changedTouches[0];
+    const target = document.elementFromPoint(touch.clientX, touch.clientY)?.closest(subtask ? '.subtask' : '.task-item');
+    if (!target || target === element) return;
+    if (subtask) {
+        const sourceCard = element.closest('.task-item');
+        if (sourceCard !== target.closest('.task-item') ||
+            element.classList.contains('done') !== target.classList.contains('done')) return;
+        const rect = target.getBoundingClientRect();
+        if (touch.clientY < rect.top + rect.height/2) target.before(element);
+        else target.after(element);
+        saveSubtaskOrder(sourceCard);
+    } else {
+        const sourceContainer = element.closest('.tasks-container');
+        if (!sourceContainer || sourceContainer !== target.closest('.tasks-container')) return;
+        const rect = target.getBoundingClientRect();
+        if (touch.clientY < rect.top + rect.height/2) target.before(element);
+        else target.after(element);
+        saveQuarterOrder(sourceContainer);
+    }
+});
+spheresContainer.addEventListener('touchcancel', () => {
+    if (mobileQuarterDrag) mobileQuarterDrag.element.classList.remove('dragging');
+    mobileQuarterDrag = null;
+});
+
 document.querySelectorAll('.task-item').forEach(card => normalizeSubtasks(card, false));
 document.querySelectorAll('.tasks-container').forEach(ensureEmptyState);
 ensureCompletedEmptyState();
@@ -5025,6 +5422,8 @@ LATER_PAGE = '''
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🕰️ Позже — Мой органайзер</title>
     <style>
@@ -5128,7 +5527,7 @@ LATER_PAGE = '''
             gap:2px 6px; min-width:0; flex:1; max-height:100%; overflow:hidden;
         }
         .later-task-title {
-            font:inherit; font-weight:600; border:0; background:transparent; color:inherit;
+            font:inherit; font-weight:400; border:0; background:transparent; color:inherit;
             text-align:left; cursor:pointer; min-width:0; overflow:hidden;
             text-overflow:ellipsis; white-space:nowrap; max-width:100%;
         }
@@ -5347,6 +5746,10 @@ LATER_PAGE = '''
             background:#ede5f5; color:#4a3f5e; }
         #laterEditSave { background:#8b7bb5; color:white; }
         @media (max-width: 760px) {
+            .later-task-title { font-weight:400; }
+            .task-item .task-actions button, .group-task-item .task-actions button { min-width:40px; min-height:40px; }
+            .later-edit-dialog { max-height:calc(100dvh - 32px); overflow-y:auto; }
+            .add-task input, .add-group-task input, .later-edit-dialog input, .later-edit-dialog textarea { font-size:16px; }
             .groups-grid { column-count:1; }
             .task-list { grid-template-columns:1fr; max-height:308px; }
         }
@@ -5685,6 +6088,8 @@ DONE_PAGE = '''
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>✅ Готово — Мой органайзер</title>
     <style>
