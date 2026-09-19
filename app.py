@@ -545,6 +545,47 @@ def add_later_task():
     conn.close()
     return jsonify({'success': True, 'task': dict(task)})
 
+# --- API: Правки задач в "Позже" (заголовок, комментарий, дата/время дедлайна) ---
+@app.route('/api/task/<int:task_id>/later_edit', methods=['PUT'])
+def update_later_task(task_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+    title = (data.get('title') or '').strip()
+    comment = (data.get('comment') or '').strip()
+    deadline_date = (data.get('deadline_date') or '').strip()
+    deadline_time = (data.get('deadline_time') or '').strip()
+    if not title:
+        return jsonify({'error': 'Введите название задачи'}), 400
+    if deadline_date:
+        try:
+            datetime.strptime(deadline_date, '%Y-%m-%d')
+        except ValueError:
+            return jsonify({'error': 'Неверная дата дедлайна'}), 400
+    if deadline_time:
+        try:
+            datetime.strptime(deadline_time, '%H:%M')
+        except ValueError:
+            return jsonify({'error': 'Неверное время дедлайна'}), 400
+        if not deadline_date:
+            return jsonify({'error': 'Для времени дедлайна укажите дату'}), 400
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('''
+            UPDATE tasks SET title = %s, comment = %s, deadline_date = %s, deadline_time = %s
+            WHERE id = %s AND user_id = %s AND category = 'later'
+              AND status = 'active' AND quarter IS NULL
+            RETURNING id
+        ''', (title, comment, deadline_date, deadline_time, task_id, session['user_id']))
+        task = cur.fetchone()
+        if not task:
+            return jsonify({'error': 'Задача не найдена'}), 404
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'success': True})
+
 # --- API: Добавить группу в "Позже" ---
 @app.route('/api/later/group', methods=['POST'])
 def add_later_group():
@@ -1297,37 +1338,61 @@ def move_tasks_to_date():
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
     
-    data = request.json
-    task_ids = data.get('task_ids', [])
-    new_date = data.get('date', '')
-    
-    if not task_ids or not new_date:
-        return jsonify({'error': 'Task IDs and date are required'}), 400
-    
+    data = request.get_json(silent=True) or {}
+    task_ids = data.get('task_ids') or []
+    new_date = (data.get('date') or '').strip()
+    category = (data.get('category') or '').strip()
+    allowed = {'focus', 'urgent', 'work', 'home', 'personal', 'waiting', 'later'}
+    if not isinstance(task_ids, list) or not task_ids or len(task_ids) > 500:
+        return jsonify({'error': 'Выберите от 1 до 500 задач'}), 400
+    if not new_date and not category:
+        return jsonify({'error': 'Укажите дату или категорию'}), 400
+    if category and category not in allowed:
+        return jsonify({'error': 'Неизвестная категория'}), 400
+    if new_date:
+        try:
+            datetime.strptime(new_date, '%Y-%m-%d')
+        except ValueError:
+            return jsonify({'error': 'Некорректная дата'}), 400
+    try:
+        ids = [int(tid) for tid in task_ids]
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Некорректные идентификаторы'}), 400
+    if len(ids) != len(set(ids)):
+        return jsonify({'error': 'Повторяющиеся идентификаторы'}), 400
+
     conn = get_db_connection()
-    cur = conn.cursor()
-    
-    placeholders = ','.join(['%s'] * len(task_ids))
-    cur.execute(f'''
-        SELECT id FROM tasks 
-        WHERE id IN ({placeholders}) AND user_id = %s
-    ''', (*task_ids, session['user_id']))
-    valid_tasks = cur.fetchall()
-    
-    if len(valid_tasks) != len(task_ids):
+    try:
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT id FROM tasks
+            WHERE id = ANY(%s) AND user_id = %s AND status = 'active' AND quarter IS NULL
+            FOR UPDATE
+        ''', (ids, session['user_id']))
+        if len(cur.fetchall()) != len(ids):
+            return jsonify({'error': 'Часть задач не найдена или уже выполнена'}), 404
+
+        assignments = []
+        params = []
+        if new_date or category == 'later':
+            assignments.append('date = %s')
+            params.append('' if category == 'later' else new_date)
+        if category:
+            assignments.append('category = %s')
+            params.append(category)
+            if category in {'urgent', 'work', 'home', 'personal'}:
+                # Для повторов Фокус/Жду ответа временные; обычная категория постоянна.
+                assignments.append('default_category = %s')
+                params.append(category)
+            assignments.append('later_group = NULL')
+        cur.execute(
+            'UPDATE tasks SET ' + ', '.join(assignments) + ' WHERE id = ANY(%s) AND user_id = %s',
+            (*params, ids, session['user_id'])
+        )
+        conn.commit()
+    finally:
         conn.close()
-        return jsonify({'error': 'Some tasks not found or unauthorized'}), 404
-    
-    cur.execute(f'''
-        UPDATE tasks 
-        SET date = %s 
-        WHERE id IN ({placeholders}) AND user_id = %s
-    ''', (new_date, *task_ids, session['user_id']))
-    
-    conn.commit()
-    conn.close()
-    
-    return jsonify({'success': True, 'message': f'{len(task_ids)} tasks moved to {new_date}'})
+    return jsonify({'success': True, 'updated': len(ids)})
 
 # --- РЕГИСТРАЦИЯ ---
 @app.route('/register', methods=['GET', 'POST'])
@@ -1679,7 +1744,9 @@ MAIN_PAGE = '''
             color: #4a3f5e;
             -webkit-appearance: none;
         }
-        .move-date-input input:focus { outline: none; border-color: #8b7bb5; }
+        .move-date-input input:focus, .move-date-input select:focus { outline: none; border-color: #8b7bb5; }
+        .move-date-input label { font-size:12px; color:#6f6282; }
+        .move-date-input select { padding:6px 10px; border:1.5px solid #ede5f5; border-radius:8px; font-size:13px; background:white; color:#4a3f5e; }
         .move-date-input .btn-confirm-move {
             background: #27ae60;
             color: white;
@@ -2227,11 +2294,23 @@ MAIN_PAGE = '''
             <div class="btn-group">
                 <button class="btn-select-all" id="selectAllBtn">Выбрать все</button>
                 <button class="btn-clear" id="clearSelectionBtn">Снять все</button>
-                <button class="btn-move" id="moveSelectedBtn">📅 Перенести на дату</button>
+                <button class="btn-move" id="moveSelectedBtn">📅 Изменить дату / категорию</button>
             </div>
             <div class="move-date-input" id="moveDateInput">
-                <input type="date" id="moveDatePicker" value="{{ view_date }}">
-                <button class="btn-confirm-move" id="confirmMoveBtn">✅ Перенести</button>
+                <label for="moveDatePicker">Новая дата (необязательно)</label>
+                <input type="date" id="moveDatePicker" value="">
+                <label for="moveCategoryPicker">Категория</label>
+                <select id="moveCategoryPicker">
+                    <option value="">Не менять категорию</option>
+                    <option value="focus">🎯 Фокус</option>
+                    <option value="urgent">⚡ До 15 минут</option>
+                    <option value="work">💼 Работа</option>
+                    <option value="home">🏠 Дом</option>
+                    <option value="personal">❤️ Личное</option>
+                    <option value="waiting">⏳ Жду ответа</option>
+                    <option value="later">🕰️ Позже</option>
+                </select>
+                <button class="btn-confirm-move" id="confirmMoveBtn">✅ Применить</button>
                 <button class="btn-cancel-move" id="cancelMoveBtn">Отмена</button>
             </div>
         </div>
@@ -2521,7 +2600,7 @@ MAIN_PAGE = '''
             <button class="move-cat-btn" data-category="later" style="grid-column: span 2;"><span class="cat-icon">🕰️</span> Позже</button>
         </div>
         <div class="modal-actions">
-            <button class="btn-cancel" id="cancelMoveBtn">Отмена</button>
+            <button class="btn-cancel" id="cancelMoveModalBtn">Отмена</button>
         </div>
     </div>
 </div>
@@ -2627,7 +2706,14 @@ MAIN_PAGE = '''
             syncTimeEntry(hourId, minuteId, hiddenId);
         }));
         hourEl.addEventListener('keydown', e => {
-            if (e.key === ':' || e.key === 'ArrowRight') { e.preventDefault(); minuteEl.focus(); minuteEl.select(); }
+            if (e.key === ':' || (e.key === 'ArrowRight' && hourEl.selectionStart === hourEl.value.length)) {
+                e.preventDefault(); minuteEl.focus(); minuteEl.setSelectionRange(0, 0);
+            }
+        });
+        minuteEl.addEventListener('keydown', e => {
+            if (e.key === 'ArrowLeft' && minuteEl.selectionStart === 0 && minuteEl.selectionEnd === 0) {
+                e.preventDefault(); hourEl.focus(); hourEl.setSelectionRange(hourEl.value.length, hourEl.value.length);
+            }
         });
     }
 
@@ -2716,22 +2802,29 @@ MAIN_PAGE = '''
             return;
         }
         const newDate = document.getElementById('moveDatePicker').value;
-        if (!newDate) {
-            alert('Выберите дату');
+        const newCategory = document.getElementById('moveCategoryPicker').value;
+        if (!newDate && !newCategory) {
+            alert('Укажите новую дату и/или категорию');
             return;
         }
         const taskIds = Array.from(selectedTasks);
         fetch('/api/tasks/move_to_date', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ task_ids: taskIds, date: newDate })
+            body: JSON.stringify({ task_ids: taskIds, date: newDate, category: newCategory })
         })
-        .then(res => res.json())
+        .then(async res => {
+            const result = await res.json();
+            if (!res.ok) throw new Error(result.error || 'Не удалось изменить задачи');
+            return result;
+        })
         .then(() => {
             clearAllSelection();
             document.getElementById('moveDateInput').classList.remove('active');
+            document.getElementById('moveDatePicker').value = '';
+            document.getElementById('moveCategoryPicker').value = '';
             loadTasks();
-        });
+        }).catch(err => alert(err.message));
     });
     
     function initDragDrop() {
@@ -3583,7 +3676,7 @@ MAIN_PAGE = '''
         });
     });
     
-    document.getElementById('cancelMoveBtn').addEventListener('click', () => {
+    document.getElementById('cancelMoveModalBtn').addEventListener('click', () => {
         document.getElementById('moveModal').classList.remove('open');
     });
     
@@ -3868,6 +3961,16 @@ FUTURE_PAGE = '''
             futureSyncTime(hourId, minuteId, hiddenId);
         });
         [hourEl, minuteEl].forEach(el => el.addEventListener('blur', () => { if (el.value !== '') el.value = String(Number(el.value || 0)).padStart(2,'0'); futureSyncTime(hourId, minuteId, hiddenId); }));
+        hourEl.addEventListener('keydown', e => {
+            if (e.key === ':' || (e.key === 'ArrowRight' && hourEl.selectionStart === hourEl.value.length)) {
+                e.preventDefault(); minuteEl.focus(); minuteEl.setSelectionRange(0, 0);
+            }
+        });
+        minuteEl.addEventListener('keydown', e => {
+            if (e.key === 'ArrowLeft' && minuteEl.selectionStart === 0 && minuteEl.selectionEnd === 0) {
+                e.preventDefault(); hourEl.focus(); hourEl.setSelectionRange(hourEl.value.length, hourEl.value.length);
+            }
+        });
     }
     futureInitTime('futureDeadlineHour','futureDeadlineMinute','futureEditDeadlineTime');
     futureInitTime('futureRepeatDeadlineHour','futureRepeatDeadlineMinute','futureRepeatDeadlineTime');
@@ -4969,7 +5072,8 @@ LATER_PAGE = '''
         .later-inbox-title { font-size:14px; font-weight:700; color:#6f6282; margin-bottom:10px; }
         .groups-area { margin-top:20px; }
         .groups-grid {
-            display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:16px; align-items:start;
+            column-count: 2;
+            column-gap: 16px;
         }
         
         .add-task {
@@ -5001,7 +5105,7 @@ LATER_PAGE = '''
         
         .task-list {
             display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:8px;
-            max-height:132px; overflow-y:auto; padding:2px 4px 2px 2px;
+            max-height:160px; overflow-y:auto; padding:2px 4px 2px 2px;
             scrollbar-width:thin; scrollbar-color:#d5c8e6 transparent;
         }
         .task-list::-webkit-scrollbar { width:7px; }
@@ -5011,7 +5115,7 @@ LATER_PAGE = '''
             border-radius: 8px;
             padding: 10px 14px;
             margin-bottom: 0;
-            height:58px;
+            height:70px;
             display: flex;
             justify-content: space-between;
             align-items: center;
@@ -5020,11 +5124,17 @@ LATER_PAGE = '''
             box-shadow: 0 1px 4px rgba(139, 123, 181, 0.04);
         }
         .task-item .task-info {
-            display:flex; align-items:center; gap:10px; min-width:0; flex:1;
+            display:flex; flex-wrap:wrap; align-content:center; align-items:center;
+            gap:2px 6px; min-width:0; flex:1; max-height:100%; overflow:hidden;
         }
-        .task-item .task-info .task-title {
-            min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+        .later-task-title {
+            font:inherit; font-weight:600; border:0; background:transparent; color:inherit;
+            text-align:left; cursor:pointer; min-width:0; overflow:hidden;
+            text-overflow:ellipsis; white-space:nowrap; max-width:100%;
         }
+        .later-task-title:hover { text-decoration: underline; color:#77609a; }
+        .later-deadline { font-size:11px; color:#8b6d83; white-space:nowrap; }
+        .task-item .task-info .later-task-title { flex:1 1 100%; }
         .task-item .task-actions { flex-shrink:0; white-space:nowrap; }
         .task-item .task-info .task-duration {
             font-size: 11px;
@@ -5060,7 +5170,12 @@ LATER_PAGE = '''
             background: #fcfaff;
             border-radius: 12px;
             padding: 18px 20px;
-            margin-bottom: 0;
+            margin-bottom: 16px;
+            display: inline-block;
+            width: 100%;
+            vertical-align: top;
+            break-inside: avoid;
+            -webkit-column-break-inside: avoid;
             box-shadow: 0 2px 10px rgba(139, 123, 181, 0.08);
         }
         .group-header {
@@ -5215,9 +5330,25 @@ LATER_PAGE = '''
         }
         .group-picker .picker-cancel { background: #ede5f5; color: #4a3f5e; }
         
+        .later-edit-backdrop[hidden] { display:none; }
+        .later-edit-backdrop { position:fixed; inset:0; z-index:3500; display:flex;
+            align-items:center; justify-content:center; background:rgba(30,20,42,.38); padding:16px; }
+        .later-edit-dialog { width:min(100%,480px); border-radius:14px; padding:22px;
+            background:#fcfaff; box-shadow:0 12px 36px rgba(30,20,42,.2); display:flex; flex-direction:column; gap:9px; }
+        .later-edit-dialog h3 { margin-bottom:8px; }
+        .later-edit-dialog label { font-size:13px; color:#6f6282; }
+        .later-edit-dialog input, .later-edit-dialog textarea { width:100%; background:white;
+            color:#4a3f5e; font:inherit; padding:9px; border:1.5px solid #ede5f5;
+            border-radius:8px; }
+        .later-edit-deadline { display:flex; gap:8px; }
+        .later-edit-deadline input { min-width:0; }
+        .later-edit-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:12px; }
+        .later-edit-actions button { padding:9px 16px; border:0; border-radius:8px; cursor:pointer;
+            background:#ede5f5; color:#4a3f5e; }
+        #laterEditSave { background:#8b7bb5; color:white; }
         @media (max-width: 760px) {
-            .groups-grid { grid-template-columns:1fr; }
-            .task-list { grid-template-columns:1fr; max-height:264px; }
+            .groups-grid { column-count:1; }
+            .task-list { grid-template-columns:1fr; max-height:308px; }
         }
     </style>
 </head>
@@ -5243,17 +5374,19 @@ LATER_PAGE = '''
                 {% for task in tasks %}
                 <div class="task-item" data-task-id="{{ task.id }}">
                     <div class="task-info">
-                        <span class="task-title" title="{{ task.title }}">{{ task.title }}</span>
+                        <button type="button" class="later-task-title" data-task-id="{{ task.id }}" title="Изменить задачу">{{ task.title }}</button>
                         {% if task.duration %}
                         <span class="task-duration">⏱️ {{ task.duration }}</span>
                         {% endif %}
                         {% if task.comment and task.comment != '' %}
                         <span class="comment-badge" title="{{ task.comment }}">💬</span>
                         {% endif %}
+                        {% if task.deadline_date %}
+                        <span class="later-deadline" title="Дедлайн">⏰ {{ task.deadline_date }}{% if task.deadline_time %} {{ task.deadline_time[:5] }}{% endif %}</span>
+                        {% endif %}
                     </div>
                     <div class="task-actions">
                         <button class="move-to-group-btn" data-task-id="{{ task.id }}" title="Переместить в группу">📂</button>
-                        <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
                         <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
                     </div>
                 </div>
@@ -5278,16 +5411,18 @@ LATER_PAGE = '''
                 <div class="group-task-list">
                     {% for task in group.tasks %}
                     <div class="group-task-item" data-task-id="{{ task.id }}">
-                        <span>{{ task.title }}</span>
+                        <button type="button" class="later-task-title" data-task-id="{{ task.id }}" title="Изменить задачу">{{ task.title }}</button>
                         {% if task.duration %}
                         <span class="task-duration">⏱️ {{ task.duration }}</span>
                         {% endif %}
                         {% if task.comment and task.comment != '' %}
                         <span class="comment-badge" title="{{ task.comment }}">💬</span>
                         {% endif %}
+                        {% if task.deadline_date %}
+                        <span class="later-deadline" title="Дедлайн">⏰ {{ task.deadline_date }}{% if task.deadline_time %} {{ task.deadline_time[:5] }}{% endif %}</span>
+                        {% endif %}
                         <div class="task-actions">
-                            <button class="done-btn" data-task-id="{{ task.id }}">✅</button>
-                            <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
+                                <button class="delete-btn" data-task-id="{{ task.id }}">🗑️</button>
                         </div>
                     </div>
                     {% else %}
@@ -5309,6 +5444,26 @@ LATER_PAGE = '''
     <select id="groupPickerSelect"></select>
     <button type="button" id="groupPickerConfirm">Переместить</button>
     <button type="button" class="picker-cancel" id="groupPickerCancel">✕</button>
+</div>
+
+<div class="later-edit-backdrop" id="laterEditBackdrop" hidden>
+    <div class="later-edit-dialog" role="dialog" aria-modal="true" aria-labelledby="laterEditHeading">
+        <h3 id="laterEditHeading">📝 Изменить задачу</h3>
+        <input type="hidden" id="laterEditId">
+        <label for="laterEditTitle">Название</label>
+        <input type="text" id="laterEditTitle" maxlength="1000">
+        <label for="laterEditComment">💬 Комментарий</label>
+        <textarea id="laterEditComment" rows="3" placeholder="Необязательно"></textarea>
+        <label for="laterEditDeadlineDate">⏰ Дедлайн</label>
+        <div class="later-edit-deadline">
+            <input type="date" id="laterEditDeadlineDate">
+            <input type="time" id="laterEditDeadlineTime" aria-label="Время дедлайна">
+        </div>
+        <div class="later-edit-actions">
+            <button type="button" id="laterEditCancel">Отмена</button>
+            <button type="button" id="laterEditSave">Сохранить</button>
+        </div>
+    </div>
 </div>
 
 <script>
@@ -5381,7 +5536,57 @@ LATER_PAGE = '''
         }).catch(err => alert(err.message));
     });
 
+    const laterEditBackdrop = document.getElementById('laterEditBackdrop');
+    function closeLaterEdit() { laterEditBackdrop.hidden = true; }
+    document.getElementById('laterEditCancel').addEventListener('click', closeLaterEdit);
+    laterEditBackdrop.addEventListener('click', e => { if (e.target === laterEditBackdrop) closeLaterEdit(); });
+    document.addEventListener('keydown', e => {
+        if (e.key === 'Escape' && !laterEditBackdrop.hidden) closeLaterEdit();
+    });
+    document.getElementById('laterEditSave').addEventListener('click', async () => {
+        const save = document.getElementById('laterEditSave');
+        const data = {
+            title: document.getElementById('laterEditTitle').value.trim(),
+            comment: document.getElementById('laterEditComment').value.trim(),
+            deadline_date: document.getElementById('laterEditDeadlineDate').value,
+            deadline_time: document.getElementById('laterEditDeadlineTime').value
+        };
+        if (!data.title) { alert('Введите название задачи'); return; }
+        if (data.deadline_time && !data.deadline_date) { alert('Укажите дату дедлайна'); return; }
+        save.disabled = true;
+        try {
+            const res = await fetch('/api/task/' + document.getElementById('laterEditId').value + '/later_edit', {
+                method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)
+            });
+            const result = await res.json();
+            if (!res.ok) throw new Error(result.error || 'Не удалось сохранить');
+            closeLaterEdit();
+            await refreshLaterLayout();
+        } catch (err) { alert(err.message); }
+        finally { save.disabled = false; }
+    });
+    async function openLaterEdit(taskId) {
+        try {
+            const res = await fetch('/api/task/' + taskId);
+            if (!res.ok) throw new Error('Не удалось открыть задачу');
+            const task = await res.json();
+            if (task.category !== 'later' || task.status !== 'active') throw new Error('Задача недоступна');
+            document.getElementById('laterEditId').value = taskId;
+            document.getElementById('laterEditTitle').value = task.title || '';
+            document.getElementById('laterEditComment').value = task.comment || '';
+            document.getElementById('laterEditDeadlineDate').value = task.deadline_date || '';
+            document.getElementById('laterEditDeadlineTime').value = (task.deadline_time || '').slice(0,5);
+            laterEditBackdrop.hidden = false;
+            document.getElementById('laterEditTitle').focus();
+        } catch (err) { alert(err.message); }
+    }
+
     document.addEventListener('click', function(e) {
+        const titleBtn = e.target.closest('.later-task-title');
+        if (titleBtn && titleBtn.closest('.later-layout')) {
+            openLaterEdit(titleBtn.dataset.taskId);
+            return;
+        }
         const addLaterBtn = e.target.closest('#addLaterBtn');
         if (addLaterBtn) {
             const input = document.getElementById('laterTaskInput');
@@ -5444,14 +5649,6 @@ LATER_PAGE = '''
                     .then(res => { if (!res.ok) throw new Error('Не удалось удалить группу'); return refreshLaterLayout(); })
                     .catch(err => alert(err.message));
             }
-            return;
-        }
-
-        const doneBtn = e.target.closest('.done-btn');
-        if (doneBtn && doneBtn.closest('.later-layout')) {
-            fetch('/api/task/' + doneBtn.dataset.taskId + '/done', { method: 'POST' })
-                .then(res => { if (!res.ok) throw new Error('Не удалось выполнить задачу'); return refreshLaterLayout(); })
-                .catch(err => alert(err.message));
             return;
         }
 
