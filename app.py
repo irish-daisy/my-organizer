@@ -113,10 +113,26 @@ def init_db():
             title TEXT NOT NULL,
             is_done BOOLEAN NOT NULL DEFAULT FALSE,
             position INTEGER NOT NULL DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            completed_at_epoch BIGINT
         )
     ''')
+    cur.execute("ALTER TABLE weekly_goals ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP")
+    cur.execute("ALTER TABLE weekly_goals ADD COLUMN IF NOT EXISTS completed_at_epoch BIGINT")
+    # Старые выполненные цели тоже переводим в новый формат без потери истории.
+    cur.execute('''
+        UPDATE weekly_goals
+        SET completed_at = LEAST(week_start::timestamp + INTERVAL '6 days', LOCALTIMESTAMP)
+        WHERE is_done = TRUE AND completed_at IS NULL
+    ''')
+    cur.execute('''
+        UPDATE weekly_goals
+        SET completed_at_epoch = EXTRACT(EPOCH FROM (completed_at AT TIME ZONE 'UTC'))::BIGINT
+        WHERE is_done = TRUE AND completed_at IS NOT NULL AND completed_at_epoch IS NULL
+    ''')
     cur.execute('CREATE INDEX IF NOT EXISTS idx_weekly_goals_user_week ON weekly_goals (user_id, week_start, position, id)')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_weekly_goals_done ON weekly_goals (user_id, is_done, completed_at)')
     conn.commit()
     conn.close()
 
@@ -339,10 +355,65 @@ def current_goal_week():
     return today - timedelta(days=today.weekday())
 
 
+WEEKLY_GOAL_RETENTION_DAYS = 21
+
+
+def rollover_incomplete_weekly_goals(user_id):
+    """Move every unfinished goal from past weeks into the current week."""
+    target_week = current_goal_week()
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute('''
+                SELECT id FROM weekly_goals
+                WHERE user_id=%s AND is_done=FALSE AND week_start < %s
+                ORDER BY week_start, position, id
+                FOR UPDATE
+            ''', (user_id, target_week))
+            rows = cur.fetchall()
+            if not rows:
+                conn.commit()
+                return
+            cur.execute('''
+                SELECT COALESCE(MAX(position), -1) AS max_position
+                FROM weekly_goals
+                WHERE user_id=%s AND week_start=%s AND is_done=FALSE
+            ''', (user_id, target_week))
+            next_position = int(cur.fetchone()['max_position']) + 1
+            for row in rows:
+                cur.execute('''
+                    UPDATE weekly_goals
+                    SET week_start=%s, position=%s
+                    WHERE id=%s AND user_id=%s AND is_done=FALSE
+                ''', (target_week, next_position, row['id'], user_id))
+                next_position += 1
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def cleanup_completed_weekly_goals(user_id):
+    """Keep completed weekly goals for 3 weeks, then remove them."""
+    cutoff = get_now_utc() - timedelta(days=WEEKLY_GOAL_RETENTION_DAYS)
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('''
+                DELETE FROM weekly_goals
+                WHERE user_id=%s AND is_done=TRUE
+                  AND completed_at IS NOT NULL AND completed_at < %s
+            ''', (user_id, cutoff))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @app.route('/api/weekly-goals', methods=['GET', 'POST'])
 def weekly_goals_api():
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
+    rollover_incomplete_weekly_goals(session['user_id'])
+    cleanup_completed_weekly_goals(session['user_id'])
     data = request.get_json(silent=True) or {} if request.method == 'POST' else {}
     week = validate_goal_week(data.get('week') if request.method == 'POST' else request.args.get('week'))
     if request.method == 'GET' and not request.args.get('week'):
@@ -356,7 +427,8 @@ def weekly_goals_api():
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             if request.method == 'GET':
                 cur.execute('''SELECT id, title, is_done, position FROM weekly_goals
-                    WHERE user_id=%s AND week_start=%s ORDER BY position, id''', (session['user_id'], week))
+                    WHERE user_id=%s AND week_start=%s AND is_done=FALSE
+                    ORDER BY position, id''', (session['user_id'], week))
                 goals = [dict(goal) for goal in cur.fetchall()]
                 return jsonify({'week': week.isoformat(), 'goals': goals})
             title = str(data.get('title') or '').strip()
@@ -399,6 +471,11 @@ def weekly_goal_item_api(goal_id):
                 if not isinstance(data['is_done'], bool):
                     return jsonify({'error': 'Ожидалось значение true/false'}), 400
                 updates.append('is_done=%s'); values.append(data['is_done'])
+                if data['is_done']:
+                    updates.extend(['completed_at=%s', 'completed_at_epoch=%s'])
+                    values.extend([get_now_utc(), get_now_epoch()])
+                else:
+                    updates.extend(['completed_at=NULL', 'completed_at_epoch=NULL'])
             if not updates:
                 return jsonify({'error': 'Нет изменений'}), 400
             values.extend([goal_id, session['user_id']])
@@ -411,6 +488,36 @@ def weekly_goal_item_api(goal_id):
         return jsonify(dict(goal))
     finally:
         conn.close()
+
+@app.route('/api/weekly-goals/done')
+def done_weekly_goals_api():
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    cleanup_completed_weekly_goals(session['user_id'])
+    cutoff = get_now_utc() - timedelta(days=WEEKLY_GOAL_RETENTION_DAYS)
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute('''
+                SELECT id, title, week_start, completed_at, completed_at_epoch
+                FROM weekly_goals
+                WHERE user_id=%s AND is_done=TRUE
+                  AND completed_at IS NOT NULL AND completed_at >= %s
+                ORDER BY completed_at DESC, id DESC
+            ''', (session['user_id'], cutoff))
+            rows = cur.fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item['week_start'] = item['week_start'].isoformat() if item.get('week_start') else ''
+            item['completed_at'] = item['completed_at'].isoformat(timespec='seconds') if item.get('completed_at') else None
+            if item.get('completed_at_epoch') is not None:
+                item['completed_at_epoch'] = int(item['completed_at_epoch'])
+            result.append(item)
+        return jsonify(result)
+    finally:
+        conn.close()
+
 
 # --- ГЛАВНАЯ СТРАНИЦА ---
 @app.route('/')
@@ -1853,23 +1960,34 @@ MAIN_PAGE = '''
         
         .move-date-input {
             display: none;
-            align-items: center;
-            gap: 8px;
+            align-items: flex-end;
+            gap: 10px;
             flex-wrap: wrap;
+            width: 100%;
         }
         .move-date-input.active { display: flex; }
-        .move-date-input input[type="date"] {
-            padding: 6px 12px;
-            border: 1.5px solid #ede5f5;
-            border-radius: 8px;
-            font-size: 13px;
-            background: white;
-            color: #4a3f5e;
-            -webkit-appearance: none;
+        .bulk-move-field {
+            display:flex;
+            flex-direction:column;
+            gap:5px;
+            flex:1 1 220px;
+            max-width:280px;
+            min-width:220px;
+        }
+        .bulk-move-field input,
+        .bulk-move-field select {
+            width:100%;
+            min-height:40px;
+            padding:9px 12px;
+            border:1.5px solid #ede5f5;
+            border-radius:8px;
+            font-size:14px;
+            background:white;
+            color:#4a3f5e;
+            -webkit-appearance:none;
         }
         .move-date-input input:focus, .move-date-input select:focus { outline: none; border-color: #8b7bb5; }
         .move-date-input label { font-size:12px; color:#6f6282; }
-        .move-date-input select { padding:6px 10px; border:1.5px solid #ede5f5; border-radius:8px; font-size:13px; background:white; color:#4a3f5e; }
         .move-date-input .btn-confirm-move {
             background: #27ae60;
             color: white;
@@ -2471,19 +2589,23 @@ MAIN_PAGE = '''
                 <button class="btn-move" id="moveSelectedBtn">📅 Изменить дату / категорию</button>
             </div>
             <div class="move-date-input" id="moveDateInput">
-                <label for="moveDatePicker">Новая дата (необязательно)</label>
-                <input type="date" id="moveDatePicker" value="">
-                <label for="moveCategoryPicker">Категория</label>
-                <select id="moveCategoryPicker">
-                    <option value="">Не менять категорию</option>
-                    <option value="focus">🎯 Фокус</option>
-                    <option value="urgent">⚡ До 15 минут</option>
-                    <option value="work">💼 Работа</option>
-                    <option value="home">🏠 Дом</option>
-                    <option value="personal">❤️ Личное</option>
-                    <option value="waiting">⏳ Жду ответа</option>
-                    <option value="later">🕰️ Позже</option>
-                </select>
+                <div class="bulk-move-field">
+                    <label for="moveDatePicker">Новая дата (необязательно)</label>
+                    <input type="date" id="moveDatePicker" value="">
+                </div>
+                <div class="bulk-move-field">
+                    <label for="moveCategoryPicker">Категория</label>
+                    <select id="moveCategoryPicker">
+                        <option value="">Не менять категорию</option>
+                        <option value="focus">🎯 Фокус</option>
+                        <option value="urgent">⚡ До 15 минут</option>
+                        <option value="work">💼 Работа</option>
+                        <option value="home">🏠 Дом</option>
+                        <option value="personal">❤️ Личное</option>
+                        <option value="waiting">⏳ Жду ответа</option>
+                        <option value="later">🕰️ Позже</option>
+                    </select>
+                </div>
                 <button class="btn-confirm-move" id="confirmMoveBtn">✅ Применить</button>
                 <button class="btn-cancel-move" id="cancelMoveBtn">Отмена</button>
             </div>
@@ -2951,8 +3073,7 @@ MAIN_PAGE = '''
             const list = document.getElementById('weeklyGoalsList');
             list.replaceChildren();
             const goals = data.goals || [];
-            document.getElementById('weeklyGoalsCount').textContent =
-                goals.filter(goal => goal.is_done).length + ' / ' + goals.length;
+            document.getElementById('weeklyGoalsCount').textContent = goals.length ? '(' + goals.length + ')' : '';
             if (!goals.length) {
                 const empty = document.createElement('div');
                 empty.className = 'weekly-goals-empty';
@@ -3131,8 +3252,17 @@ MAIN_PAGE = '''
         document.getElementById('moveDateInput').classList.toggle('active');
     });
     
+    function clearBulkMoveDate() {
+        const picker = document.getElementById('moveDatePicker');
+        if (!picker) return;
+        if (picker._flatpickr) picker._flatpickr.clear();
+        else picker.value = '';
+    }
+
     document.getElementById('cancelMoveBtn').addEventListener('click', function() {
         document.getElementById('moveDateInput').classList.remove('active');
+        clearBulkMoveDate();
+        document.getElementById('moveCategoryPicker').value = '';
     });
     
     document.getElementById('confirmMoveBtn').addEventListener('click', function() {
@@ -3160,7 +3290,7 @@ MAIN_PAGE = '''
         .then(() => {
             clearAllSelection();
             document.getElementById('moveDateInput').classList.remove('active');
-            document.getElementById('moveDatePicker').value = '';
+            clearBulkMoveDate();
             document.getElementById('moveCategoryPicker').value = '';
             loadTasks();
         }).catch(err => alert(err.message));
@@ -6183,6 +6313,28 @@ DONE_PAGE = '''
         .task-item .task-actions button:hover { color: #8b7bb5; background: #ede5f5; }
         .task-item .task-actions .restore-btn:hover { color: #27ae60; }
         
+        .weekly-done-block {
+            background:#fcfaff;
+            border:2px solid #e2d5f2;
+            border-radius:12px;
+            padding:16px 18px;
+            margin-bottom:22px;
+            box-shadow:0 2px 10px rgba(139,123,181,.08);
+        }
+        .weekly-done-block h2 { font-size:18px; margin-bottom:6px; color:#4a3f5e; }
+        .weekly-done-sub { font-size:12px; color:#9a8bad; margin-bottom:12px; }
+        .weekly-done-list { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+        .weekly-done-item {
+            background:#faf5ff; border-radius:8px; padding:10px 12px; display:flex;
+            align-items:flex-start; justify-content:space-between; gap:8px; min-width:0;
+            border-left:4px solid #8b7bb5;
+        }
+        .weekly-done-main { min-width:0; }
+        .weekly-done-title { font-size:14px; overflow-wrap:anywhere; }
+        .weekly-done-meta { margin-top:4px; font-size:11px; color:#a99cba; }
+        .weekly-done-restore { border:0; background:none; color:#8b7bb5; cursor:pointer; padding:3px 5px; border-radius:6px; }
+        .weekly-done-restore:hover { background:#ede5f5; }
+        .weekly-done-empty { color:#c5b8d8; padding:10px 0; font-size:13px; grid-column:1/-1; }
         .empty-list { color: #c5b8d8; text-align: center; padding: 30px; }
         
         .info-note {
@@ -6197,6 +6349,7 @@ DONE_PAGE = '''
         
         @media (max-width: 600px) {
             .header { flex-direction: column; text-align: center; }
+            .weekly-done-list { grid-template-columns:1fr; }
         }
     </style>
 </head>
@@ -6211,6 +6364,14 @@ DONE_PAGE = '''
         </div>
     </div>
     
+    <section class="weekly-done-block">
+        <h2>🌟 Выполненные цели на неделю</h2>
+        <div class="weekly-done-sub">Цели хранятся здесь 3 недели после выполнения</div>
+        <div class="weekly-done-list" id="doneWeeklyGoals">
+            <div class="weekly-done-empty">Загрузка…</div>
+        </div>
+    </section>
+
     <div id="doneContainer">
         <div class="empty-list">Загрузка…</div>
     </div>
@@ -6218,6 +6379,74 @@ DONE_PAGE = '''
 </div>
 
 <script>
+    function escapeDoneHtml(value) {
+        return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    }
+
+    function getWeeklyCompletedDate(goal) {
+        if (goal.completed_at_epoch !== null && goal.completed_at_epoch !== undefined) {
+            return new Date(Number(goal.completed_at_epoch) * 1000);
+        }
+        return goal.completed_at ? new Date(goal.completed_at) : null;
+    }
+
+    function weeklyRangeLabel(weekStart) {
+        if (!weekStart) return '';
+        const [y,m,d] = weekStart.split('-').map(Number);
+        const start = new Date(y, m - 1, d, 12);
+        const end = new Date(y, m - 1, d + 6, 12);
+        return start.toLocaleDateString('ru-RU', {day:'numeric', month:'short'}) +
+            ' – ' + end.toLocaleDateString('ru-RU', {day:'numeric', month:'short'});
+    }
+
+    function loadDoneWeeklyGoals() {
+        fetch('/api/weekly-goals/done')
+            .then(async res => {
+                const body = await res.json();
+                if (!res.ok) throw new Error(body.error || 'Не удалось загрузить цели');
+                return body;
+            })
+            .then(goals => {
+                const container = document.getElementById('doneWeeklyGoals');
+                container.innerHTML = '';
+                if (!goals.length) {
+                    container.innerHTML = '<div class="weekly-done-empty">Выполненных целей за последние 3 недели пока нет</div>';
+                    return;
+                }
+                goals.forEach(goal => {
+                    const item = document.createElement('div');
+                    item.className = 'weekly-done-item';
+                    const completed = getWeeklyCompletedDate(goal);
+                    const completedLabel = completed ? completed.toLocaleDateString('ru-RU', {day:'numeric', month:'short'}) : '';
+                    item.innerHTML = `
+                        <div class="weekly-done-main">
+                            <div class="weekly-done-title">${escapeDoneHtml(goal.title)}</div>
+                            <div class="weekly-done-meta">${escapeDoneHtml(weeklyRangeLabel(goal.week_start))}${completedLabel ? ' · ✅ ' + escapeDoneHtml(completedLabel) : ''}</div>
+                        </div>
+                        <button class="weekly-done-restore" data-goal-id="${goal.id}" title="Вернуть цель">↩️</button>
+                    `;
+                    container.appendChild(item);
+                });
+                container.querySelectorAll('.weekly-done-restore').forEach(button => {
+                    button.addEventListener('click', async function() {
+                        const response = await fetch('/api/weekly-goals/' + this.dataset.goalId, {
+                            method:'PUT', headers:{'Content-Type':'application/json'},
+                            body:JSON.stringify({is_done:false})
+                        });
+                        if (!response.ok) {
+                            const body = await response.json().catch(() => ({}));
+                            alert(body.error || 'Не удалось вернуть цель');
+                            return;
+                        }
+                        loadDoneWeeklyGoals();
+                    });
+                });
+            })
+            .catch(error => {
+                document.getElementById('doneWeeklyGoals').innerHTML = '<div class="weekly-done-empty">' + escapeDoneHtml(error.message) + '</div>';
+            });
+    }
+
     function getCompletedDate(task) {
         if (task.completed_at_epoch !== null && task.completed_at_epoch !== undefined) {
             return new Date(Number(task.completed_at_epoch) * 1000);
@@ -6304,6 +6533,7 @@ DONE_PAGE = '''
             });
     }
     
+    loadDoneWeeklyGoals();
     loadDoneTasks();
 </script>
 </body>
